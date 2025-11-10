@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import uvicorn
 import tempfile
 from fastapi import FastAPI
@@ -13,9 +12,6 @@ import subprocess
 app = FastAPI()
 
 FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-
-if not os.getenv("GOOGLE_CREDENTIALS") or not FOLDER_ID:
-    raise RuntimeError("Missing required environment variables: GOOGLE_CREDENTIALS and/or DRIVE_FOLDER_ID")
 
 class VideoRequest(BaseModel):
     video_url: str
@@ -40,7 +36,7 @@ def download_video(url, title):
 
 def upload_to_drive(filepath, filename):
     creds = service_account.Credentials.from_service_account_info(
-        json.loads(os.getenv("GOOGLE_CREDENTIALS")),
+        eval(os.getenv("GOOGLE_CREDENTIALS")),
         scopes=["https://www.googleapis.com/auth/drive.file"]
     )
 
