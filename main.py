@@ -167,4 +167,31 @@ async def diagnostics():
             "GOOGLE_CREDENTIALS_present": bool(os.getenv("GOOGLE_CREDENTIALS")),
             "PUBLIC_DOMAIN": os.getenv("PUBLIC_DOMAIN")
         },
-        "
+        "credentials_ok": False,
+        "drive_access_ok": False,
+        "binaries": {
+            "ffmpeg_found": (subprocess.run(["which", "ffmpeg"], capture_output=True).returncode == 0),
+            "yt_dlp_found": (subprocess.run(["which", "yt-dlp"], capture_output=True).returncode == 0)
+        },
+        "temp_free_disk_mb": int(os.statvfs('/tmp').f_bavail * os.statvfs('/tmp').f_frsize / 1024 / 1024),
+        "suggestions": []
+    }
+
+    # Validate credentials
+    try:
+        _ = load_credentials()
+        diag["credentials_ok"] = True
+    except Exception as e:
+        diag["credentials_ok"] = False
+        diag["credentials_error"] = str(e)
+
+    # Test Drive access
+    try:
+        service = get_drive_service()
+        service.files().list(pageSize=1).execute()
+        diag["drive_access_ok"] = True
+    except Exception as e:
+        diag["drive_access_ok"] = False
+        diag["drive_access_error"] = str(e)
+
+    return diag
