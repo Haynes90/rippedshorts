@@ -1,5 +1,7 @@
 fastapi
-uvicorn
+uvicorn[standard]
+yt-dlp
 google-api-python-client
 google-auth
-yt-dlp
+google-auth-httplib2
+requests
