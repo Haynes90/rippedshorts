@@ -1,2 +1,11 @@
+$schema = "https://railway.com/railway.schema.json"
+
 [build]
-builder = "docker"
+builder = "railpack"
+
+[deploy]
+runtime = "V2"
+numReplicas = 1
+sleepApplication = false
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
