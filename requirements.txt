@@ -5,3 +5,4 @@ google-auth
 google-auth-oauthlib
 yt-dlp
 python-multipart
+requests
