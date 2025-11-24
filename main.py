@@ -256,23 +256,46 @@ async def ingest(request: Request, background_tasks: BackgroundTasks):
     return {"status": "queued", "job_id": job_id, "title": title}
 
 
-# --------- API: CLIP ----------
+# --------- API: CLIPS  (UPDATED) ----------
 @app.post("/clips")
 async def create_clips(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
 
-    if not data.get("drive_file_id"):
-        return JSONResponse({"status": "error", "error": "Missing drive_file_id"}, status_code=400)
+    # Require job_id from ingest job
+    source_job_id = data.get("job_id")
+    if not source_job_id or source_job_id not in JOBS:
+        return JSONResponse({"status": "error", "error": "Invalid or missing job_id"}, status_code=400)
 
+    # Look up the Drive file ID from the ingest job
+    drive_file_id = JOBS[source_job_id].get("file_id")
+    if not drive_file_id:
+        return JSONResponse({"status": "error", "error": "Source job has no drive_file_id"}, status_code=500)
+
+    # Validate clips
     if not isinstance(data.get("clips"), list) or not data["clips"]:
-        return JSONResponse({"status": "error", "error": "Missing / empty clips"}, status_code=400)
+        return JSONResponse({"status": "error", "error": "Missing or empty clips list"}, status_code=400)
 
+    # Build new clipping job
     job_id = str(uuid.uuid4())
-    JOBS[job_id] = {"job_id": job_id, "status": "queued", "kind": "clips", "logs": []}
+    JOBS[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "kind": "clips",
+        "source_job_id": source_job_id,
+        "drive_file_id": drive_file_id,
+        "logs": []
+    }
+
+    # Attach the resolved drive_file_id to payload
+    data["drive_file_id"] = drive_file_id
 
     background_tasks.add_task(process_clip_job, job_id, data)
 
-    return {"status": "queued", "job_id": job_id}
+    return {
+        "status": "queued",
+        "job_id": job_id,
+        "source_job_id": source_job_id
+    }
 
 
 # --------- STATUS ----------
