@@ -19,6 +19,13 @@ app = FastAPI()
 # --------- SIMPLE IN-MEMORY JOB STORE ----------
 JOBS: dict[str, dict] = {}
 
+# NEW: Track the latest ingest file
+LATEST_INGEST: dict = {
+    "file_id": None,
+    "title": None,
+    "folder_id": None
+}
+
 def log(job_id: str, message: str) -> None:
     if job_id not in JOBS:
         return
@@ -147,7 +154,7 @@ def make_clip(source_path: str, out_path: str, start: float, duration: float, jo
         raise Exception(f"ffmpeg failed")
 
 
-# --------- BACKGROUND: FULL VIDEO ----------
+# --------- BACKGROUND JOB: INGEST ----------
 def process_job(job_id: str, url: str, title: str, callback_url: str | None):
     try:
         JOBS[job_id]["status"] = "downloading"
@@ -160,6 +167,11 @@ def process_job(job_id: str, url: str, title: str, callback_url: str | None):
         JOBS[job_id]["status"] = "success"
         JOBS[job_id]["drive_link"] = upload_result.get("webViewLink")
         JOBS[job_id]["file_id"] = upload_result.get("id")
+
+        # UPDATE GLOBAL LATEST INGEST
+        LATEST_INGEST["file_id"] = upload_result.get("id")
+        LATEST_INGEST["title"] = title
+        LATEST_INGEST["folder_id"] = os.environ.get("DRIVE_FOLDER_ID")
 
         log(job_id, "Job finished successfully")
 
@@ -184,7 +196,7 @@ def process_job(job_id: str, url: str, title: str, callback_url: str | None):
             log(job_id, f"Callback failed: {e}")
 
 
-# --------- BACKGROUND: CLIP ----------
+# --------- BACKGROUND JOB: CLIPPING ----------
 def process_clip_job(job_id: str, payload: dict):
     drive_file_id = payload["drive_file_id"]
     folder_id = payload["folder_id"]
@@ -256,45 +268,40 @@ async def ingest(request: Request, background_tasks: BackgroundTasks):
     return {"status": "queued", "job_id": job_id, "title": title}
 
 
-# --------- API: CLIPS  (UPDATED) ----------
+# --------- API: CLIPS (NO FILE ID NEEDED FROM ZAP) ----------
 @app.post("/clips")
 async def create_clips(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
 
-    # Require job_id from ingest job
-    source_job_id = data.get("job_id")
-    if not source_job_id or source_job_id not in JOBS:
-        return JSONResponse({"status": "error", "error": "Invalid or missing job_id"}, status_code=400)
-
-    # Look up the Drive file ID from the ingest job
-    drive_file_id = JOBS[source_job_id].get("file_id")
-    if not drive_file_id:
-        return JSONResponse({"status": "error", "error": "Source job has no drive_file_id"}, status_code=500)
-
-    # Validate clips
+    # MUST have clips
     if not isinstance(data.get("clips"), list) or not data["clips"]:
         return JSONResponse({"status": "error", "error": "Missing or empty clips list"}, status_code=400)
 
-    # Build new clipping job
+    # Require latest ingest file
+    if not LATEST_INGEST["file_id"]:
+        return JSONResponse({"status": "error", "error": "No ingest has been processed yet"}, status_code=400)
+
+    drive_file_id = LATEST_INGEST["file_id"]
+    video_title = data.get("video_title") or LATEST_INGEST["title"]
+    folder_id = data.get("folder_id") or LATEST_INGEST["folder_id"]
+
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {
         "job_id": job_id,
         "status": "queued",
         "kind": "clips",
-        "source_job_id": source_job_id,
         "drive_file_id": drive_file_id,
         "logs": []
     }
 
-    # Attach the resolved drive_file_id to payload
+    # Attach backend file id to payload
     data["drive_file_id"] = drive_file_id
 
     background_tasks.add_task(process_clip_job, job_id, data)
 
     return {
         "status": "queued",
-        "job_id": job_id,
-        "source_job_id": source_job_id
+        "job_id": job_id
     }
 
 
