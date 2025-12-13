@@ -61,24 +61,38 @@ def get_drive_client():
     return build("drive", "v3", credentials=creds)
 
 # --------------------------------------------------
-# YOUTUBE DOWNLOAD
+# YOUTUBE INGEST (ONLY USED BY /ingest)
 # --------------------------------------------------
 def download_video(url: str, title: str, job_id=None):
     out = f"/tmp/{title}.mp4"
     opts = {
+        "format": "bv*+ba/best",
+        "merge_output_format": "mp4",
         "outtmpl": out,
-        "format": "mp4",
         "cookies": COOKIES_PATH,
-        "quiet": True
+        "quiet": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android"]
+            }
+        },
     }
+
     if job_id:
-        log(job_id, "Downloading YouTube video")
+        log(job_id, "yt-dlp downloading from YouTube")
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
+
+    if not os.path.exists(out) or os.path.getsize(out) == 0:
+        raise Exception("yt-dlp produced empty file")
+
     return out
 
 # --------------------------------------------------
-# DRIVE DOWNLOAD
+# DRIVE DOWNLOAD (USED FOR CLIPPING)
 # --------------------------------------------------
 def download_from_drive(file_id: str, job_id=None):
     drive = get_drive_client()
@@ -102,10 +116,7 @@ def download_from_drive(file_id: str, job_id=None):
 def upload_to_drive(path: str, title: str, folder_id: str, job_id=None):
     drive = get_drive_client()
     media = MediaFileUpload(path, mimetype="video/mp4", resumable=True)
-    meta = {
-        "name": f"{title}.mp4",
-        "parents": [folder_id]
-    }
+    meta = {"name": f"{title}.mp4", "parents": [folder_id]}
 
     req = drive.files().create(
         body=meta,
@@ -121,9 +132,9 @@ def upload_to_drive(path: str, title: str, folder_id: str, job_id=None):
     return resp
 
 # --------------------------------------------------
-# FFMPEG
+# FFMPEG CLIPPING (DRIVE ONLY)
 # --------------------------------------------------
-def make_clip(src, out, start, dur, job_id=None):
+def make_clip(src, out, start, dur):
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start),
@@ -152,22 +163,16 @@ def process_ingest(job_id, url, title, callback):
             "folder_id": os.environ["DRIVE_FOLDER_ID"]
         })
 
-        JOBS[job_id].update({
-            "status": "success",
-            "file_id": res["id"]
-        })
+        JOBS[job_id].update({"status": "success", "file_id": res["id"]})
 
     except Exception as e:
-        JOBS[job_id].update({
-            "status": "failed",
-            "error": str(e)
-        })
+        JOBS[job_id].update({"status": "failed", "error": str(e)})
 
     if callback:
         requests.post(callback, json=JOBS[job_id], timeout=15)
 
 # --------------------------------------------------
-# BACKGROUND: CLIPS
+# BACKGROUND: CLIPS (DRIVE ONLY)
 # --------------------------------------------------
 def process_clips(job_id, payload):
     src = download_from_drive(payload["drive_file_id"], job_id)
@@ -179,7 +184,7 @@ def process_clips(job_id, payload):
         idx = int(clip["index"])
         out = f"/tmp/{base}_{idx}.mp4"
 
-        make_clip(src, out, clip["start"], clip["duration"], job_id)
+        make_clip(src, out, clip["start"], clip["duration"])
         up = upload_to_drive(out, f"{base}_{idx}", payload["folder_id"], job_id)
 
         JOBS[job_id]["clips"].append({
@@ -201,7 +206,7 @@ async def ingest(req: Request, bg: BackgroundTasks):
     data = await req.json()
     url = data.get("url")
     if not url:
-        return JSONResponse({"error": "missing url"}, status_code=400)
+        return JSONResponse({"error": "missing url"}, 400)
 
     title = url.split("v=")[-1].split("&")[0]
     job_id = str(uuid.uuid4())
@@ -214,29 +219,12 @@ async def ingest(req: Request, bg: BackgroundTasks):
 async def analyze_and_clip(req: Request, bg: BackgroundTasks):
     data = await req.json()
 
-    # --------------------------------------------------
-    # RAW PAYLOAD LOGGING
-    # --------------------------------------------------
-    raw_job_id = str(uuid.uuid4())
-    JOBS[raw_job_id] = {
-        "job_id": raw_job_id,
-        "status": "received",
-        "raw_payload": data
-    }
-
-    # Also write to disk so you can inspect in Railway
-    with open(f"/tmp/raw_payload_{raw_job_id}.json", "w") as f:
-        json.dump(data, f, indent=2)
-
-    # --------------------------------------------------
-    # NESTED SEGMENTS NORMALIZATION
-    # --------------------------------------------------
+    # -------- SEGMENTS NORMALIZATION --------
     raw = data.get("segments_json")
     segments = []
 
     if isinstance(raw, list):
         segments = raw
-
     elif isinstance(raw, str):
         try:
             parsed = json.loads(raw)
@@ -244,7 +232,6 @@ async def analyze_and_clip(req: Request, bg: BackgroundTasks):
                 segments = parsed
         except:
             segments = []
-
     elif isinstance(raw, dict):
         inner = raw.get("segments_json")
         if isinstance(inner, str):
@@ -254,57 +241,17 @@ async def analyze_and_clip(req: Request, bg: BackgroundTasks):
                     segments = parsed
             except:
                 segments = []
-        elif "segments_array" in raw and isinstance(raw["segments_array"], list):
-            segments = raw["segments_array"]
 
-    # --------------------------------------------------
-    # GRACEFUL FALLBACK
-    # --------------------------------------------------
     if not segments:
-        JOBS[raw_job_id]["status"] = "no_segments"
-        return {
-            "status": "ok",
-            "note": "No usable segments; payload logged",
-            "job_id": raw_job_id,
-            "clips_found": 0
-        }
+        return {"status": "ok", "note": "no segments provided", "clips_found": 0}
 
-    # --------------------------------------------------
-    # OPENAI
-    # --------------------------------------------------
-    prompt = f"""
-Choose up to {data['max_clip_count']} strong clips.
-Each clip must be between {data['min_clip_len_sec']} and {data['max_clip_len_sec']} seconds.
-Return JSON only.
-"""
-
-    r = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": "gpt-4o-mini",
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": "Return ONLY JSON"},
-                {"role": "user", "content": prompt},
-                {"role": "user", "content": json.dumps(segments)}
-            ]
-        },
-        timeout=45
-    )
-
-    result = json.loads(r.json()["choices"][0]["message"]["content"])
-    clips = result.get("clips", [])
-
+    # -------- CLIP DECISION (ALREADY DONE BY ZAPIER AI) --------
     formatted = []
-    for i, c in enumerate(clips, start=1):
+    for i, seg in enumerate(segments, start=1):
         formatted.append({
             "index": i,
-            "start": c["start_sec"],
-            "duration": c["duration_sec"],
+            "start": seg["start"],
+            "duration": seg["duration"],
             "name": f"clip_{i}"
         })
 
@@ -319,17 +266,12 @@ Return JSON only.
         "callback_url": data.get("callback_url")
     })
 
-    return {
-        "status": "queued",
-        "job_id": job_id,
-        "clips_found": len(formatted),
-        "raw_payload_job_id": raw_job_id
-    }
+    return {"status": "queued", "job_id": job_id, "clips_found": len(formatted)}
 
 @app.get("/status/{job_id}")
 async def status(job_id: str):
     if job_id not in JOBS:
-        raise HTTPException(status_code=404, detail="not found")
+        raise HTTPException(status_code=404)
     return JOBS[job_id]
 
 @app.get("/health")
