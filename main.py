@@ -35,6 +35,7 @@ LATEST_INGEST = {
 def log(job_id: str, msg: str):
     ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     JOBS.setdefault(job_id, {}).setdefault("logs", []).append(f"{ts} | {msg}")
+    print(f"{ts} | {msg}", flush=True)
 
 def sanitize_filename(name: str):
     for c in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
@@ -60,7 +61,7 @@ def get_drive_client():
     return build("drive", "v3", credentials=creds)
 
 # --------------------------------------------------
-# YOUTUBE INGEST (ONCE)
+# YOUTUBE INGEST (FULL VIDEO)
 # --------------------------------------------------
 def download_video(url: str, title: str, job_id=None):
     out = f"/tmp/{title}.mp4"
@@ -71,10 +72,12 @@ def download_video(url: str, title: str, job_id=None):
         "outtmpl": out,
         "cookies": COOKIES_PATH,
         "quiet": True,
-        "retries": 5,
-        "fragment_retries": 5,
+        "retries": 10,
+        "fragment_retries": 10,
         "extractor_args": {
-            "youtube": {"player_client": ["android"]}
+            "youtube": {
+                "player_client": ["android", "web", "ios"]
+            }
         },
     }
 
@@ -135,7 +138,7 @@ def upload_to_drive(path: str, title: str, folder_id: str, job_id=None):
     while resp is None:
         _, resp = req.next_chunk()
 
-    log(job_id, f"Uploaded clip to Drive: {resp['id']}")
+    log(job_id, f"Uploaded to Drive: {resp['id']}")
     return resp
 
 # --------------------------------------------------
@@ -158,7 +161,7 @@ def make_clip(src, out, start, dur, job_id=None):
         raise Exception(r.stderr[-400:])
 
     size = os.path.getsize(out)
-    log(job_id, f"Created clip file ({size} bytes)")
+    log(job_id, f"Created clip ({size} bytes)")
 
     if size == 0:
         raise Exception("ffmpeg produced empty clip")
@@ -188,7 +191,7 @@ def process_ingest(job_id, url, title, callback):
         requests.post(callback, json=JOBS[job_id], timeout=15)
 
 # --------------------------------------------------
-# BACKGROUND: CLIPS (VERIFIED)
+# BACKGROUND: CLIPS
 # --------------------------------------------------
 def process_clips(job_id, payload):
     created = 0
@@ -247,16 +250,16 @@ async def ingest(req: Request, bg: BackgroundTasks):
 async def analyze_and_clip(req: Request, bg: BackgroundTasks):
     data = await req.json()
 
-    # Normalize segments
     raw = data.get("segments_json")
     segments = []
 
     if isinstance(raw, list):
         segments = raw
     elif isinstance(raw, dict):
-        inner = raw.get("segments_json")
-        if isinstance(inner, str):
-            segments = json.loads(inner)
+        for v in raw.values():
+            if isinstance(v, list):
+                segments = v
+                break
 
     if not segments:
         return {"status": "ok", "note": "no segments", "clips_found": 0}
@@ -265,8 +268,8 @@ async def analyze_and_clip(req: Request, bg: BackgroundTasks):
     for i, seg in enumerate(segments, start=1):
         clips.append({
             "index": i,
-            "start": seg["start"],
-            "duration": seg["duration"]
+            "start": seg.get("start") or seg.get("offset"),
+            "duration": seg.get("duration")
         })
 
     job_id = str(uuid.uuid4())
