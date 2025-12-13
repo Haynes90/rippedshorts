@@ -4,7 +4,6 @@ import uuid
 import datetime
 import subprocess
 import io
-import time
 
 import yt_dlp
 import requests
@@ -61,10 +60,11 @@ def get_drive_client():
     return build("drive", "v3", credentials=creds)
 
 # --------------------------------------------------
-# YOUTUBE INGEST (ONLY USED BY /ingest)
+# YOUTUBE INGEST (ONCE)
 # --------------------------------------------------
 def download_video(url: str, title: str, job_id=None):
     out = f"/tmp/{title}.mp4"
+
     opts = {
         "format": "bv*+ba/best",
         "merge_output_format": "mp4",
@@ -74,29 +74,28 @@ def download_video(url: str, title: str, job_id=None):
         "retries": 5,
         "fragment_retries": 5,
         "extractor_args": {
-            "youtube": {
-                "player_client": ["android"]
-            }
+            "youtube": {"player_client": ["android"]}
         },
     }
 
-    if job_id:
-        log(job_id, "yt-dlp downloading from YouTube")
+    log(job_id, "Starting YouTube ingest")
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
 
     if not os.path.exists(out) or os.path.getsize(out) == 0:
-        raise Exception("yt-dlp produced empty file")
+        raise Exception("YouTube ingest produced empty file")
 
+    log(job_id, f"Ingested video size: {os.path.getsize(out)} bytes")
     return out
 
 # --------------------------------------------------
-# DRIVE DOWNLOAD (USED FOR CLIPPING)
+# DRIVE DOWNLOAD (FOR CLIPPING)
 # --------------------------------------------------
 def download_from_drive(file_id: str, job_id=None):
     drive = get_drive_client()
     req = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
+
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, req)
 
@@ -108,6 +107,12 @@ def download_from_drive(file_id: str, job_id=None):
     with open(path, "wb") as f:
         f.write(fh.getvalue())
 
+    size = os.path.getsize(path)
+    log(job_id, f"Downloaded source from Drive ({size} bytes)")
+
+    if size == 0:
+        raise Exception("Drive download produced empty file")
+
     return path
 
 # --------------------------------------------------
@@ -115,6 +120,7 @@ def download_from_drive(file_id: str, job_id=None):
 # --------------------------------------------------
 def upload_to_drive(path: str, title: str, folder_id: str, job_id=None):
     drive = get_drive_client()
+
     media = MediaFileUpload(path, mimetype="video/mp4", resumable=True)
     meta = {"name": f"{title}.mp4", "parents": [folder_id]}
 
@@ -129,12 +135,13 @@ def upload_to_drive(path: str, title: str, folder_id: str, job_id=None):
     while resp is None:
         _, resp = req.next_chunk()
 
+    log(job_id, f"Uploaded clip to Drive: {resp['id']}")
     return resp
 
 # --------------------------------------------------
-# FFMPEG CLIPPING (DRIVE ONLY)
+# FFMPEG CLIP
 # --------------------------------------------------
-def make_clip(src, out, start, dur):
+def make_clip(src, out, start, dur, job_id=None):
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start),
@@ -145,9 +152,16 @@ def make_clip(src, out, start, dur):
         "-preset", "veryfast",
         out
     ]
+
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
         raise Exception(r.stderr[-400:])
+
+    size = os.path.getsize(out)
+    log(job_id, f"Created clip file ({size} bytes)")
+
+    if size == 0:
+        raise Exception("ffmpeg produced empty clip")
 
 # --------------------------------------------------
 # BACKGROUND: INGEST
@@ -163,37 +177,51 @@ def process_ingest(job_id, url, title, callback):
             "folder_id": os.environ["DRIVE_FOLDER_ID"]
         })
 
-        JOBS[job_id].update({"status": "success", "file_id": res["id"]})
+        JOBS[job_id]["status"] = "success"
+        JOBS[job_id]["file_id"] = res["id"]
 
     except Exception as e:
-        JOBS[job_id].update({"status": "failed", "error": str(e)})
+        JOBS[job_id]["status"] = "failed"
+        JOBS[job_id]["error"] = str(e)
 
     if callback:
         requests.post(callback, json=JOBS[job_id], timeout=15)
 
 # --------------------------------------------------
-# BACKGROUND: CLIPS (DRIVE ONLY)
+# BACKGROUND: CLIPS (VERIFIED)
 # --------------------------------------------------
 def process_clips(job_id, payload):
-    src = download_from_drive(payload["drive_file_id"], job_id)
-    JOBS[job_id]["clips"] = []
+    created = 0
+    uploaded = 0
 
-    base = sanitize_filename(payload["video_title"])
+    try:
+        src = download_from_drive(payload["drive_file_id"], job_id)
+        base = sanitize_filename(payload["video_title"])
+        JOBS[job_id]["clips"] = []
 
-    for clip in payload["clips"]:
-        idx = int(clip["index"])
-        out = f"/tmp/{base}_{idx}.mp4"
+        for clip in payload["clips"]:
+            idx = int(clip["index"])
+            out = f"/tmp/{base}_{idx}.mp4"
 
-        make_clip(src, out, clip["start"], clip["duration"])
-        up = upload_to_drive(out, f"{base}_{idx}", payload["folder_id"], job_id)
+            make_clip(src, out, clip["start"], clip["duration"], job_id)
+            created += 1
 
-        JOBS[job_id]["clips"].append({
-            "index": idx,
-            "file_id": up["id"],
-            "webViewLink": up["webViewLink"]
-        })
+            up = upload_to_drive(out, f"{base}_{idx}", payload["folder_id"], job_id)
+            uploaded += 1
 
-    JOBS[job_id]["status"] = "success"
+            JOBS[job_id]["clips"].append({
+                "index": idx,
+                "file_id": up["id"]
+            })
+
+        JOBS[job_id]["status"] = "success"
+
+    except Exception as e:
+        JOBS[job_id]["status"] = "failed"
+        JOBS[job_id]["error"] = str(e)
+
+    JOBS[job_id]["clips_created"] = created
+    JOBS[job_id]["clips_uploaded"] = uploaded
 
     if payload.get("callback_url"):
         requests.post(payload["callback_url"], json=JOBS[job_id], timeout=20)
@@ -219,40 +247,26 @@ async def ingest(req: Request, bg: BackgroundTasks):
 async def analyze_and_clip(req: Request, bg: BackgroundTasks):
     data = await req.json()
 
-    # -------- SEGMENTS NORMALIZATION --------
+    # Normalize segments
     raw = data.get("segments_json")
     segments = []
 
     if isinstance(raw, list):
         segments = raw
-    elif isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                segments = parsed
-        except:
-            segments = []
     elif isinstance(raw, dict):
         inner = raw.get("segments_json")
         if isinstance(inner, str):
-            try:
-                parsed = json.loads(inner)
-                if isinstance(parsed, list):
-                    segments = parsed
-            except:
-                segments = []
+            segments = json.loads(inner)
 
     if not segments:
-        return {"status": "ok", "note": "no segments provided", "clips_found": 0}
+        return {"status": "ok", "note": "no segments", "clips_found": 0}
 
-    # -------- CLIP DECISION (ALREADY DONE BY ZAPIER AI) --------
-    formatted = []
+    clips = []
     for i, seg in enumerate(segments, start=1):
-        formatted.append({
+        clips.append({
             "index": i,
             "start": seg["start"],
-            "duration": seg["duration"],
-            "name": f"clip_{i}"
+            "duration": seg["duration"]
         })
 
     job_id = str(uuid.uuid4())
@@ -262,16 +276,16 @@ async def analyze_and_clip(req: Request, bg: BackgroundTasks):
         "drive_file_id": data["drive_file_id"],
         "folder_id": data["folder_id"],
         "video_title": data.get("video_title", "video"),
-        "clips": formatted,
+        "clips": clips,
         "callback_url": data.get("callback_url")
     })
 
-    return {"status": "queued", "job_id": job_id, "clips_found": len(formatted)}
+    return {"status": "queued", "job_id": job_id, "clips_requested": len(clips)}
 
 @app.get("/status/{job_id}")
 async def status(job_id: str):
     if job_id not in JOBS:
-        raise HTTPException(status_code=404)
+        raise HTTPException(404)
     return JOBS[job_id]
 
 @app.get("/health")
