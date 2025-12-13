@@ -1,161 +1,297 @@
-@app.post("/analyze-and-clip")
-async def analyze_and_clip(request: Request, background_tasks: BackgroundTasks):
-    data = await request.json()
+import os
+import json
+import uuid
+import datetime
+import subprocess
+import io
+import time
 
-    # -------------------------------
-    # FIX: segments_json may be:
-    # - a list (correct)
-    # - a string containing JSON
-    # - a string representation from Zapier
-    # -------------------------------
-    raw_segments = data.get("segments_json")
+import yt_dlp
+import requests
 
-    if raw_segments is None:
-        return JSONResponse({"error": "segments_json missing"}, status_code=400)
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi.responses import JSONResponse
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
-    # If string → try to parse
-    if isinstance(raw_segments, str):
-        try:
-            segments_json = json.loads(raw_segments)
-        except Exception:
-            return JSONResponse(
-                {"error": "segments_json is a string but not valid JSON"},
-                status_code=400
-            )
-    else:
-        segments_json = raw_segments
+# --------------------------------------------------
+# APP
+# --------------------------------------------------
+app = FastAPI()
 
-    # Must now be a list
-    if not isinstance(segments_json, list):
-        return JSONResponse({"error": "segments_json must be a JSON array"}, status_code=400)
+# --------------------------------------------------
+# STATE
+# --------------------------------------------------
+JOBS: dict[str, dict] = {}
 
-    # -------------------------------
-    # Normalize text fields safely
-    # -------------------------------
-    def normalize_text(t):
-        if not isinstance(t, str):
-            return t
-        t = (
-            t.replace("&quot;", '"')
-             .replace("&#39;", "'")
-             .replace("&gt;", ">")
-             .replace("&lt;", "<")
-             .replace("&amp;", "&")
-        )
-        return t
+LATEST_INGEST = {
+    "file_id": None,
+    "title": None,
+    "folder_id": None
+}
 
-    for seg in segments_json:
-        if isinstance(seg, dict) and "text" in seg:
-            seg["text"] = normalize_text(seg["text"])
+# --------------------------------------------------
+# UTIL
+# --------------------------------------------------
+def log(job_id: str, msg: str):
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    JOBS.setdefault(job_id, {}).setdefault("logs", []).append(f"{ts} | {msg}")
 
-    # Extract other fields
-    video_total_len_sec = data.get("video_total_len_sec")
-    min_clip_len_sec = data.get("min_clip_len_sec")
-    max_clip_len_sec = data.get("max_clip_len_sec")
-    max_clip_count = data.get("max_clip_count")
-    drive_file_id = data.get("drive_file_id")
-    folder_id = data.get("folder_id")
-    video_title = data.get("video_title") or "video"
-    callback_url = data.get("callback_url")
+def sanitize_filename(name: str):
+    for c in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
+        name = name.replace(c, "_")
+    return name.strip() or "clip"
 
-    # -------------------------------
-    # Build OpenAI prompt
-    # -------------------------------
-    prompt = f"""
-You are an expert short-form editor.
-Choose up to {max_clip_count} clips.
+# --------------------------------------------------
+# COOKIES
+# --------------------------------------------------
+COOKIES_PATH = "/app/cookies.txt"
+if "YOUTUBE_COOKIES" in os.environ:
+    with open(COOKIES_PATH, "w") as f:
+        f.write(os.environ["YOUTUBE_COOKIES"])
 
-Rules:
-- Use segments_json (provided separately below)
-- Use only time ranges within {video_total_len_sec} seconds
-- Each clip must be between {min_clip_len_sec} and {max_clip_len_sec} seconds
-Return ONLY valid JSON with:
-{{
-  "clips": [
-    {{
-      "title": "string",
-      "hook": "string",
-      "summary": "string",
-      "keywords_csv": "string",
-      "start_sec": 0,
-      "end_sec": 0,
-      "duration_sec": 0,
-      "confidence": 0.0,
-      "reason": "string"
-    }}
-  ]
-}}
-"""
+# --------------------------------------------------
+# GOOGLE DRIVE
+# --------------------------------------------------
+def get_drive_client():
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(os.environ["GOOGLE_CREDENTIALS"]),
+        scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    return build("drive", "v3", credentials=creds)
 
-    import time
+# --------------------------------------------------
+# YOUTUBE DOWNLOAD
+# --------------------------------------------------
+def download_video(url: str, title: str, job_id=None):
+    out = f"/tmp/{title}.mp4"
+    opts = {
+        "outtmpl": out,
+        "format": "mp4",
+        "cookies": COOKIES_PATH,
+        "quiet": True
+    }
+    if job_id: log(job_id, "Downloading YouTube video")
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+    return out
 
-    OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-    if not OPENAI_API_KEY:
-        return {"error": "Missing OPENAI_API_KEY"}
+# --------------------------------------------------
+# DRIVE DOWNLOAD
+# --------------------------------------------------
+def download_from_drive(file_id: str, job_id=None):
+    drive = get_drive_client()
+    req = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
 
-    result = None
-    last_err = None
+    path = f"/tmp/{file_id}.mp4"
+    with open(path, "wb") as f:
+        f.write(fh.getvalue())
+    return path
 
-    for attempt in range(4):
-        try:
-            r = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {"role": "system", "content": "Return ONLY valid JSON."},
-                        {"role": "user", "content": prompt},
-                        {"role": "user", "content": json.dumps(segments_json)}
-                    ]
-                },
-                timeout=45
-            )
-            if r.status_code == 429:
-                last_err = r.text
-                time.sleep(1 + attempt)
-                continue
+# --------------------------------------------------
+# DRIVE UPLOAD
+# --------------------------------------------------
+def upload_to_drive(path: str, title: str, folder_id: str, job_id=None):
+    drive = get_drive_client()
+    media = MediaFileUpload(path, mimetype="video/mp4", resumable=True)
+    meta = {"name": f"{title}.mp4", "parents": [folder_id]}
+    req = drive.files().create(
+        body=meta,
+        media_body=media,
+        fields="id,webViewLink",
+        supportsAllDrives=True
+    )
+    resp = None
+    while resp is None:
+        _, resp = req.next_chunk()
+    return resp
 
-            r.raise_for_status()
-            content = r.json()["choices"][0]["message"]["content"]
-            result = json.loads(content)
-            break
+# --------------------------------------------------
+# FFMPEG
+# --------------------------------------------------
+def make_clip(src, out, start, dur, job_id=None):
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start),
+        "-i", src,
+        "-t", str(dur),
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        "-preset", "veryfast",
+        out
+    ]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        raise Exception(r.stderr[-400:])
 
-        except Exception as e:
-            last_err = str(e)
-            time.sleep(1)
+# --------------------------------------------------
+# BACKGROUND: INGEST
+# --------------------------------------------------
+def process_ingest(job_id, url, title, callback):
+    try:
+        JOBS[job_id]["status"] = "downloading"
+        path = download_video(url, title, job_id)
 
-    if result is None:
-        return {"error": f"OpenAI failed: {last_err}"}
+        JOBS[job_id]["status"] = "uploading"
+        res = upload_to_drive(path, title, os.environ["DRIVE_FOLDER_ID"], job_id)
 
-    clips = result.get("clips", [])
-    if not clips:
-        return {"error": "OpenAI returned no clips"}
+        LATEST_INGEST["file_id"] = res["id"]
+        LATEST_INGEST["title"] = title
+        LATEST_INGEST["folder_id"] = os.environ["DRIVE_FOLDER_ID"]
 
-    formatted = []
-    for i, clip in enumerate(clips, start=1):
-        formatted.append({
-            "index": i,
-            "start": clip["start_sec"],
-            "duration": clip["duration_sec"],
-            "name": f"{video_title}_clip_{i}"
+        JOBS[job_id]["status"] = "success"
+        JOBS[job_id]["file_id"] = res["id"]
+
+    except Exception as e:
+        JOBS[job_id]["status"] = "failed"
+        JOBS[job_id]["error"] = str(e)
+
+    if callback:
+        requests.post(callback, json=JOBS[job_id])
+
+# --------------------------------------------------
+# BACKGROUND: CLIPS
+# --------------------------------------------------
+def process_clips(job_id, payload):
+    src = download_from_drive(payload["drive_file_id"], job_id)
+    JOBS[job_id]["clips"] = []
+
+    base = sanitize_filename(payload["video_title"])
+
+    for clip in payload["clips"]:
+        idx = int(clip["index"])
+        out = f"/tmp/{base}_{idx}.mp4"
+        make_clip(src, out, clip["start"], clip["duration"], job_id)
+        up = upload_to_drive(out, f"{base}_{idx}", payload["folder_id"], job_id)
+        JOBS[job_id]["clips"].append({
+            "index": idx,
+            "file_id": up["id"],
+            "link": up["webViewLink"]
         })
 
-    payload = {
-        "drive_file_id": drive_file_id,
-        "folder_id": folder_id,
-        "video_title": video_title,
-        "clips": formatted,
-        "callback_url": callback_url
-    }
+    JOBS[job_id]["status"] = "success"
+    if payload.get("callback_url"):
+        requests.post(payload["callback_url"], json=JOBS[job_id])
+
+# --------------------------------------------------
+# ROUTES
+# --------------------------------------------------
+@app.post("/ingest")
+async def ingest(req: Request, bg: BackgroundTasks):
+    data = await req.json()
+    url = data.get("url")
+    if not url:
+        return JSONResponse({"error": "missing url"}, 400)
+
+    title = url.split("v=")[-1].split("&")[0]
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"job_id": job_id, "status": "queued"}
+
+    bg.add_task(process_ingest, job_id, url, title, data.get("callback_url"))
+    return {"status": "queued", "job_id": job_id}
+
+@app.post("/clips")
+async def clips(req: Request, bg: BackgroundTasks):
+    data = await req.json()
+    if not LATEST_INGEST["file_id"]:
+        return JSONResponse({"error": "no ingest yet"}, 400)
 
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {"job_id": job_id, "status": "queued"}
 
-    background_tasks.add_task(process_clip_job, job_id, payload)
+    data["drive_file_id"] = LATEST_INGEST["file_id"]
+    data["folder_id"] = LATEST_INGEST["folder_id"]
+    data["video_title"] = data.get("video_title") or LATEST_INGEST["title"]
+
+    bg.add_task(process_clips, job_id, data)
+    return {"status": "queued", "job_id": job_id}
+
+@app.post("/analyze-and-clip")
+async def analyze_and_clip(req: Request, bg: BackgroundTasks):
+    data = await req.json()
+
+    # -------- NORMALIZE SEGMENTS (ACCEPT ANYTHING) --------
+    raw = data.get("segments_json", [])
+    segments = []
+
+    if isinstance(raw, list):
+        segments = raw
+    elif isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                segments = parsed
+        except:
+            segments = []
+    elif isinstance(raw, dict):
+        if "segments_array" in raw and isinstance(raw["segments_array"], list):
+            segments = raw["segments_array"]
+        else:
+            segments = [v for k, v in sorted(raw.items()) if isinstance(v, dict)]
+
+    if not segments:
+        return JSONResponse({"error": "no segments usable"}, 400)
+
+    # -------- OPENAI --------
+    prompt = f"""
+Choose up to {data['max_clip_count']} clips.
+Each clip {data['min_clip_len_sec']}–{data['max_clip_len_sec']} seconds.
+Return JSON only.
+"""
+
+    r = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": "gpt-4o-mini",
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": "Return ONLY JSON"},
+                {"role": "user", "content": prompt},
+                {"role": "user", "content": json.dumps(segments)}
+            ]
+        }
+    )
+
+    clips = json.loads(r.json()["choices"][0]["message"]["content"]).get("clips", [])
+
+    formatted = []
+    for i, c in enumerate(clips, 1):
+        formatted.append({
+            "index": i,
+            "start": c["start_sec"],
+            "duration": c["duration_sec"],
+            "name": f"clip_{i}"
+        })
+
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"job_id": job_id, "status": "queued"}
+
+    bg.add_task(process_clips, job_id, {
+        "drive_file_id": data["drive_file_id"],
+        "folder_id": data["folder_id"],
+        "video_title": data.get("video_title", "video"),
+        "clips": formatted,
+        "callback_url": data.get("callback_url")
+    })
 
     return {"status": "queued", "job_id": job_id, "clips_found": len(formatted)}
+
+@app.get("/status/{job_id}")
+async def status(job_id: str):
+    if job_id not in JOBS:
+        raise HTTPException(404)
+    return JOBS[job_id]
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
