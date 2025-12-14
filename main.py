@@ -6,7 +6,7 @@ import subprocess
 import io
 import requests
 
-from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -22,11 +22,11 @@ LATEST_INGEST = {
     "folder_id": None
 }
 
-def log(job_id, msg):
-    ts = datetime.datetime.utcnow().isoformat()
-    JOBS.setdefault(job_id, {}).setdefault("logs", []).append(f"{ts} | {msg}")
+# ----------------- UTILS -----------------
+def log(msg):
+    print(f"[LOG] {msg}")
 
-# ---------- GOOGLE DRIVE ----------
+# ----------------- DRIVE -----------------
 def get_drive():
     creds = service_account.Credentials.from_service_account_info(
         json.loads(os.environ["GOOGLE_CREDENTIALS"]),
@@ -58,20 +58,22 @@ def upload_to_drive(path, name, folder_id):
         supportsAllDrives=True
     ).execute()
 
-# ---------- FFMPEG ----------
+# ----------------- FFMPEG -----------------
 def clip_video(src, out, start, duration):
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(start),
-        "-i", src,
-        "-t", str(duration),
-        "-c:v", "libx264",
-        "-c:a", "aac",
-        out
-    ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-ss", str(start),
+            "-i", src,
+            "-t", str(duration),
+            "-c:v", "libx264",
+            "-c:a", "aac",
+            out
+        ],
+        check=True
+    )
 
-# ---------- INGEST ----------
+# ----------------- INGEST -----------------
 @app.post("/ingest")
 async def ingest(req: Request):
     data = await req.json()
@@ -83,30 +85,26 @@ async def ingest(req: Request):
     LATEST_INGEST["folder_id"] = data["folder_id"]
     LATEST_INGEST["title"] = data.get("video_title", "video")
 
+    log("Ingest set successfully")
     return {"status": "ok"}
 
-# ---------- ANALYZE AND CLIP ----------
+# ----------------- ANALYZE + CLIP -----------------
 @app.post("/analyze-and-clip")
 async def analyze_and_clip(req: Request, bg: BackgroundTasks):
     raw = await req.body()
-    print("RAW PAYLOAD:", raw.decode(errors="ignore"))
+    log(f"RAW PAYLOAD: {raw.decode(errors='ignore')}")
 
     data = await req.json()
 
-    # 🔧 ZAPIER NORMALIZATION FIX
     segments = None
 
-    # Case 1: Zapier sent misspelled, stringified JSON
-    if "segements_json" in data:
+    # ✅ FIX: normalize Zapier payload
+    if "segments_json" in data:
         try:
-            parsed = json.loads(data["segements_json"])
+            parsed = json.loads(data["segments_json"])
             segments = parsed.get("segments")
-        except Exception:
-            pass
-
-    # Case 2: Correct direct array
-    if segments is None:
-        segments = data.get("segments")
+        except Exception as e:
+            log(f"Failed to parse segments_json: {e}")
 
     if not isinstance(segments, list) or not segments:
         return JSONResponse({"error": "no segments usable"}, 400)
@@ -119,7 +117,6 @@ async def analyze_and_clip(req: Request, bg: BackgroundTasks):
 
     bg.add_task(
         run_clips,
-        job_id,
         segments,
         data.get("video_title"),
         data.get("callback_url")
@@ -131,29 +128,26 @@ async def analyze_and_clip(req: Request, bg: BackgroundTasks):
         "job_id": job_id
     }
 
-def run_clips(job_id, segments, title, callback):
+def run_clips(segments, title, callback):
     src = download_from_drive(LATEST_INGEST["file_id"])
     folder = LATEST_INGEST["folder_id"]
     base = title or LATEST_INGEST["title"]
 
-    results = []
+    count = 0
 
     for i, seg in enumerate(segments, 1):
         out = f"/tmp/{base}_{i}.mp4"
         clip_video(src, out, seg["start"], seg["duration"])
-        up = upload_to_drive(out, f"{base}_{i}", folder)
-        results.append(up["id"])
-
-    JOBS[job_id]["status"] = "success"
-    JOBS[job_id]["clips"] = results
+        upload_to_drive(out, f"{base}_{i}", folder)
+        count += 1
 
     if callback:
         requests.post(callback, json={
             "status": "done",
-            "clips_created": len(results)
+            "clips_created": count
         })
 
-# ---------- HEALTH ----------
+# ----------------- HEALTH -----------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
