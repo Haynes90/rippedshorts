@@ -4,8 +4,6 @@ import uuid
 import datetime
 import subprocess
 import io
-
-import yt_dlp
 import requests
 
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
@@ -14,283 +12,128 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
-# --------------------------------------------------
-# APP
-# --------------------------------------------------
 app = FastAPI()
 
-# --------------------------------------------------
-# STATE
-# --------------------------------------------------
 JOBS = {}
+
 LATEST_INGEST = {
     "file_id": None,
     "title": None,
     "folder_id": None
 }
 
-# --------------------------------------------------
-# UTIL
-# --------------------------------------------------
-def log(job_id: str, msg: str):
-    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+def log(job_id, msg):
+    ts = datetime.datetime.utcnow().isoformat()
     JOBS.setdefault(job_id, {}).setdefault("logs", []).append(f"{ts} | {msg}")
-    print(f"{ts} | {msg}", flush=True)
 
-def sanitize_filename(name: str):
-    for c in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
-        name = name.replace(c, "_")
-    return name.strip() or "clip"
-
-# --------------------------------------------------
-# COOKIES
-# --------------------------------------------------
-COOKIES_PATH = "/app/cookies.txt"
-if "YOUTUBE_COOKIES" in os.environ:
-    with open(COOKIES_PATH, "w") as f:
-        f.write(os.environ["YOUTUBE_COOKIES"])
-
-# --------------------------------------------------
-# GOOGLE DRIVE
-# --------------------------------------------------
-def get_drive_client():
+# ---------- GOOGLE DRIVE ----------
+def get_drive():
     creds = service_account.Credentials.from_service_account_info(
         json.loads(os.environ["GOOGLE_CREDENTIALS"]),
         scopes=["https://www.googleapis.com/auth/drive"]
     )
     return build("drive", "v3", credentials=creds)
 
-# --------------------------------------------------
-# YOUTUBE INGEST (FULL VIDEO)
-# --------------------------------------------------
-def download_video(url: str, title: str, job_id=None):
-    out = f"/tmp/{title}.mp4"
-
-    opts = {
-        "format": "bv*+ba/best",
-        "merge_output_format": "mp4",
-        "outtmpl": out,
-        "cookies": COOKIES_PATH,
-        "quiet": True,
-        "retries": 10,
-        "fragment_retries": 10,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web", "ios"]
-            }
-        },
-    }
-
-    log(job_id, "Starting YouTube ingest")
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
-
-    if not os.path.exists(out) or os.path.getsize(out) == 0:
-        raise Exception("YouTube ingest produced empty file")
-
-    log(job_id, f"Ingested video size: {os.path.getsize(out)} bytes")
-    return out
-
-# --------------------------------------------------
-# DRIVE DOWNLOAD (FOR CLIPPING)
-# --------------------------------------------------
-def download_from_drive(file_id: str, job_id=None):
-    drive = get_drive_client()
+def download_from_drive(file_id):
+    drive = get_drive()
     req = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
-
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, req)
-
     done = False
     while not done:
         _, done = downloader.next_chunk()
-
     path = f"/tmp/{file_id}.mp4"
     with open(path, "wb") as f:
         f.write(fh.getvalue())
-
-    size = os.path.getsize(path)
-    log(job_id, f"Downloaded source from Drive ({size} bytes)")
-
-    if size == 0:
-        raise Exception("Drive download produced empty file")
-
     return path
 
-# --------------------------------------------------
-# DRIVE UPLOAD
-# --------------------------------------------------
-def upload_to_drive(path: str, title: str, folder_id: str, job_id=None):
-    drive = get_drive_client()
-
-    media = MediaFileUpload(path, mimetype="video/mp4", resumable=True)
-    meta = {"name": f"{title}.mp4", "parents": [folder_id]}
-
-    req = drive.files().create(
+def upload_to_drive(path, name, folder_id):
+    drive = get_drive()
+    media = MediaFileUpload(path, mimetype="video/mp4")
+    meta = {"name": f"{name}.mp4", "parents": [folder_id]}
+    return drive.files().create(
         body=meta,
         media_body=media,
         fields="id,webViewLink",
         supportsAllDrives=True
-    )
+    ).execute()
 
-    resp = None
-    while resp is None:
-        _, resp = req.next_chunk()
-
-    log(job_id, f"Uploaded to Drive: {resp['id']}")
-    return resp
-
-# --------------------------------------------------
-# FFMPEG CLIP
-# --------------------------------------------------
-def make_clip(src, out, start, dur, job_id=None):
+# ---------- FFMPEG ----------
+def clip_video(src, out, start, duration):
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start),
         "-i", src,
-        "-t", str(dur),
+        "-t", str(duration),
         "-c:v", "libx264",
         "-c:a", "aac",
-        "-preset", "veryfast",
         out
     ]
+    subprocess.run(cmd, check=True)
 
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if r.returncode != 0:
-        raise Exception(r.stderr[-400:])
-
-    size = os.path.getsize(out)
-    log(job_id, f"Created clip ({size} bytes)")
-
-    if size == 0:
-        raise Exception("ffmpeg produced empty clip")
-
-# --------------------------------------------------
-# BACKGROUND: INGEST
-# --------------------------------------------------
-def process_ingest(job_id, url, title, callback):
-    try:
-        path = download_video(url, title, job_id)
-        res = upload_to_drive(path, title, os.environ["DRIVE_FOLDER_ID"], job_id)
-
-        LATEST_INGEST.update({
-            "file_id": res["id"],
-            "title": title,
-            "folder_id": os.environ["DRIVE_FOLDER_ID"]
-        })
-
-        JOBS[job_id]["status"] = "success"
-        JOBS[job_id]["file_id"] = res["id"]
-
-    except Exception as e:
-        JOBS[job_id]["status"] = "failed"
-        JOBS[job_id]["error"] = str(e)
-
-    if callback:
-        requests.post(callback, json=JOBS[job_id], timeout=15)
-
-# --------------------------------------------------
-# BACKGROUND: CLIPS
-# --------------------------------------------------
-def process_clips(job_id, payload):
-    created = 0
-    uploaded = 0
-
-    try:
-        src = download_from_drive(payload["drive_file_id"], job_id)
-        base = sanitize_filename(payload["video_title"])
-        JOBS[job_id]["clips"] = []
-
-        for clip in payload["clips"]:
-            idx = int(clip["index"])
-            out = f"/tmp/{base}_{idx}.mp4"
-
-            make_clip(src, out, clip["start"], clip["duration"], job_id)
-            created += 1
-
-            up = upload_to_drive(out, f"{base}_{idx}", payload["folder_id"], job_id)
-            uploaded += 1
-
-            JOBS[job_id]["clips"].append({
-                "index": idx,
-                "file_id": up["id"]
-            })
-
-        JOBS[job_id]["status"] = "success"
-
-    except Exception as e:
-        JOBS[job_id]["status"] = "failed"
-        JOBS[job_id]["error"] = str(e)
-
-    JOBS[job_id]["clips_created"] = created
-    JOBS[job_id]["clips_uploaded"] = uploaded
-
-    if payload.get("callback_url"):
-        requests.post(payload["callback_url"], json=JOBS[job_id], timeout=20)
-
-# --------------------------------------------------
-# ROUTES
-# --------------------------------------------------
+# ---------- INGEST ----------
 @app.post("/ingest")
 async def ingest(req: Request, bg: BackgroundTasks):
     data = await req.json()
-    url = data.get("url")
-    if not url:
-        return JSONResponse({"error": "missing url"}, 400)
+    file_id = data.get("drive_file_id")
+    title = data.get("video_title", "video")
+    folder = data.get("folder_id")
 
-    title = url.split("v=")[-1].split("&")[0]
-    job_id = str(uuid.uuid4())
-    JOBS[job_id] = {"job_id": job_id, "status": "queued"}
+    if not file_id or not folder:
+        return JSONResponse({"error": "missing drive_file_id or folder_id"}, 400)
 
-    bg.add_task(process_ingest, job_id, url, title, data.get("callback_url"))
-    return {"status": "queued", "job_id": job_id}
-
-@app.post("/analyze-and-clip")
-async def analyze_and_clip(req: Request, bg: BackgroundTasks):
-    data = await req.json()
-
-    raw = data.get("segments_json")
-    segments = []
-
-    if isinstance(raw, list):
-        segments = raw
-    elif isinstance(raw, dict):
-        for v in raw.values():
-            if isinstance(v, list):
-                segments = v
-                break
-
-    if not segments:
-        return {"status": "ok", "note": "no segments", "clips_found": 0}
-
-    clips = []
-    for i, seg in enumerate(segments, start=1):
-        clips.append({
-            "index": i,
-            "start": seg.get("start") or seg.get("offset"),
-            "duration": seg.get("duration")
-        })
-
-    job_id = str(uuid.uuid4())
-    JOBS[job_id] = {"job_id": job_id, "status": "queued"}
-
-    bg.add_task(process_clips, job_id, {
-        "drive_file_id": data["drive_file_id"],
-        "folder_id": data["folder_id"],
-        "video_title": data.get("video_title", "video"),
-        "clips": clips,
-        "callback_url": data.get("callback_url")
+    LATEST_INGEST.update({
+        "file_id": file_id,
+        "title": title,
+        "folder_id": folder
     })
 
-    return {"status": "queued", "job_id": job_id, "clips_requested": len(clips)}
-
-@app.get("/status/{job_id}")
-async def status(job_id: str):
-    if job_id not in JOBS:
-        raise HTTPException(404)
-    return JOBS[job_id]
-
-@app.get("/health")
-async def health():
     return {"status": "ok"}
+
+# ---------- ANALYZE AND CLIP (USES AI SEGMENTS) ----------
+@app.post("/analyze-and-clip")
+async def analyze_and_clip(req: Request, bg: BackgroundTasks):
+    raw = await req.body()
+    print("RAW PAYLOAD:", raw.decode(errors="ignore"))
+
+    data = await req.json()
+
+    segments = data.get("segments")
+    if not isinstance(segments, list) or not segments:
+        return JSONResponse({"error": "no segments usable"}, 400)
+
+    if not LATEST_INGEST["file_id"]:
+        return JSONResponse({"error": "no ingest available"}, 400)
+
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"status": "queued"}
+
+    bg.add_task(run_clips, job_id, segments, data.get("video_title"), data.get("callback_url"))
+
+    return {
+        "status": "ok",
+        "clips_found": len(segments),
+        "job_id": job_id
+    }
+
+def run_clips(job_id, segments, title, callback):
+    src = download_from_drive(LATEST_INGEST["file_id"])
+    folder = LATEST_INGEST["folder_id"]
+    base = title or LATEST_INGEST["title"]
+
+    results = []
+
+    for i, seg in enumerate(segments, 1):
+        out = f"/tmp/{base}_{i}.mp4"
+        clip_video(src, out, seg["start"], seg["duration"])
+        up = upload_to_drive(out, f"{base}_{i}", folder)
+        results.append(up["id"])
+
+    JOBS[job_id]["status"] = "success"
+    JOBS[job_id]["clips"] = results
+
+    if callback:
+        requests.post(callback, json={
+            "status": "done",
+            "clips_created": len(results)
+        })
