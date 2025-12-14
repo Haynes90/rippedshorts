@@ -1,170 +1,127 @@
 import os
 import json
+import uuid
+import datetime
 import subprocess
 import io
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
-
-from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import JSONResponse
-
 import yt_dlp
 
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 app = FastAPI()
 
-LATEST_INGEST = {
+# -----------------------------
+# In-memory job store (debug/status)
+# -----------------------------
+JOBS: Dict[str, Dict[str, Any]] = {}
+
+# Latest ingest (convenience fallback)
+LATEST_INGEST: Dict[str, Optional[str]] = {
     "file_id": None,
+    "title": None,
     "folder_id": None,
-    "title": None
 }
 
-# ---------- GOOGLE DRIVE ----------
-def get_drive():
+# -----------------------------
+# Logging helpers
+# -----------------------------
+def _ts() -> str:
+    return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+def log(job_id: str, message: str) -> None:
+    if job_id not in JOBS:
+        return
+    JOBS[job_id].setdefault("logs", []).append(f"{_ts()} | {message}")
+
+def print_raw(label: str, payload: Any) -> None:
+    try:
+        if isinstance(payload, (bytes, bytearray)):
+            txt = payload.decode("utf-8", errors="ignore")
+        else:
+            txt = json.dumps(payload, ensure_ascii=False) if not isinstance(payload, str) else payload
+        print(f"[RAW] {label}: {txt[:8000]}")
+    except Exception:
+        print(f"[RAW] {label}: <unprintable>")
+
+# -----------------------------
+# Environment + cookies
+# -----------------------------
+COOKIES_PATH = "/app/cookies.txt"
+if os.environ.get("YOUTUBE_COOKIES"):
+    try:
+        with open(COOKIES_PATH, "w", encoding="utf-8") as f:
+            f.write(os.environ["YOUTUBE_COOKIES"])
+        print("[BOOT] Wrote cookies.txt from YOUTUBE_COOKIES")
+    except Exception as e:
+        print(f"[BOOT] Failed writing cookies.txt: {e}")
+
+# -----------------------------
+# Drive client
+# -----------------------------
+def get_drive_client():
+    if "GOOGLE_CREDENTIALS" not in os.environ:
+        raise Exception("Missing GOOGLE_CREDENTIALS env var")
+
     creds = service_account.Credentials.from_service_account_info(
         json.loads(os.environ["GOOGLE_CREDENTIALS"]),
-        scopes=["https://www.googleapis.com/auth/drive"]
+        scopes=["https://www.googleapis.com/auth/drive"],
     )
     return build("drive", "v3", credentials=creds)
 
-def upload_to_drive(path, name, folder):
-    drive = get_drive()
-    media = MediaFileUpload(path, mimetype="video/mp4")
-    meta = {"name": f"{name}.mp4", "parents": [folder]}
-    return drive.files().create(
+def drive_upload(file_path: str, filename: str, folder_id: str) -> Dict[str, Any]:
+    drive = get_drive_client()
+    meta = {"name": filename, "parents": [folder_id]}
+    media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
+
+    req = drive.files().create(
         body=meta,
         media_body=media,
-        fields="id",
-        supportsAllDrives=True
-    ).execute()
+        fields="id,webViewLink",
+        supportsAllDrives=True,
+    )
 
-def download_from_drive(file_id):
-    drive = get_drive()
+    resp = None
+    while resp is None:
+        _, resp = req.next_chunk(num_retries=5)
+    return resp
+
+def drive_download(file_id: str) -> str:
+    drive = get_drive_client()
     req = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
+
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, req)
+
     done = False
     while not done:
-        _, done = downloader.next_chunk()
-    path = f"/tmp/{file_id}.mp4"
-    with open(path, "wb") as f:
+        _, done = downloader.next_chunk(num_retries=5)
+
+    local_path = f"/tmp/{file_id}.mp4"
+    with open(local_path, "wb") as f:
         f.write(fh.getvalue())
-    return path
+    return local_path
 
-# ---------- YOUTUBE DOWNLOAD ----------
-def download_youtube(url, title):
-    out = f"/tmp/{title}.mp4"
-    opts = {
-        "outtmpl": out,
-        "format": "mp4",
-        "quiet": True,
-        "noprogress": True,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
-    return out
+# -----------------------------
+# Filename safety
+# -----------------------------
+def sanitize_filename(name: str) -> str:
+    if not name:
+        return "video"
+    bad = ['/', '\\', ':', '*', '?', '"', '<', '>', '|']
+    for ch in bad:
+        name = name.replace(ch, "_")
+    name = " ".join(name.split()).strip()
+    return name or "video"
 
-# ---------- FFMPEG ----------
-def clip_video(src, out, start, duration):
-    subprocess.run(
-        ["ffmpeg", "-y", "-ss", str(start), "-i", src, "-t", str(duration),
-         "-c:v", "libx264", "-c:a", "aac", out],
-        check=True
-    )
-
-# ---------- INGEST ----------
-@app.post("/ingest")
-async def ingest(req: Request):
-    data = await req.json()
-    print("[INGEST RAW]", data)
-
-    url = data.get("url")
-    folder = data.get("folder_id")
-    title = data.get("video_title")
-
-    # 🔁 MODE B: keep last file, do nothing
-    if not url or not folder:
-        if LATEST_INGEST["file_id"]:
-            return {
-                "status": "ok",
-                "note": "using previous ingest",
-                "drive_file_id": LATEST_INGEST["file_id"]
-            }
-        return {
-            "status": "ok",
-            "note": "no ingest performed"
-        }
-
-    # 🔽 MODE A: full ingest
-    try:
-        local = download_youtube(url, title or "video")
-        uploaded = upload_to_drive(local, title or "video", folder)
-
-        LATEST_INGEST.update({
-            "file_id": uploaded["id"],
-            "folder_id": folder,
-            "title": title or "video"
-        })
-
-        return {
-            "status": "ok",
-            "drive_file_id": uploaded["id"]
-        }
-
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, 500)
-
-# ---------- ANALYZE + CLIP ----------
-@app.post("/analyze-and-clip")
-async def analyze_and_clip(req: Request, bg: BackgroundTasks):
-    raw = await req.body()
-    print("[RAW]", raw.decode(errors="ignore"))
-
-    data = await req.json()
-    segments = []
-
-    raw_segments = data.get("segments_json")
-
-    if isinstance(raw_segments, str) and '"segments"' in raw_segments:
-        try:
-            parsed = json.loads(raw_segments)
-            segments = parsed.get("segments", [])
-        except Exception:
-            return {"status": "ok", "clips_found": 0}
-
-    if not segments or not LATEST_INGEST["file_id"]:
-        return {"status": "ok", "clips_found": 0}
-
-    bg.add_task(
-        run_clips,
-        segments,
-        data.get("video_title"),
-        data.get("callback_url")
-    )
-
-    return {"status": "ok", "clips_found": len(segments)}
-
-def run_clips(segments, title, callback):
-    src = download_from_drive(LATEST_INGEST["file_id"])
-    folder = LATEST_INGEST["folder_id"]
-    base = title or LATEST_INGEST["title"]
-
-    count = 0
-    for i, seg in enumerate(segments, 1):
-        out = f"/tmp/{base}_{i}.mp4"
-        clip_video(src, out, seg["start"], seg["duration"])
-        upload_to_drive(out, f"{base}_{i}", folder)
-        count += 1
-
-    if callback:
-        requests.post(callback, json={
-            "status": "done",
-            "clips_created": count
-        })
-
-# ---------- HEALTH ----------
-@app.get("/health")
-async def health():
-    return {"ok": True}
+# -----------------------------
+# yt-dlp download (full video)
+# -----------------------------
+d
