@@ -73,24 +73,19 @@ def clip_video(src, out, start, duration):
 
 # ---------- INGEST ----------
 @app.post("/ingest")
-async def ingest(req: Request, bg: BackgroundTasks):
+async def ingest(req: Request):
     data = await req.json()
-    file_id = data.get("drive_file_id")
-    title = data.get("video_title", "video")
-    folder = data.get("folder_id")
 
-    if not file_id or not folder:
+    if not data.get("drive_file_id") or not data.get("folder_id"):
         return JSONResponse({"error": "missing drive_file_id or folder_id"}, 400)
 
-    LATEST_INGEST.update({
-        "file_id": file_id,
-        "title": title,
-        "folder_id": folder
-    })
+    LATEST_INGEST["file_id"] = data["drive_file_id"]
+    LATEST_INGEST["folder_id"] = data["folder_id"]
+    LATEST_INGEST["title"] = data.get("video_title", "video")
 
     return {"status": "ok"}
 
-# ---------- ANALYZE AND CLIP (USES AI SEGMENTS) ----------
+# ---------- ANALYZE AND CLIP ----------
 @app.post("/analyze-and-clip")
 async def analyze_and_clip(req: Request, bg: BackgroundTasks):
     raw = await req.body()
@@ -98,7 +93,21 @@ async def analyze_and_clip(req: Request, bg: BackgroundTasks):
 
     data = await req.json()
 
-    segments = data.get("segments")
+    # 🔧 ZAPIER NORMALIZATION FIX
+    segments = None
+
+    # Case 1: Zapier sent misspelled, stringified JSON
+    if "segements_json" in data:
+        try:
+            parsed = json.loads(data["segements_json"])
+            segments = parsed.get("segments")
+        except Exception:
+            pass
+
+    # Case 2: Correct direct array
+    if segments is None:
+        segments = data.get("segments")
+
     if not isinstance(segments, list) or not segments:
         return JSONResponse({"error": "no segments usable"}, 400)
 
@@ -108,7 +117,13 @@ async def analyze_and_clip(req: Request, bg: BackgroundTasks):
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {"status": "queued"}
 
-    bg.add_task(run_clips, job_id, segments, data.get("video_title"), data.get("callback_url"))
+    bg.add_task(
+        run_clips,
+        job_id,
+        segments,
+        data.get("video_title"),
+        data.get("callback_url")
+    )
 
     return {
         "status": "ok",
@@ -137,3 +152,8 @@ def run_clips(job_id, segments, title, callback):
             "status": "done",
             "clips_created": len(results)
         })
+
+# ---------- HEALTH ----------
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
