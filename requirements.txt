@@ -6,3 +6,6 @@ google-auth-oauthlib
 yt-dlp
 python-multipart
 requests
+mediapipe
+opencv-python
+numpy
