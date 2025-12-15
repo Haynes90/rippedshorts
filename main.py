@@ -5,6 +5,9 @@ import subprocess
 import io
 import yt_dlp
 import requests
+import cv2
+import mediapipe as mp
+import numpy as np
 
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -73,7 +76,7 @@ def download_from_drive(file_id):
     with open(path, "wb") as f:
         f.write(fh.getvalue())
     if os.path.getsize(path) == 0:
-        raise Exception("Downloaded Drive file is empty")
+        raise Exception("Downloaded Drive file empty")
     return path
 
 # --------------------------------------------------
@@ -108,12 +111,132 @@ async def ingest(req: Request, bg: BackgroundTasks):
     data = await req.json()
     raw_log("INGEST", data)
 
-    if "url" not in data:
-        return JSONResponse({"error": "missing url"}, 400)
-
     title = data["url"].split("v=")[-1].split("&")[0]
     bg.add_task(process_ingest, data["url"], title)
     return {"status": "queued"}
 
 # --------------------------------------------------
-# STEP 1 — BASE REEL
+# STEP 2 — FACE-AWARE REELIFY
+# --------------------------------------------------
+def reelify_face_follow(input_path: str, output_path: str):
+    """
+    Create a 9:16 reel that follows the dominant face.
+    Falls back to center crop if no face is found.
+    """
+
+    cap = cv2.VideoCapture(input_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    crop_h = height
+    crop_w = int(crop_h * 9 / 16)
+
+    face_centers = []
+
+    mp_face = mp.solutions.face_detection.FaceDetection(
+        model_selection=0,
+        min_detection_confidence=0.5
+    )
+
+    frame_idx = 0
+    sample_every = int(fps // 3) if fps > 0 else 5  # ~3 samples/sec
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_idx % sample_every == 0:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = mp_face.process(rgb)
+
+            if res.detections:
+                # choose largest face
+                best = max(
+                    res.detections,
+                    key=lambda d: d.location_data.relative_bounding_box.width
+                )
+                bbox = best.location_data.relative_bounding_box
+                cx = int((bbox.xmin + bbox.width / 2) * width)
+                face_centers.append(cx)
+
+        frame_idx += 1
+
+    cap.release()
+
+    # Determine crop center
+    if face_centers:
+        center_x = int(np.mean(face_centers))
+    else:
+        center_x = width // 2  # fallback
+
+    crop_x = max(0, min(center_x - crop_w // 2, width - crop_w))
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-vf", f"crop={crop_w}:{crop_h}:{crop_x}:0,scale=1080:1920",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-c:a", "aac",
+        output_path
+    ]
+
+    subprocess.run(cmd, check=True)
+
+# --------------------------------------------------
+# ANALYZE + CLIP
+# --------------------------------------------------
+@app.post("/analyze-and-clip")
+async def analyze_and_clip(req: Request, bg: BackgroundTasks):
+    data = await req.json()
+    raw_log("ANALYZE", data)
+
+    segments = data.get("segments", [])
+    if not segments:
+        return {"clips_found": 0}
+
+    def run():
+        src = download_from_drive(LATEST_INGEST["file_id"])
+        base = sanitize(data.get("video_title") or LATEST_INGEST["title"])
+
+        for i, s in enumerate(segments, 1):
+            start = float(s["start"])
+            dur = float(s["duration"])
+
+            clip_path = f"/tmp/{base}_{i}.mp4"
+
+            # clip segment
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-ss", str(start),
+                "-i", src,
+                "-t", str(dur),
+                "-c:v", "libx264",
+                "-c:a", "aac",
+                clip_path
+            ], check=True)
+
+            # face-aware reelify (replace)
+            reelify_face_follow(clip_path, clip_path)
+
+            upload_to_drive(
+                clip_path,
+                f"{base}_{i}",
+                LATEST_INGEST["folder_id"]
+            )
+
+        if data.get("callback_url"):
+            requests.post(data["callback_url"], json={
+                "status": "success",
+                "clips_uploaded": len(segments)
+            }, timeout=10)
+
+    bg.add_task(run)
+    return {"status": "queued", "clips": len(segments)}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
