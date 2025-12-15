@@ -9,6 +9,3 @@ requests
 mediapipe
 opencv-python
 numpy
-pyannote.audio
-torch
-torchaudio
