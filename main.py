@@ -39,50 +39,44 @@ def sanitize(name):
     return name.strip() or "clip"
 
 # --------------------------------------------------
-# SEGMENT NORMALIZER (FINAL)
+# SEGMENT EXTRACTION (FINAL, ROBUST)
 # --------------------------------------------------
-def normalize_segments(raw):
-    # Zapier empty-key wrapper: {"": "<json>"}
-    if isinstance(raw, dict) and "" in raw:
-        raw = raw[""]
+def extract_segments(obj, found=None):
+    """
+    Recursively walk ANY structure and extract
+    all {start, duration} objects.
+    """
+    if found is None:
+        found = []
 
-    # String → JSON
-    if isinstance(raw, str):
+    if isinstance(obj, dict):
+        # Direct match
+        if "start" in obj and "duration" in obj:
+            try:
+                found.append({
+                    "start": float(obj["start"]),
+                    "duration": float(obj["duration"])
+                })
+            except:
+                pass
+
+        # Recurse into values
+        for v in obj.values():
+            extract_segments(v, found)
+
+    elif isinstance(obj, list):
+        for item in obj:
+            extract_segments(item, found)
+
+    elif isinstance(obj, str):
+        # Try parsing JSON strings
         try:
-            raw = json.loads(raw)
-        except:
-            return []
-
-    # Unwrap Zapier field nesting: segments_json → {...}
-    if isinstance(raw, dict) and "segments_json" in raw:
-        raw = raw["segments_json"]
-
-    # Ignore AI error payloads
-    if isinstance(raw, dict) and "error" in raw:
-        return []
-
-    # { "segments": [...] }
-    if isinstance(raw, dict) and "segments" in raw:
-        raw = raw["segments"]
-
-    # Single segment object → list
-    if isinstance(raw, dict) and "start" in raw and "duration" in raw:
-        raw = [raw]
-
-    if not isinstance(raw, list):
-        return []
-
-    segments = []
-    for s in raw:
-        try:
-            segments.append({
-                "start": float(s["start"]),
-                "duration": float(s["duration"])
-            })
+            parsed = json.loads(obj)
+            extract_segments(parsed, found)
         except:
             pass
 
-    return segments
+    return found
 
 # --------------------------------------------------
 # COOKIES
@@ -132,7 +126,7 @@ def download_from_drive(file_id):
     return path
 
 # --------------------------------------------------
-# INGEST (UNCHANGED LOGIC, BUG FIXED)
+# INGEST
 # --------------------------------------------------
 def download_youtube(url, title):
     out = f"/tmp/{sanitize(title)}.mp4"
@@ -177,8 +171,7 @@ async def ingest(req: Request, bg: BackgroundTasks):
 
     title = data["url"].split("v=")[-1].split("&")[0]
     job_id = str(uuid.uuid4())
-
-    JOBS[job_id] = {"status": "queued"}  # FIXED
+    JOBS[job_id] = {"status": "queued"}
 
     bg.add_task(process_ingest, job_id, data["url"], title, data.get("callback_url"))
     return {"status": "queued", "job_id": job_id}
@@ -194,8 +187,8 @@ async def analyze_and_clip(req: Request, bg: BackgroundTasks):
     if not LATEST_INGEST["file_id"]:
         return JSONResponse({"error": "no ingest available"}, 400)
 
-    segments = normalize_segments(data.get("segments_json"))
-    print(f"[DEBUG] Segments parsed: {len(segments)}")
+    segments = extract_segments(data)
+    print(f"[DEBUG] Segments extracted: {len(segments)}")
     print(f"[DEBUG] First segment: {segments[0] if segments else None}")
 
     if not segments:
@@ -204,10 +197,7 @@ async def analyze_and_clip(req: Request, bg: BackgroundTasks):
     def run():
         try:
             print("[DEBUG] Background clip task started")
-
             src = download_from_drive(LATEST_INGEST["file_id"])
-            print(f"[DEBUG] Source downloaded ({os.path.getsize(src)} bytes)")
-
             base = sanitize(data.get("video_title") or LATEST_INGEST["title"])
 
             for i, s in enumerate(segments, 1):
@@ -228,7 +218,6 @@ async def analyze_and_clip(req: Request, bg: BackgroundTasks):
                 print(f"[DEBUG] Uploaded clip #{i}: {up['id']}")
 
             if data.get("callback_url"):
-                print("[DEBUG] Sending callback")
                 requests.post(data["callback_url"], json={
                     "status": "success",
                     "clips_created": len(segments),
