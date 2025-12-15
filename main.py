@@ -12,6 +12,9 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
+# --------------------------------------------------
+# APP + STATE
+# --------------------------------------------------
 app = FastAPI()
 
 JOBS = {}
@@ -21,7 +24,9 @@ LATEST_INGEST = {
     "folder_id": None
 }
 
-# ---------------- UTIL ----------------
+# --------------------------------------------------
+# UTIL
+# --------------------------------------------------
 def raw_log(label, payload):
     try:
         print(f"[RAW] {label}: {json.dumps(payload)[:8000]}")
@@ -33,9 +38,11 @@ def sanitize(name):
         name = name.replace(c, "_")
     return name.strip() or "clip"
 
-# ---------------- SEGMENT NORMALIZER ----------------
+# --------------------------------------------------
+# SEGMENT NORMALIZER (FINAL)
+# --------------------------------------------------
 def normalize_segments(raw):
-    # Zapier sometimes sends {"": "<json string>"}
+    # Zapier empty-key wrapper: {"": "<json>"}
     if isinstance(raw, dict) and "" in raw:
         raw = raw[""]
 
@@ -46,39 +53,48 @@ def normalize_segments(raw):
         except:
             return []
 
-    # Ignore AI error blobs
+    # Unwrap Zapier field nesting: segments_json → {...}
+    if isinstance(raw, dict) and "segments_json" in raw:
+        raw = raw["segments_json"]
+
+    # Ignore AI error payloads
     if isinstance(raw, dict) and "error" in raw:
         return []
 
-    # {segments: [...]}
+    # { "segments": [...] }
     if isinstance(raw, dict) and "segments" in raw:
         raw = raw["segments"]
 
-    # Single segment object → wrap in list
+    # Single segment object → list
     if isinstance(raw, dict) and "start" in raw and "duration" in raw:
         raw = [raw]
 
     if not isinstance(raw, list):
         return []
 
-    out = []
+    segments = []
     for s in raw:
         try:
-            out.append({
+            segments.append({
                 "start": float(s["start"]),
                 "duration": float(s["duration"])
             })
         except:
             pass
-    return out
 
-# ---------------- COOKIES ----------------
+    return segments
+
+# --------------------------------------------------
+# COOKIES
+# --------------------------------------------------
 COOKIES_PATH = "/app/cookies.txt"
 if "YOUTUBE_COOKIES" in os.environ:
     with open(COOKIES_PATH, "w") as f:
         f.write(os.environ["YOUTUBE_COOKIES"])
 
-# ---------------- DRIVE ----------------
+# --------------------------------------------------
+# GOOGLE DRIVE
+# --------------------------------------------------
 def drive_client():
     creds = service_account.Credentials.from_service_account_info(
         json.loads(os.environ["GOOGLE_CREDENTIALS"]),
@@ -115,7 +131,9 @@ def download_from_drive(file_id):
         raise Exception("Drive video empty")
     return path
 
-# ---------------- INGEST ----------------
+# --------------------------------------------------
+# INGEST (UNCHANGED LOGIC, BUG FIXED)
+# --------------------------------------------------
 def download_youtube(url, title):
     out = f"/tmp/{sanitize(title)}.mp4"
     opts = {
@@ -154,43 +172,71 @@ async def ingest(req: Request, bg: BackgroundTasks):
     data = await req.json()
     raw_log("INGEST", data)
 
+    if "url" not in data:
+        return JSONResponse({"error": "missing url"}, 400)
+
     title = data["url"].split("v=")[-1].split("&")[0]
     job_id = str(uuid.uuid4())
 
-    JOBS[job_id] = {"status": "queued"}  # ✅ FIX
+    JOBS[job_id] = {"status": "queued"}  # FIXED
 
     bg.add_task(process_ingest, job_id, data["url"], title, data.get("callback_url"))
     return {"status": "queued", "job_id": job_id}
 
-# ---------------- ANALYZE & CLIP ----------------
+# --------------------------------------------------
+# ANALYZE + CLIP
+# --------------------------------------------------
 @app.post("/analyze-and-clip")
 async def analyze_and_clip(req: Request, bg: BackgroundTasks):
     data = await req.json()
     raw_log("ANALYZE", data)
 
+    if not LATEST_INGEST["file_id"]:
+        return JSONResponse({"error": "no ingest available"}, 400)
+
     segments = normalize_segments(data.get("segments_json"))
     print(f"[DEBUG] Segments parsed: {len(segments)}")
+    print(f"[DEBUG] First segment: {segments[0] if segments else None}")
 
     if not segments:
         return {"clips_found": 0}
 
     def run():
-        src = download_from_drive(LATEST_INGEST["file_id"])
-        base = sanitize(data.get("video_title") or LATEST_INGEST["title"])
+        try:
+            print("[DEBUG] Background clip task started")
 
-        for i, s in enumerate(segments, 1):
-            out = f"/tmp/{base}_{i}.mp4"
-            subprocess.run([
-                "ffmpeg", "-y", "-ss", str(s["start"]), "-i", src,
-                "-t", str(s["duration"]), "-c:v", "libx264", "-c:a", "aac", out
-            ], check=True)
-            upload_to_drive(out, f"{base}_{i}", LATEST_INGEST["folder_id"])
+            src = download_from_drive(LATEST_INGEST["file_id"])
+            print(f"[DEBUG] Source downloaded ({os.path.getsize(src)} bytes)")
 
-        if data.get("callback_url"):
-            requests.post(data["callback_url"], json={
-                "status": "success",
-                "clips_uploaded": len(segments)
-            }, timeout=10)
+            base = sanitize(data.get("video_title") or LATEST_INGEST["title"])
+
+            for i, s in enumerate(segments, 1):
+                print(f"[DEBUG] Clipping #{i}: start={s['start']} dur={s['duration']}")
+                out = f"/tmp/{base}_{i}.mp4"
+
+                subprocess.run([
+                    "ffmpeg", "-y",
+                    "-ss", str(s["start"]),
+                    "-i", src,
+                    "-t", str(s["duration"]),
+                    "-c:v", "libx264",
+                    "-c:a", "aac",
+                    out
+                ], check=True)
+
+                up = upload_to_drive(out, f"{base}_{i}", LATEST_INGEST["folder_id"])
+                print(f"[DEBUG] Uploaded clip #{i}: {up['id']}")
+
+            if data.get("callback_url"):
+                print("[DEBUG] Sending callback")
+                requests.post(data["callback_url"], json={
+                    "status": "success",
+                    "clips_created": len(segments),
+                    "clips_uploaded": len(segments)
+                }, timeout=10)
+
+        except Exception as e:
+            print(f"[ERROR] Background task failed: {e}")
 
     bg.add_task(run)
     return {"status": "queued", "clips": len(segments)}
