@@ -172,26 +172,82 @@ async def ingest(req: Request):
 # SEGMENT NORMALIZER
 # --------------------------------------------------
 def normalize_segments(data):
-    if "" in data and isinstance(data[""], str):
-        data = json.loads(data[""])
+    """
+    Extremely defensive segment normalizer.
+    Accepts:
+    - valid JSON
+    - stringified JSON
+    - truncated JSON
+    - Zapier-wrapped payloads
+    Returns ONLY [{start, duration}]
+    NEVER raises.
+    """
 
-    raw = data.get("segments_json") or data.get("segments")
+    try:
+        # unwrap {"": "...json..."}
+        if isinstance(data, dict) and "" in data and isinstance(data[""], str):
+            data = data[""]
 
-    if isinstance(raw, str):
-        raw = json.loads(raw)
+        # parse outer string if needed
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except Exception:
+                # cannot parse outer shell → give up safely
+                debug("normalize_segments: outer JSON invalid")
+                return []
 
-    if isinstance(raw, dict):
-        raw = raw.get("segments")
+        raw = data.get("segments_json") or data.get("segments")
 
-    segments = []
-    if isinstance(raw, list):
-        for s in raw:
-            st = safe_float(s.get("start"))
-            du = safe_float(s.get("duration"))
-            if st is not None and du and du > 0:
-                segments.append({"start": st, "duration": du})
+        # If raw is a string, it may be BROKEN JSON
+        if isinstance(raw, str):
+            segments = []
+            for line in raw.splitlines():
+                line = line.strip()
+                if '"offset"' in line:
+                    try:
+                        offset = float(line.split(":")[1].strip(" ,"))
+                    except Exception:
+                        offset = None
+                if '"duration"' in line:
+                    try:
+                        duration = float(line.split(":")[1].strip(" ,"))
+                    except Exception:
+                        duration = None
 
-    return segments
+                if offset is not None and duration is not None:
+                    if duration > 0:
+                        segments.append({
+                            "start": offset,
+                            "duration": duration
+                        })
+                    offset = None
+                    duration = None
+
+            debug(f"Recovered {len(segments)} segments from broken JSON")
+            return segments
+
+        # If raw is already structured
+        if isinstance(raw, dict):
+            raw = raw.get("segments")
+
+        segments = []
+        if isinstance(raw, list):
+            for s in raw:
+                try:
+                    start = safe_float(s.get("offset") or s.get("start"))
+                    dur = safe_float(s.get("duration"))
+                    if start is not None and dur and dur > 0:
+                        segments.append({"start": start, "duration": dur})
+                except Exception:
+                    continue
+
+        return segments
+
+    except Exception as e:
+        debug(f"normalize_segments FAILED SAFELY: {e}")
+        return []
+
 
 # --------------------------------------------------
 # FFMPEG CLIP + AUDIO SAFE
