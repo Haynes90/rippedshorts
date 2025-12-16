@@ -1,5 +1,3 @@
-# (FILE IS LONG — THIS IS COMPLETE AND FINAL)
-
 import os
 import json
 import uuid
@@ -9,70 +7,68 @@ import io
 import yt_dlp
 import requests
 
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
-import cv2
-import numpy as np
-import mediapipe as mp
-
+# --------------------------------------------------
+# APP
+# --------------------------------------------------
 app = FastAPI()
-@app.post("/ingest")
-async def ingest(req: Request, bg: BackgroundTasks):
-    data = await req.json()
-    debug(f"INGEST payload: {data}")
 
-    if "url" not in data:
-        return JSONResponse({"error": "missing url"}, 400)
-
-    job_id = str(uuid.uuid4())
-    JOBS[job_id] = {"status": "queued", "logs": []}
-
-    def run():
-        try:
-            url = data["url"]
-            title = url.split("v=")[-1].split("&")[0]
-
-            job_log(job_id, f"Downloading YouTube: {url}")
-            path = download_youtube(url, title)
-            job_log(job_id, f"Downloaded: {os.path.getsize(path)} bytes")
-
-            job_log(job_id, "Uploading to Drive")
-            up = upload_to_drive(path, title, os.environ["DRIVE_FOLDER_ID"])
-
-            LATEST_INGEST["file_id"] = up["id"]
-            LATEST_INGEST["title"] = title
-            LATEST_INGEST["folder_id"] = os.environ["DRIVE_FOLDER_ID"]
-
-            JOBS[job_id]["status"] = "success"
-            JOBS[job_id]["file_id"] = up["id"]
-
-        except Exception as e:
-            JOBS[job_id]["status"] = "failed"
-            JOBS[job_id]["error"] = str(e)
-            job_log(job_id, f"ERROR: {e}")
-
-    bg.add_task(run)
-    return {"status": "queued", "job_id": job_id}
-
+# --------------------------------------------------
+# STATE
+# --------------------------------------------------
 JOBS = {}
-LATEST_INGEST = {"file_id": None, "title": None, "folder_id": None}
+LATEST_INGEST = {
+    "file_id": None,
+    "title": None,
+    "folder_id": None
+}
 
-# ---------------- LOGGING ----------------
+# --------------------------------------------------
+# LOGGING
+# --------------------------------------------------
 def ts():
     return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 def debug(msg):
     print(f"[DEBUG] {ts()} | {msg}")
 
-def job_log(job_id, msg):
-    JOBS.setdefault(job_id, {}).setdefault("logs", []).append(f"{ts()} | {msg}")
+def raw_log(label, payload):
+    try:
+        print(f"[RAW] {label}: {json.dumps(payload)[:8000]}")
+    except Exception:
+        print(f"[RAW] {label}: <unserializable>")
 
-# ---------------- GOOGLE DRIVE ----------------
+# --------------------------------------------------
+# UTIL
+# --------------------------------------------------
+def sanitize(name):
+    for c in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
+        name = name.replace(c, "_")
+    return name.strip() or "clip"
+
+def safe_float(x):
+    try:
+        return float(x)
+    except:
+        return None
+
+# --------------------------------------------------
+# COOKIES
+# --------------------------------------------------
+COOKIES_PATH = "/app/cookies.txt"
+if "YOUTUBE_COOKIES" in os.environ:
+    with open(COOKIES_PATH, "w") as f:
+        f.write(os.environ["YOUTUBE_COOKIES"])
+
+# --------------------------------------------------
+# GOOGLE DRIVE
+# --------------------------------------------------
 def drive_client():
     creds = service_account.Credentials.from_service_account_info(
         json.loads(os.environ["GOOGLE_CREDENTIALS"]),
@@ -106,121 +102,146 @@ def download_from_drive(file_id):
     path = f"/tmp/{file_id}.mp4"
     with open(path, "wb") as f:
         f.write(fh.getvalue())
+
+    if os.path.getsize(path) == 0:
+        raise Exception("Drive video empty")
     return path
 
-# ---------------- FFMPEG ----------------
+# --------------------------------------------------
+# INGEST (SYNCHRONOUS — RELIABLE)
+# --------------------------------------------------
+@app.post("/ingest")
+async def ingest(req: Request):
+    data = await req.json()
+    raw_log("INGEST", data)
+
+    if "url" not in data:
+        return JSONResponse({"error": "missing url"}, 400)
+
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"status": "running"}
+
+    try:
+        url = data["url"]
+        title = url.split("v=")[-1].split("&")[0]
+        debug(f"Downloading YouTube: {url}")
+
+        out = f"/tmp/{sanitize(title)}.mp4"
+        opts = {
+            "format": "bv*+ba/best",
+            "merge_output_format": "mp4",
+            "outtmpl": out,
+            "quiet": True,
+            "retries": 5,
+            "fragment_retries": 5,
+            "cookies": COOKIES_PATH if os.path.exists(COOKIES_PATH) else None,
+        }
+        if opts["cookies"] is None:
+            opts.pop("cookies")
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+
+        if not os.path.exists(out):
+            raise Exception("yt-dlp failed")
+
+        debug("Uploading to Drive")
+        up = upload_to_drive(out, title, os.environ["DRIVE_FOLDER_ID"])
+
+        LATEST_INGEST.update({
+            "file_id": up["id"],
+            "title": title,
+            "folder_id": os.environ["DRIVE_FOLDER_ID"]
+        })
+
+        JOBS[job_id]["status"] = "success"
+        JOBS[job_id]["file_id"] = up["id"]
+
+        if "callback_url" in data:
+            requests.post(data["callback_url"], json=JOBS[job_id], timeout=10)
+
+        return {"status": "success", "job_id": job_id}
+
+    except Exception as e:
+        JOBS[job_id]["status"] = "failed"
+        JOBS[job_id]["error"] = str(e)
+        debug(f"INGEST ERROR: {e}")
+        return JSONResponse({"error": str(e)}, 500)
+
+# --------------------------------------------------
+# SEGMENT NORMALIZER
+# --------------------------------------------------
+def normalize_segments(data):
+    if "" in data and isinstance(data[""], str):
+        data = json.loads(data[""])
+
+    raw = data.get("segments_json") or data.get("segments")
+
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+
+    if isinstance(raw, dict):
+        raw = raw.get("segments")
+
+    segments = []
+    if isinstance(raw, list):
+        for s in raw:
+            st = safe_float(s.get("start"))
+            du = safe_float(s.get("duration"))
+            if st is not None and du and du > 0:
+                segments.append({"start": st, "duration": du})
+
+    return segments
+
+# --------------------------------------------------
+# FFMPEG CLIP + AUDIO SAFE
+# --------------------------------------------------
 def make_clip(src, out, start, dur):
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start),
         "-i", src,
         "-t", str(dur),
+        "-map", "0:v:0",
+        "-map", "0:a?",
         "-c:v", "libx264",
         "-c:a", "aac",
+        "-preset", "veryfast",
         out
     ]
-    subprocess.run(cmd, check=True)
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        raise Exception(r.stderr.decode()[:4000])
 
-def mux_audio(video_only, audio_src, out):
-    """
-    Reattach original audio after OpenCV processing
-    """
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_only,
-        "-i", audio_src,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-shortest",
-        out
-    ]
-    subprocess.run(cmd, check=True)
-
-# ---------------- REEL FRAMER ----------------
-class ReelFramer:
-    def __init__(self):
-        self.face = mp.solutions.face_detection.FaceDetection(0, 0.6)
-        self.out_w, self.out_h = 1080, 1920
-        self.aspect = self.out_w / self.out_h
-        self.last_x = None
-        self.smooth = 0.88
-
-    def reframe(self, inp, out, job_id=None):
-        cap = cv2.VideoCapture(inp)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        vw = cv2.VideoWriter(
-            out,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps,
-            (self.out_w, self.out_h)
-        )
-
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-
-            h, w = frame.shape[:2]
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            res = self.face.process(rgb)
-
-            cx = w // 2
-            if res.detections:
-                det = max(res.detections,
-                          key=lambda d: d.location_data.relative_bounding_box.width)
-                bb = det.location_data.relative_bounding_box
-                cx = int((bb.xmin + bb.width / 2) * w)
-
-            if self.last_x is None:
-                self.last_x = cx
-            cx = int(self.smooth * self.last_x + (1 - self.smooth) * cx)
-            self.last_x = cx
-
-            crop_h = int(h / 1.15)
-            crop_w = int(crop_h * self.aspect)
-            x1 = max(0, min(w - crop_w, cx - crop_w // 2))
-            y1 = (h - crop_h) // 2
-
-            crop = frame[y1:y1 + crop_h, x1:x1 + crop_w]
-            resized = cv2.resize(crop, (self.out_w, self.out_h))
-            vw.write(resized)
-
-        cap.release()
-        vw.release()
-
-# ---------------- ROUTES ----------------
+# --------------------------------------------------
+# ANALYZE + CLIP (USES EXISTING INGEST)
+# --------------------------------------------------
 @app.post("/analyze-and-clip")
-async def analyze(req: Request, bg: BackgroundTasks):
+async def analyze_and_clip(req: Request):
     data = await req.json()
-    segments = data.get("segments", [])
+    raw_log("ANALYZE", data)
+
+    if not LATEST_INGEST["file_id"]:
+        return JSONResponse({"error": "no ingest available"}, 400)
+
+    segments = normalize_segments(data)
+    debug(f"Segments parsed: {len(segments)}")
+
     if not segments:
-        return {"status": "ok", "clips_created": 0}
+        return {"status": "ok", "clips": 0}
 
-    job_id = str(uuid.uuid4())
-    JOBS[job_id] = {"status": "queued", "logs": []}
+    src = download_from_drive(LATEST_INGEST["file_id"])
+    base = sanitize(data.get("video_title") or LATEST_INGEST["title"])
 
-    def run():
-        src = download_from_drive(LATEST_INGEST["file_id"])
-        framer = ReelFramer()
+    uploaded = 0
+    for i, s in enumerate(segments, 1):
+        out = f"/tmp/{base}_{i}.mp4"
+        make_clip(src, out, s["start"], s["duration"])
+        upload_to_drive(out, f"{base}_{i}", LATEST_INGEST["folder_id"])
+        uploaded += 1
 
-        for i, s in enumerate(segments, 1):
-            raw = f"/tmp/raw_{i}.mp4"
-            vid = f"/tmp/reel_video_{i}.mp4"
-            final = f"/tmp/final_{i}.mp4"
-
-            make_clip(src, raw, s["start"], s["duration"])
-            framer.reframe(raw, vid, job_id)
-            mux_audio(vid, raw, final)
-
-            upload_to_drive(final, f"clip_{i}", LATEST_INGEST["folder_id"])
-
-        JOBS[job_id]["status"] = "success"
-
-    bg.add_task(run)
-    return {"status": "queued", "job_id": job_id}
+    return {"status": "success", "clips_uploaded": uploaded}
 
 @app.get("/health")
-def health():
+async def health():
     return {"status": "ok"}
