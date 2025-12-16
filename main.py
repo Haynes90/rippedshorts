@@ -21,6 +21,43 @@ import numpy as np
 import mediapipe as mp
 
 app = FastAPI()
+@app.post("/ingest")
+async def ingest(req: Request, bg: BackgroundTasks):
+    data = await req.json()
+    debug(f"INGEST payload: {data}")
+
+    if "url" not in data:
+        return JSONResponse({"error": "missing url"}, 400)
+
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"status": "queued", "logs": []}
+
+    def run():
+        try:
+            url = data["url"]
+            title = url.split("v=")[-1].split("&")[0]
+
+            job_log(job_id, f"Downloading YouTube: {url}")
+            path = download_youtube(url, title)
+            job_log(job_id, f"Downloaded: {os.path.getsize(path)} bytes")
+
+            job_log(job_id, "Uploading to Drive")
+            up = upload_to_drive(path, title, os.environ["DRIVE_FOLDER_ID"])
+
+            LATEST_INGEST["file_id"] = up["id"]
+            LATEST_INGEST["title"] = title
+            LATEST_INGEST["folder_id"] = os.environ["DRIVE_FOLDER_ID"]
+
+            JOBS[job_id]["status"] = "success"
+            JOBS[job_id]["file_id"] = up["id"]
+
+        except Exception as e:
+            JOBS[job_id]["status"] = "failed"
+            JOBS[job_id]["error"] = str(e)
+            job_log(job_id, f"ERROR: {e}")
+
+    bg.add_task(run)
+    return {"status": "queued", "job_id": job_id}
 
 JOBS = {}
 LATEST_INGEST = {"file_id": None, "title": None, "folder_id": None}
