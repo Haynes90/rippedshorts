@@ -1,299 +1,149 @@
 import os
-import json
-import uuid
-import datetime
-import subprocess
-import io
-import time
-import yt_dlp
 import requests
+import uuid
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
 
-from typing import List, Dict
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-
-# Step-2 deps
-import cv2
-import numpy as np
-import mediapipe as mp
-
-# transcript
-from youtube_transcript_api import YouTubeTranscriptApi
-
-
-# --------------------------------------------------
-# APP
-# --------------------------------------------------
 app = FastAPI()
 
-# --------------------------------------------------
-# STATE
-# --------------------------------------------------
-JOBS = {}
-LATEST_INGEST = {
-    "file_id": None,
-    "title": None,
-    "folder_id": None
-}
+# -------------------------
+# ENV
+# -------------------------
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
+RAPIDAPI_HOST = "youtube-transcripts-transcribe-youtube-video-to-text.p.rapidapi.com"
 
-# --------------------------------------------------
-# LOGGING
-# --------------------------------------------------
-def ts():
-    return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+if not RAPIDAPI_KEY:
+    raise RuntimeError("RAPIDAPI_KEY not set")
 
-def debug(msg):
-    print(f"[DEBUG] {ts()} | {msg}")
-
-def raw_log(label, payload):
-    try:
-        print(f"[RAW] {label}: {json.dumps(payload)[:8000]}")
-    except Exception:
-        print(f"[RAW] {label}: <unserializable>")
+# -------------------------
+# MODELS
+# -------------------------
+class DiscoverRequest(BaseModel):
+    video_id: str
+    duration: Optional[float] = None
+    callback_url: str
 
 
-# --------------------------------------------------
-# UTIL
-# --------------------------------------------------
-def sanitize(name):
-    for c in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
-        name = name.replace(c, "_")
-    return name.strip() or "clip"
+# -------------------------
+# TRANSCRIPT (RapidAPI)
+# -------------------------
+def get_transcript(video_id: str) -> List[dict]:
+    url = "https://youtube-transcripts-transcribe-youtube-video-to-text.p.rapidapi.com/transcribe"
 
-def safe_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
+    payload = {
+        "url": f"https://www.youtube.com/watch?v={video_id}"
+    }
 
-def run_cmd(cmd):
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if r.returncode != 0:
-        raise Exception(r.stderr.decode("utf-8", errors="ignore")[:8000])
-    return r
+    headers = {
+        "Content-Type": "application/json",
+        "x-rapidapi-host": RAPIDAPI_HOST,
+        "x-rapidapi-key": RAPIDAPI_KEY,
+    }
 
+    resp = requests.post(url, json=payload, headers=headers, timeout=30)
 
-# --------------------------------------------------
-# COOKIES
-# --------------------------------------------------
-COOKIES_PATH = "/app/cookies.txt"
-if "YOUTUBE_COOKIES" in os.environ:
-    with open(COOKIES_PATH, "w") as f:
-        f.write(os.environ["YOUTUBE_COOKIES"])
+    if resp.status_code != 200:
+        raise RuntimeError(f"Transcript API failed: {resp.text}")
 
+    data = resp.json()
 
-# --------------------------------------------------
-# GOOGLE DRIVE
-# --------------------------------------------------
-def drive_client():
-    creds = service_account.Credentials.from_service_account_info(
-        json.loads(os.environ["GOOGLE_CREDENTIALS"]),
-        scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    return build("drive", "v3", credentials=creds)
+    transcript = data.get("transcript", [])
+    if not transcript:
+        raise RuntimeError("Transcript returned empty")
 
-def upload_to_drive(path, name, folder_id):
-    drive = drive_client()
-    media = MediaFileUpload(path, mimetype="video/mp4", resumable=True)
-    req = drive.files().create(
-        body={"name": f"{name}.mp4", "parents": [folder_id]},
-        media_body=media,
-        fields="id",
-        supportsAllDrives=True
-    )
-    res = None
-    while res is None:
-        _, res = req.next_chunk()
-    return res
-
-def download_from_drive(file_id):
-    drive = drive_client()
-    req = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, req)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-
-    path = f"/tmp/{file_id}.mp4"
-    with open(path, "wb") as f:
-        f.write(fh.getvalue())
-
-    if os.path.getsize(path) == 0:
-        raise Exception("Drive video empty")
-    return path
-
-
-# --------------------------------------------------
-# INGEST (FULL VIDEO — OPTIONAL)
-# --------------------------------------------------
-@app.post("/ingest")
-async def ingest(req: Request):
-    data = await req.json()
-    raw_log("INGEST", data)
-
-    if "url" not in data:
-        return JSONResponse({"error": "missing url"}, 400)
-
-    job_id = str(uuid.uuid4())
-    JOBS[job_id] = {"status": "running"}
-
-    try:
-        url = data["url"]
-        title = url.split("v=")[-1].split("&")[0]
-        out = f"/tmp/{sanitize(title)}.mp4"
-
-        opts = {
-            "format": "bv*+ba/best",
-            "merge_output_format": "mp4",
-            "outtmpl": out,
-            "quiet": True,
-            "retries": 5,
-            "fragment_retries": 5,
-            "cookies": COOKIES_PATH if os.path.exists(COOKIES_PATH) else None,
-        }
-        if opts["cookies"] is None:
-            opts.pop("cookies", None)
-
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-
-        up = upload_to_drive(out, title, os.environ["DRIVE_FOLDER_ID"])
-
-        LATEST_INGEST.update({
-            "file_id": up["id"],
-            "title": title,
-            "folder_id": os.environ["DRIVE_FOLDER_ID"]
-        })
-
-        JOBS[job_id]["status"] = "success"
-        JOBS[job_id]["file_id"] = up["id"]
-
-        if "callback_url" in data:
-            requests.post(data["callback_url"], json=JOBS[job_id], timeout=10)
-
-        return {"status": "success", "job_id": job_id, "file_id": up["id"]}
-
-    except Exception as e:
-        JOBS[job_id]["status"] = "failed"
-        JOBS[job_id]["error"] = str(e)
-        debug(f"INGEST ERROR: {e}")
-        return JSONResponse({"error": str(e)}, 500)
-
-
-# --------------------------------------------------
-# DISCOVER (TRANSCRIPT-ONLY, CHUNKED)
-# --------------------------------------------------
-def fetch_transcript_chunks(video_id, chunk_seconds=900):
-    transcript = YouTubeTranscriptApi.get_transcript(video_id)
-    chunks = []
-
-    buf = []
-    start = None
-    dur = 0
-
-    for seg in transcript:
-        if start is None:
-            start = seg["start"]
-
-        buf.append(seg["text"])
-        dur += seg["duration"]
-
-        if dur >= chunk_seconds:
-            chunks.append({
-                "start": start,
-                "duration": dur,
-                "text": " ".join(buf)
-            })
-            buf, start, dur = [], None, 0
-
-    if buf:
-        chunks.append({
-            "start": start,
-            "duration": dur,
-            "text": " ".join(buf)
-        })
-
-    return chunks
-
-
-def discover_segments_from_chunk(chunk):
-    text = chunk["text"].lower()
+    # Normalize
     segments = []
-
-    if any(k in text for k in ["jesus", "lord", "faith", "worship"]):
+    for t in transcript:
         segments.append({
-            "start": chunk["start"],
-            "duration": min(60, chunk["duration"]),
-            "score": 85,
-            "category": "education",
-            "reason": "Faith-centered teaching moment"
+            "start": float(t["start"]),
+            "duration": float(t["duration"]),
+            "text": t["text"].strip()
         })
 
     return segments
 
 
+# -------------------------
+# CHUNKING (safe for 3hr vids)
+# -------------------------
+def chunk_transcript(segments, chunk_seconds=600):
+    chunks = []
+    current = []
+    current_start = segments[0]["start"]
+
+    total = 0
+    for s in segments:
+        if total + s["duration"] > chunk_seconds:
+            chunks.append({
+                "start": current_start,
+                "segments": current
+            })
+            current = []
+            current_start = s["start"]
+            total = 0
+
+        current.append(s)
+        total += s["duration"]
+
+    if current:
+        chunks.append({
+            "start": current_start,
+            "segments": current
+        })
+
+    return chunks
+
+
+# -------------------------
+# CALLBACK
+# -------------------------
+def post_callback(url: str, payload: dict):
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print("Callback failed:", e)
+
+
+# -------------------------
+# DISCOVER ENDPOINT
+# -------------------------
 @app.post("/discover")
-async def discover(req: Request):
-    data = await req.json()
-    raw_log("DISCOVER", data)
-
-    video_id = data.get("video_id")
-    callback_url = data.get("callback_url")
-
-    if not video_id or not callback_url:
-        return JSONResponse({"error": "missing video_id or callback_url"}, 400)
+def discover(req: DiscoverRequest):
+    job_id = str(uuid.uuid4())
 
     try:
-        all_segments = []
-        chunks = fetch_transcript_chunks(video_id)
+        transcript = get_transcript(req.video_id)
+        chunks = chunk_transcript(transcript)
 
-        for idx, chunk in enumerate(chunks):
-            found = discover_segments_from_chunk(chunk)
-            all_segments.extend(found)
+        # Respond to Zap immediately
+        post_callback(req.callback_url, {
+            "job_id": job_id,
+            "video_id": req.video_id,
+            "status": "transcript_ready",
+            "chunk_count": len(chunks),
+            "chunks": chunks  # Zap B / next step consumes this
+        })
 
-            requests.post(
-                callback_url,
-                json={
-                    "video_id": video_id,
-                    "chunk_index": idx,
-                    "segments": found,
-                    "complete": False
-                },
-                timeout=10
-            )
-
-            time.sleep(0.3)
-
-        requests.post(
-            callback_url,
-            json={
-                "video_id": video_id,
-                "segments": all_segments,
-                "complete": True
-            },
-            timeout=10
-        )
-
-        return {"status": "ok", "segments_found": len(all_segments)}
+        return {
+            "status": "accepted",
+            "job_id": job_id,
+            "chunks": len(chunks)
+        }
 
     except Exception as e:
-        debug(f"DISCOVER ERROR: {e}")
-        return JSONResponse({"error": str(e)}, 500)
+        post_callback(req.callback_url, {
+            "job_id": job_id,
+            "video_id": req.video_id,
+            "status": "error",
+            "error": str(e)
+        })
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# --------------------------------------------------
-# ANALYZE + CLIP (UNCHANGED FROM YOUR PIPELINE)
-# --------------------------------------------------
-# ⬇️ EVERYTHING BELOW HERE IS IDENTICAL TO WHAT YOU ALREADY HAVE
-# ⬇️ normalize_segments, ffmpeg, ReelFramer, analyze-and-clip, health
-# ⬇️ (LEFT OUT HERE FOR BREVITY IN THIS RESPONSE)
-# --------------------------------------------------
-
-@app.get("/health")
-async def health():
+# -------------------------
+# HEALTH
+# -------------------------
+@app.get("/")
+def health():
     return {"status": "ok"}
