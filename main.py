@@ -144,14 +144,17 @@ def discover(req: DiscoverRequest):
             "chunks": len(chunks)
         }
 
-    except Exception as e:
-        post_callback(req.callback_url, {
-            "job_id": job_id,
-            "video_id": req.video_id,
-            "status": "error",
-            "error": str(e)
-        })
-        raise HTTPException(status_code=500, detail=str(e))
+   except Exception as e:
+    print("DISCOVER FAILED:", repr(e))
+
+    post_callback(req.callback_url, {
+        "job_id": job_id,
+        "video_id": req.video_id,
+        "status": "error",
+        "error": str(e)
+    })
+
+    raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------
 # ROOT HEALTH
