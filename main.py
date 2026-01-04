@@ -1,7 +1,3 @@
-@app.get("/ping")
-def ping():
-    return {"pong": True}
-
 import os
 import requests
 import uuid
@@ -9,7 +5,17 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 
+# -------------------------
+# APP
+# -------------------------
 app = FastAPI()
+
+# -------------------------
+# HEALTH / PING
+# -------------------------
+@app.get("/ping")
+def ping():
+    return {"pong": True}
 
 # -------------------------
 # ENV
@@ -27,7 +33,6 @@ class DiscoverRequest(BaseModel):
     video_id: str
     duration: Optional[float] = None
     callback_url: str
-
 
 # -------------------------
 # TRANSCRIPT (RapidAPI)
@@ -56,7 +61,6 @@ def get_transcript(video_id: str) -> List[dict]:
     if not transcript:
         raise RuntimeError("Transcript returned empty")
 
-    # Normalize
     segments = []
     for t in transcript:
         segments.append({
@@ -66,7 +70,6 @@ def get_transcript(video_id: str) -> List[dict]:
         })
 
     return segments
-
 
 # -------------------------
 # CHUNKING (safe for 3hr vids)
@@ -98,7 +101,6 @@ def chunk_transcript(segments, chunk_seconds=600):
 
     return chunks
 
-
 # -------------------------
 # CALLBACK
 # -------------------------
@@ -107,7 +109,6 @@ def post_callback(url: str, payload: dict):
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print("Callback failed:", e)
-
 
 # -------------------------
 # DISCOVER ENDPOINT
@@ -120,13 +121,12 @@ def discover(req: DiscoverRequest):
         transcript = get_transcript(req.video_id)
         chunks = chunk_transcript(transcript)
 
-        # Respond to Zap immediately
         post_callback(req.callback_url, {
             "job_id": job_id,
             "video_id": req.video_id,
             "status": "transcript_ready",
             "chunk_count": len(chunks),
-            "chunks": chunks  # Zap B / next step consumes this
+            "chunks": chunks
         })
 
         return {
@@ -144,9 +144,8 @@ def discover(req: DiscoverRequest):
         })
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # -------------------------
-# HEALTH
+# ROOT HEALTH
 # -------------------------
 @app.get("/")
 def health():
