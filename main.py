@@ -24,7 +24,7 @@ RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
 RAPIDAPI_HOST = "youtube-transcripts-transcribe-youtube-video-to-text.p.rapidapi.com"
 
 if not RAPIDAPI_KEY:
-    raise RuntimeError("RAPIDAPI_KEY not set")
+    print("WARNING: RAPIDAPI_KEY not set")
 
 # -------------------------
 # MODELS
@@ -38,6 +38,9 @@ class DiscoverRequest(BaseModel):
 # TRANSCRIPT (RapidAPI)
 # -------------------------
 def get_transcript(video_id: str) -> List[dict]:
+    if not RAPIDAPI_KEY:
+        raise RuntimeError("RAPIDAPI_KEY not configured")
+
     url = "https://youtube-transcripts-transcribe-youtube-video-to-text.p.rapidapi.com/transcribe"
 
     payload = {
@@ -115,6 +118,12 @@ def post_callback(url: str, payload: dict):
 # -------------------------
 @app.post("/discover")
 def discover(req: DiscoverRequest):
+    if not RAPIDAPI_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="RAPIDAPI_KEY not configured"
+        )
+
     job_id = str(uuid.uuid4())
 
     try:
