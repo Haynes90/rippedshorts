@@ -1,3 +1,7 @@
+@app.get("/ping")
+def ping():
+    return {"pong": True}
+
 import os
 import requests
 import uuid
