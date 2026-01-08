@@ -1,12 +1,7 @@
 fastapi
 uvicorn
-yt-dlp
 requests
-google-api-python-client
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
+yt-dlp
+numpy
 opencv-python-headless
 mediapipe
-numpy
-youtube-transcript-api==0.6.2
