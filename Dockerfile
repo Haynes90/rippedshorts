@@ -1,8 +1,9 @@
 diff --git a/Dockerfile b/Dockerfile
-index f6dd94c8a02353d790ecc00f56f562b4228dc7a2..083c9cff765c3b7fd0569e02584b41cfbb1820a9 100644
+index f6dd94c8a02353d790ecc00f56f562b4228dc7a2..85fc385a7d77577905082a4eab322c24d34e71f3 100644
 --- a/Dockerfile
 +++ b/Dockerfile
-@@ -1,14 +1,19 @@
+@@ -1,14 +1,20 @@
++# syntax=docker/dockerfile:1
  FROM python:3.11-slim
  
 +ENV PYTHONDONTWRITEBYTECODE=1 \
