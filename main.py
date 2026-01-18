@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import timediff --git a/main.py b/main.py
 index c9b54b2e6e16961bf40a386cb5597cf043a0a817..4ae9aca15d4ce812e243dc47d9c4f39b9a149853 100644
@@ -184,11 +185,12 @@ index c9b54b2e6e16961bf40a386cb5597cf043a0a817..4ae9aca15d4ce812e243dc47d9c4f39b
 
 import logging
 from typing import List, Optional, Dict, Any
+from urllib.parse import urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator, validator
 
 # -------------------------
 # LOGGING (visible in Railway logs)
@@ -225,9 +227,51 @@ if not RAPIDAPI_KEY:
 # -------------------------
 # MODELS
 # -------------------------
+YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
+
+
+def extract_video_id(youtube_url: str) -> Optional[str]:
+    parsed = urlparse(youtube_url)
+    host = parsed.netloc.lower()
+    if "youtube.com" in host:
+        query = parse_qs(parsed.query)
+        if "v" in query and query["v"]:
+            return query["v"][0]
+        if parsed.path.startswith("/shorts/"):
+            return parsed.path.split("/shorts/")[-1].split("/")[0]
+        if parsed.path.startswith("/embed/"):
+            return parsed.path.split("/embed/")[-1].split("/")[0]
+    if "youtu.be" in host:
+        return parsed.path.lstrip("/").split("/")[0]
+    return None
+
+
 class DiscoverRequest(BaseModel):
-    video_id: str = Field(..., min_length=6)
+    video_id: Optional[str] = Field(None, min_length=6)
     youtube_url: Optional[str] = None  # optional convenience
+
+    @root_validator(pre=True)
+    def require_id_or_url(cls, values):
+        video_id = values.get("video_id")
+        youtube_url = values.get("youtube_url")
+        if not video_id and not youtube_url:
+            raise ValueError("Either video_id or youtube_url is required")
+        return values
+
+    @validator("video_id")
+    def validate_video_id(cls, value):
+        if value and not YOUTUBE_ID_RE.match(value):
+            raise ValueError("video_id must be a valid YouTube id")
+        return value
+
+    @validator("youtube_url")
+    def validate_youtube_url(cls, value):
+        if value is None:
+            return value
+        parsed = urlparse(value)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError("youtube_url must be a valid URL")
+        return value
 
 class DiscoverResponse(BaseModel):
     status: str
@@ -288,29 +332,57 @@ def get_transcript(video_id: str) -> List[dict]:
 # -------------------------
 # Chunking (3hr-safe)
 # -------------------------
-def chunk_transcript(segments: List[dict], chunk_seconds: int = 120) -> List[dict]:
+SENTENCE_END_RE = re.compile(r"[.!?…]+$")  # simple heuristic for thought completion
+
+
+def chunk_transcript(
+    segments: List[dict],
+    chunk_seconds: int = 120,
+    min_chunk_seconds: int = 30,
+) -> List[dict]:
     """
-    Chunk by time window. 120s chunks is good for long videos.
+    Chunk by time window while trying to end on a sentence boundary.
     We do NOT return chunks to Zapier — internal use only.
     """
+    if not segments:
+        return []
     chunks = []
     current = []
     current_start = segments[0]["start"]
     total = 0.0
+    last_sentence_break_index = None
 
     for s in segments:
-        if total + s["duration"] > chunk_seconds and current:
-            chunks.append({
-                "start": float(current_start),
-                "end": float(current_start + total),
-                "segments": current
-            })
-            current = []
+        if not current:
             current_start = s["start"]
-            total = 0.0
-
         current.append(s)
         total += float(s["duration"])
+
+        if s["text"] and SENTENCE_END_RE.search(s["text"]):
+            last_sentence_break_index = len(current) - 1
+
+        if total > chunk_seconds and current:
+            if last_sentence_break_index is not None and total >= min_chunk_seconds:
+                split_at = last_sentence_break_index + 1
+                chunk_segments = current[:split_at]
+                chunks.append({
+                    "start": float(current_start),
+                    "end": float(chunk_segments[-1]["start"] + chunk_segments[-1]["duration"]),
+                    "segments": chunk_segments,
+                })
+                current = current[split_at:]
+                current_start = current[0]["start"] if current else current_start
+                total = sum(seg["duration"] for seg in current)
+                last_sentence_break_index = None
+            else:
+                chunks.append({
+                    "start": float(current_start),
+                    "end": float(current_start + total),
+                    "segments": current
+                })
+                current = []
+                total = 0.0
+                last_sentence_break_index = None
 
     if current:
         chunks.append({
@@ -375,20 +447,32 @@ def discover(req: DiscoverRequest):
         # Return a clear error early rather than accepting jobs that cannot run.
         raise HTTPException(status_code=500, detail="RAPIDAPI_KEY not configured")
 
+    resolved_video_id = req.video_id
+    if req.youtube_url:
+        extracted = extract_video_id(req.youtube_url)
+        if not extracted:
+            raise HTTPException(status_code=400, detail="Unable to parse youtube_url")
+        if resolved_video_id and resolved_video_id != extracted:
+            raise HTTPException(status_code=400, detail="video_id does not match youtube_url")
+        resolved_video_id = extracted
+
+    if not resolved_video_id:
+        raise HTTPException(status_code=400, detail="video_id could not be resolved")
+
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {
         "job_id": job_id,
-        "video_id": req.video_id,
+        "video_id": resolved_video_id,
         "status": "queued",
         "step": "queued",
         "created_at": time.time(),
     }
 
     # Offload to background thread
-    executor.submit(run_discovery, job_id, req.video_id)
+    executor.submit(run_discovery, job_id, resolved_video_id)
 
     # IMPORTANT: return immediately, no transcript, no chunks
-    return {"status": "accepted", "job_id": job_id, "video_id": req.video_id}
+    return {"status": "accepted", "job_id": job_id, "video_id": resolved_video_id}
 
 # -------------------------
 # JOB STATUS (debug endpoint)
