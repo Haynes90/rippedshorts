@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 # -------------------------
-# LOGGING (shows in Railway logs)
+# LOGGING
 # -------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -25,24 +25,20 @@ logger = logging.getLogger("ripped-shorts")
 app = FastAPI(title="Ripped Shorts Backend")
 
 # -------------------------
-# EXECUTOR + IN-MEM JOB STORE
-# (OK for now; later migrate to Redis/DB for persistence)
+# EXECUTOR + IN-MEM JOBS
 # -------------------------
 executor = ThreadPoolExecutor(max_workers=int(os.getenv("WORKERS", "2")))
 JOBS: Dict[str, Dict[str, Any]] = {}
 
 # -------------------------
-# ENV (RapidAPI)
+# ENV
 # -------------------------
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+TRANSCRIPT_LANG = os.getenv("TRANSCRIPT_LANG", "auto")  # auto recommended
+TRANSCRIPT_FLAT_TEXT = os.getenv("TRANSCRIPT_FLAT_TEXT", "false").lower() in ("1", "true", "yes")
 
-# Your correct RapidAPI product:
-# curl --url https://video-transcript-scraper.p.rapidapi.com/transcript/youtube
-RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "video-transcript-scraper.p.rapidapi.com")
-RAPIDAPI_URL = os.getenv(
-    "RAPIDAPI_URL",
-    "https://video-transcript-scraper.p.rapidapi.com/transcript/youtube",
-)
+YTT3_HOST = "youtube-transcript3.p.rapidapi.com"
+YTT3_URL = "https://youtube-transcript3.p.rapidapi.com/api/transcript"
 
 if not RAPIDAPI_KEY:
     logger.warning("RAPIDAPI_KEY not set (discover will fail until configured).")
@@ -52,7 +48,7 @@ if not RAPIDAPI_KEY:
 # -------------------------
 class DiscoverRequest(BaseModel):
     video_id: str = Field(..., min_length=6)
-    youtube_url: Optional[str] = None  # optional; we derive from video_id if missing
+    youtube_url: Optional[str] = None  # ignored by transcript3, kept for future use
 
 class DiscoverResponse(BaseModel):
     status: str
@@ -71,85 +67,79 @@ def health():
     return {"status": "ok"}
 
 # -------------------------
-# TRANSCRIPT (RapidAPI: video-transcript-scraper)
+# TRANSCRIPT (youtube-transcript3)
 # -------------------------
 def get_transcript(video_id: str) -> List[dict]:
     """
-    Uses RapidAPI 'video-transcript-scraper' endpoint.
-    Expected response usually includes a list under 'transcript'.
-    We log keys to make debugging easy if format differs.
+    Uses RapidAPI 'youtube-transcript3' only.
+    GET /api/transcript?videoId=...&lang=auto&flat_text=false
+
+    Success:
+      { "success": true, "transcript": [ { "text":..., "duration":..., "offset":... }, ... ] }
+
+    Failure (often still 200):
+      { "success": false, "error": "..." }
     """
     if not RAPIDAPI_KEY:
         raise RuntimeError("RAPIDAPI_KEY not configured")
 
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
-
-    payload = {"video_url": video_url}
-
     headers = {
-        "Content-Type": "application/json",
-        "x-rapidapi-host": RAPIDAPI_HOST,
+        "x-rapidapi-host": YTT3_HOST,
         "x-rapidapi-key": RAPIDAPI_KEY,
     }
 
-    resp = requests.post(
-        RAPIDAPI_URL,
-        json=payload,
-        headers=headers,
-        timeout=(10, 180),  # connect, read (long videos can take time)
-    )
+    # IMPORTANT: flat_text must be false to preserve timestamps
+    params = {
+        "videoId": video_id,
+        "lang": TRANSCRIPT_LANG,
+        "flat_text": "true" if TRANSCRIPT_FLAT_TEXT else "false",
+    }
+
+    resp = requests.get(YTT3_URL, headers=headers, params=params, timeout=(10, 120))
+
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError(f"Transcript API non-JSON response ({resp.status_code}): {resp.text}")
 
     if resp.status_code != 200:
-        raise RuntimeError(f"Transcript API failed ({resp.status_code}): {resp.text}")
+        raise RuntimeError(f"Transcript API failed ({resp.status_code}): {data}")
 
-    data = resp.json()
+    if not data.get("success"):
+        # Example: {"success": false, "error": "YouTube video ID is required"}
+        raise RuntimeError(f"Transcript API reported failure: {data}")
 
-    # Debug visibility: what did the API return?
-    try:
-        logger.info(f"RapidAPI response keys: {list(data.keys())}")
-    except Exception:
-        logger.info("RapidAPI response keys: <unable to list>")
-
-    # Common key for this API
     transcript = data.get("transcript")
 
-    # Some APIs return segments under other keys; defensively check a few:
-    if not transcript:
-        transcript = data.get("segments") or data.get("results") or data.get("data")
+    # If flat_text=true, some versions may return transcript as a string
+    if isinstance(transcript, str):
+        raise RuntimeError("flat_text=true returns no timestamps; set TRANSCRIPT_FLAT_TEXT=false")
 
     if not transcript or not isinstance(transcript, list):
-        # Show a truncated payload to help debug schema mismatches (safe length)
-        logger.info(f"RapidAPI raw response (truncated): {str(data)[:1200]}")
-        raise RuntimeError("Transcript empty or malformed from RapidAPI")
+        raise RuntimeError(f"Transcript returned empty or malformed: {data}")
 
     segments: List[dict] = []
     for t in transcript:
-        # Expected: {"text": "...", "start": 12.3, "duration": 4.1}
         text = (t.get("text") or "").strip()
         if not text:
             continue
-
-        segments.append(
-            {
-                "start": float(t.get("start", 0.0)),
-                "duration": float(t.get("duration", 0.0)),
-                "text": text,
-            }
-        )
+        segments.append({
+            "start": float(t.get("offset", 0.0)),     # <-- offset is the start time
+            "duration": float(t.get("duration", 0.0)),
+            "text": text,
+        })
 
     if not segments:
-        raise RuntimeError("Transcript contained no usable text segments")
+        raise RuntimeError("Transcript contained no usable segments")
 
     return segments
 
 # -------------------------
-# CHUNKING (3hr-safe)
+# CHUNKING
 # -------------------------
 def chunk_transcript(segments: List[dict], chunk_seconds: int = 120) -> List[dict]:
     """
-    Chunk transcript into time windows.
-    We keep segments inside each chunk for downstream AI work,
-    but we do NOT return them to Zapier.
+    Chunk transcript into time windows. We keep segments per chunk for AI discovery later.
     """
     chunks: List[dict] = []
     current: List[dict] = []
@@ -158,14 +148,13 @@ def chunk_transcript(segments: List[dict], chunk_seconds: int = 120) -> List[dic
 
     for s in segments:
         dur = float(s.get("duration", 0.0))
+
         if (total + dur) > chunk_seconds and current:
-            chunks.append(
-                {
-                    "start": float(current_start),
-                    "end": float(current_start + total),
-                    "segments": current,
-                }
-            )
+            chunks.append({
+                "start": float(current_start),
+                "end": float(current_start + total),
+                "segments": current,
+            })
             current = []
             current_start = s["start"]
             total = 0.0
@@ -174,13 +163,11 @@ def chunk_transcript(segments: List[dict], chunk_seconds: int = 120) -> List[dic
         total += dur
 
     if current:
-        chunks.append(
-            {
-                "start": float(current_start),
-                "end": float(current_start + total),
-                "segments": current,
-            }
-        )
+        chunks.append({
+            "start": float(current_start),
+            "end": float(current_start + total),
+            "segments": current,
+        })
 
     return chunks
 
@@ -202,12 +189,10 @@ def run_discovery(job_id: str, video_id: str):
         chunks = chunk_transcript(transcript, chunk_seconds=120)
         logger.info(f"[{job_id}] chunks={len(chunks)}")
 
-        # NOTE: Next steps (not implemented yet):
+        # Next steps to add AFTER transcript stability:
         # - AI clip discovery per chunk
-        # - Merge & rank globally; cap at 30
-        # - Assign clip_index 1..30 and write rows to Google Sheets
-        #
-        # For now, we stop here to prove transcript+chunking is stable.
+        # - global merge/rank, cap <= 30
+        # - write proposed clips to Google Sheets
 
         JOBS[job_id]["status"] = "done"
         JOBS[job_id]["step"] = "completed"
@@ -221,9 +206,21 @@ def run_discovery(job_id: str, video_id: str):
         logger.info(f"[{job_id}] discovery done elapsed_s={JOBS[job_id]['elapsed_s']}")
 
     except Exception as e:
+        msg = str(e)
+
+        # Treat transcript absence as BLOCKED (not a system error)
+        # youtube-transcript3 failures are often returned with success:false and an error string.
+        if "Transcript API reported failure" in msg and ("does" in msg or "exist" in msg or "not" in msg):
+            JOBS[job_id]["status"] = "blocked"
+            JOBS[job_id]["step"] = "transcript_unavailable"
+            JOBS[job_id]["error"] = msg
+            JOBS[job_id]["elapsed_s"] = round(time.time() - started, 2)
+            logger.warning(f"[{job_id}] blocked: transcript unavailable ({msg})")
+            return
+
         JOBS[job_id]["status"] = "error"
         JOBS[job_id]["step"] = "failed"
-        JOBS[job_id]["error"] = str(e)
+        JOBS[job_id]["error"] = msg
         JOBS[job_id]["elapsed_s"] = round(time.time() - started, 2)
 
         logger.exception(f"[{job_id}] discovery failed: {e}")
@@ -245,13 +242,11 @@ def discover(req: DiscoverRequest):
         "created_at": time.time(),
     }
 
-    # Offload to background thread so Zapier gets immediate response
     executor.submit(run_discovery, job_id, req.video_id)
-
     return {"status": "accepted", "job_id": job_id, "video_id": req.video_id}
 
 # -------------------------
-# JOB STATUS (debug endpoint)
+# JOB STATUS (debug)
 # -------------------------
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str):
