@@ -71,9 +71,10 @@ def health():
 # -------------------------
 def get_transcript(video_id: str) -> List[dict]:
     """
-    youtube-transcript3 ONLY, but uses BOTH endpoints for reliability:
+    youtube-transcript3 ONLY, tries:
       1) /api/transcript?videoId=...
       2) /api/transcript-with-url?url=...
+    Omits 'lang' when TRANSCRIPT_LANG=auto (provider behaves better that way).
     """
     if not RAPIDAPI_KEY:
         raise RuntimeError("RAPIDAPI_KEY not configured")
@@ -83,9 +84,11 @@ def get_transcript(video_id: str) -> List[dict]:
         "x-rapidapi-key": RAPIDAPI_KEY,
     }
 
-    # Always keep timestamps
-    lang = os.getenv("TRANSCRIPT_LANG", "auto")
-    flat_text = "false"  # force timestamps always
+    # Force timestamps
+    flat_text = "false"
+
+    lang_env = os.getenv("TRANSCRIPT_LANG", "auto").strip().lower()
+    include_lang = (lang_env not in ("", "auto", "none"))
 
     video_url = f"https://www.youtube.com/watch?v={video_id}"
 
@@ -96,32 +99,36 @@ def get_transcript(video_id: str) -> List[dict]:
         except Exception:
             raise RuntimeError(f"Transcript API non-JSON ({resp.status_code}): {resp.text}")
 
-        # Log minimal debug context (safe)
-        logger.info(f"Transcript3 call={endpoint.split('/')[-1]} status={resp.status_code} success={data.get('success')}")
+        logger.info(
+            f"Transcript3 call={endpoint.split('/')[-1]} "
+            f"status={resp.status_code} success={data.get('success')}"
+        )
 
         if resp.status_code != 200:
             raise RuntimeError(f"Transcript API HTTP error ({resp.status_code}): {data}")
 
         if not data.get("success"):
-            raise RuntimeError(f"Transcript API reported failure: {data}")
+            # Preserve exact provider error text for retry decision
+            raise RuntimeError(f"TRANSCRIPT3_FAIL::{data}")
 
         return data
 
     # Attempt 1: by videoId
+    params1 = {"videoId": video_id, "flat_text": flat_text}
+    if include_lang:
+        params1["lang"] = lang_env
+
     try:
-        data = _call(
-            YTT3_URL,
-            {"videoId": video_id, "lang": lang, "flat_text": flat_text},
-        )
+        data = _call(YTT3_URL, params1)
     except Exception as e1:
         logger.warning(f"Transcript3 videoId attempt failed: {e1}")
 
         # Attempt 2: by URL (same provider)
         url_endpoint = "https://youtube-transcript3.p.rapidapi.com/api/transcript-with-url"
-        data = _call(
-            url_endpoint,
-            {"url": video_url, "lang": lang, "flat_text": flat_text},
-        )
+        params2 = {"url": video_url, "flat_text": flat_text}
+        if include_lang:
+            params2["lang"] = lang_env
+        data = _call(url_endpoint, params2)
 
     transcript = data.get("transcript")
 
@@ -146,6 +153,7 @@ def get_transcript(video_id: str) -> List[dict]:
         raise RuntimeError("Transcript contained no usable segments")
 
     return segments
+
 
 # -------------------------
 # CHUNKING
@@ -187,56 +195,40 @@ def chunk_transcript(segments: List[dict], chunk_seconds: int = 120) -> List[dic
 # -------------------------
 # BACKGROUND JOB: DISCOVERY
 # -------------------------
-def run_discovery(job_id: str, video_id: str):
-    started = time.time()
-    JOBS[job_id]["status"] = "running"
-    JOBS[job_id]["step"] = "transcript_fetch"
-
-    logger.info(f"[{job_id}] discovery start video_id={video_id}")
-
     try:
-        transcript = get_transcript(video_id)
-        logger.info(f"[{job_id}] transcript segments={len(transcript)}")
+        JOBS[job_id]["step"] = "transcript_fetch"
 
-        JOBS[job_id]["step"] = "chunking"
-        chunks = chunk_transcript(transcript, chunk_seconds=120)
-        logger.info(f"[{job_id}] chunks={len(chunks)}")
+        # Retry strategy for transient provider failures
+        backoff_seconds = [0, 15, 45, 120]  # total ~3 minutes max
+        last_err = None
 
-        # Next steps to add AFTER transcript stability:
-        # - AI clip discovery per chunk
-        # - global merge/rank, cap <= 30
-        # - write proposed clips to Google Sheets
+        for attempt, wait_s in enumerate(backoff_seconds, start=1):
+            if wait_s:
+                logger.info(f"[{job_id}] transcript retry in {wait_s}s (attempt {attempt}/{len(backoff_seconds)})")
+                time.sleep(wait_s)
 
-        JOBS[job_id]["status"] = "done"
-        JOBS[job_id]["step"] = "completed"
-        JOBS[job_id]["result"] = {
-            "video_id": video_id,
-            "segments": len(transcript),
-            "chunks": len(chunks),
-        }
-        JOBS[job_id]["elapsed_s"] = round(time.time() - started, 2)
+            try:
+                transcript = get_transcript(video_id)
+                logger.info(f"[{job_id}] transcript segments={len(transcript)} (attempt {attempt})")
+                last_err = None
+                break
+            except Exception as e:
+                last_err = str(e)
+                logger.warning(f"[{job_id}] transcript attempt {attempt} failed: {last_err}")
 
-        logger.info(f"[{job_id}] discovery done elapsed_s={JOBS[job_id]['elapsed_s']}")
+                # Only keep retrying if provider says "not available at the moment"
+                if "not available at the moment" not in last_err.lower():
+                    break
 
-    except Exception as e:
-        msg = str(e)
-
-        # Treat transcript absence as BLOCKED (not a system error)
-        # youtube-transcript3 failures are often returned with success:false and an error string.
-        if "Transcript API reported failure" in msg and ("does" in msg or "exist" in msg or "not" in msg):
+        if last_err is not None:
             JOBS[job_id]["status"] = "blocked"
             JOBS[job_id]["step"] = "transcript_unavailable"
-            JOBS[job_id]["error"] = msg
+            JOBS[job_id]["error"] = last_err
             JOBS[job_id]["elapsed_s"] = round(time.time() - started, 2)
-            logger.warning(f"[{job_id}] blocked: transcript unavailable ({msg})")
+            logger.warning(f"[{job_id}] blocked: transcript unavailable after retries")
             return
 
-        JOBS[job_id]["status"] = "error"
-        JOBS[job_id]["step"] = "failed"
-        JOBS[job_id]["error"] = msg
-        JOBS[job_id]["elapsed_s"] = round(time.time() - started, 2)
-
-        logger.exception(f"[{job_id}] discovery failed: {e}")
+        # continue with chunking...
 
 # -------------------------
 # DISCOVER ENDPOINT (Zapier-safe)
