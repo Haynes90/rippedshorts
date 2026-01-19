@@ -249,41 +249,83 @@ def health():
 # RapidAPI transcript fetch
 # -------------------------
 def get_transcript(video_id: str) -> List[dict]:
+    """
+    youtube-transcript3 ONLY, but uses BOTH endpoints for reliability:
+      1) /api/transcript?videoId=...
+      2) /api/transcript-with-url?url=...
+    """
     if not RAPIDAPI_KEY:
         raise RuntimeError("RAPIDAPI_KEY not configured")
 
-    payload = {"url": f"https://www.youtube.com/watch?v={video_id}"}
     headers = {
-        "Content-Type": "application/json",
-        "x-rapidapi-host": RAPIDAPI_HOST,
+        "x-rapidapi-host": YTT3_HOST,
         "x-rapidapi-key": RAPIDAPI_KEY,
     }
 
-    # Use sensible timeouts: (connect, read)
-    resp = requests.post(RAPIDAPI_URL, json=payload, headers=headers, timeout=(10, 120))
+    # Always keep timestamps
+    lang = os.getenv("TRANSCRIPT_LANG", "auto")
+    flat_text = "false"  # force timestamps always
 
-    if resp.status_code != 200:
-        raise RuntimeError(f"Transcript API failed ({resp.status_code}): {resp.text}")
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    data = resp.json()
-    transcript = data.get("transcript", [])
-    if not transcript:
-        raise RuntimeError("Transcript returned empty")
+    def _call(endpoint: str, params: dict) -> dict:
+        resp = requests.get(endpoint, headers=headers, params=params, timeout=(10, 120))
+        try:
+            data = resp.json()
+        except Exception:
+            raise RuntimeError(f"Transcript API non-JSON ({resp.status_code}): {resp.text}")
 
-    segments = []
+        # Log minimal debug context (safe)
+        logger.info(f"Transcript3 call={endpoint.split('/')[-1]} status={resp.status_code} success={data.get('success')}")
+
+        if resp.status_code != 200:
+            raise RuntimeError(f"Transcript API HTTP error ({resp.status_code}): {data}")
+
+        if not data.get("success"):
+            raise RuntimeError(f"Transcript API reported failure: {data}")
+
+        return data
+
+    # Attempt 1: by videoId
+    try:
+        data = _call(
+            YTT3_URL,
+            {"videoId": video_id, "lang": lang, "flat_text": flat_text},
+        )
+    except Exception as e1:
+        logger.warning(f"Transcript3 videoId attempt failed: {e1}")
+
+        # Attempt 2: by URL (same provider)
+        url_endpoint = "https://youtube-transcript3.p.rapidapi.com/api/transcript-with-url"
+        data = _call(
+            url_endpoint,
+            {"url": video_url, "lang": lang, "flat_text": flat_text},
+        )
+
+    transcript = data.get("transcript")
+
+    if isinstance(transcript, str):
+        raise RuntimeError("Provider returned flat text; timestamps unavailable (flat_text must be false).")
+
+    if not transcript or not isinstance(transcript, list):
+        raise RuntimeError(f"Transcript empty or malformed: {data}")
+
+    segments: List[dict] = []
     for t in transcript:
+        text = (t.get("text") or "").strip()
+        if not text:
+            continue
         segments.append({
-            "start": float(t.get("start", 0.0)),
+            "start": float(t.get("offset", 0.0)),
             "duration": float(t.get("duration", 0.0)),
-            "text": (t.get("text") or "").strip()
+            "text": text,
         })
 
-    # Basic sanity
-    segments = [s for s in segments if s["text"]]
     if not segments:
-        raise RuntimeError("Transcript had no usable text segments")
+        raise RuntimeError("Transcript contained no usable segments")
 
     return segments
+
 
 # -------------------------
 # Chunking (3hr-safe)
