@@ -152,7 +152,12 @@ def get_transcript(video_id: str) -> List[dict]:
 
     segments: List[dict] = []
     for entry in transcript:
-        text = (entry.get("text") or "").strip()
+        if not isinstance(entry, dict):
+            continue
+        raw_text = entry.get("text")
+        if raw_text is None:
+            raw_text = ""
+        text = str(raw_text).strip()
         if not text:
             continue
         start = entry.get("start")
