@@ -43,13 +43,15 @@ RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
 RAPIDAPI_HOST = "youtube-transcript3.p.rapidapi.com"
 RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/api/transcript"
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID") or os.getenv("Drive_Folder_ID")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
 
 if not RAPIDAPI_KEY:
     logger.warning("RAPIDAPI_KEY not set (discover will fail until configured).")
 if not DRIVE_FOLDER_ID:
-    logger.warning("Drive folder id not set (Drive_Folder_ID/DRIVE_FOLDER_ID).")
+    logger.warning("Drive folder id not set (DRIVE_FOLDER_ID).")
+if not GOOGLE_CREDENTIALS and not GOOGLE_SERVICE_ACCOUNT_FILE:
+    logger.warning("Google credentials not set (GOOGLE_CREDENTIALS or GOOGLE_SERVICE_ACCOUNT_FILE).")
 
 # -------------------------
 # MODELS
@@ -239,8 +241,8 @@ def get_google_services():
         "https://www.googleapis.com/auth/drive",
         "https://www.googleapis.com/auth/documents",
     ]
-    if GOOGLE_SERVICE_ACCOUNT_JSON:
-        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    if GOOGLE_CREDENTIALS:
+        info = json.loads(GOOGLE_CREDENTIALS)
         creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
     elif GOOGLE_SERVICE_ACCOUNT_FILE:
         creds = service_account.Credentials.from_service_account_file(
@@ -248,7 +250,7 @@ def get_google_services():
             scopes=scopes,
         )
     else:
-        raise RuntimeError("Google service account credentials not configured")
+        raise RuntimeError("Google credentials not configured (GOOGLE_CREDENTIALS or GOOGLE_SERVICE_ACCOUNT_FILE)")
 
     drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
     docs_service = build("docs", "v1", credentials=creds, cache_discovery=False)
