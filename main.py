@@ -1,3 +1,9 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/main.py b/main.py
+index f364ddc7ebfb844a73a909111b9732f66f957676..a76c6eed51cacbaf7d25d67c60614cc35718875e 100644
+--- a/main.py
++++ b/main.py
+@@ -1,161 +1,135 @@
  import os
  import uuid
  import time
@@ -185,3 +191,127 @@
  # CHUNKING
  # -------------------------
  def chunk_transcript(segments: List[dict], chunk_seconds: int = 120) -> List[dict]:
+@@ -173,84 +147,117 @@ def chunk_transcript(segments: List[dict], chunk_seconds: int = 120) -> List[dic
+         if (total + dur) > chunk_seconds and current:
+             chunks.append({
+                 "start": float(current_start),
+                 "end": float(current_start + total),
+                 "segments": current,
+             })
+             current = []
+             current_start = s["start"]
+             total = 0.0
+ 
+         current.append(s)
+         total += dur
+ 
+     if current:
+         chunks.append({
+             "start": float(current_start),
+             "end": float(current_start + total),
+             "segments": current,
+         })
+ 
+     return chunks
+ 
+ # -------------------------
+ # BACKGROUND JOB: DISCOVERY
+ # -------------------------
+-    try:
+-        JOBS[job_id]["step"] = "transcript_fetch"
++def run_discovery(job_id: str, video_id: str):
++    started = time.time()
++    JOBS[job_id]["status"] = "running"
++    JOBS[job_id]["step"] = "transcript_fetch"
++
++    logger.info(f"[{job_id}] discovery start video_id={video_id}")
+ 
++    try:
+         # Retry strategy for transient provider failures
+         backoff_seconds = [0, 15, 45, 120]  # total ~3 minutes max
+         last_err = None
++        transcript = None
+ 
+         for attempt, wait_s in enumerate(backoff_seconds, start=1):
+             if wait_s:
+                 logger.info(f"[{job_id}] transcript retry in {wait_s}s (attempt {attempt}/{len(backoff_seconds)})")
+                 time.sleep(wait_s)
+ 
+             try:
+                 transcript = get_transcript(video_id)
+                 logger.info(f"[{job_id}] transcript segments={len(transcript)} (attempt {attempt})")
+                 last_err = None
+                 break
+             except Exception as e:
+                 last_err = str(e)
+                 logger.warning(f"[{job_id}] transcript attempt {attempt} failed: {last_err}")
+ 
+                 # Only keep retrying if provider says "not available at the moment"
+                 if "not available at the moment" not in last_err.lower():
+                     break
+ 
+         if last_err is not None:
+             JOBS[job_id]["status"] = "blocked"
+             JOBS[job_id]["step"] = "transcript_unavailable"
+             JOBS[job_id]["error"] = last_err
+             JOBS[job_id]["elapsed_s"] = round(time.time() - started, 2)
+             logger.warning(f"[{job_id}] blocked: transcript unavailable after retries")
+             return
+ 
+-        # continue with chunking...
++        JOBS[job_id]["step"] = "chunking"
++        chunks = chunk_transcript(transcript, chunk_seconds=120)
++        logger.info(f"[{job_id}] chunks={len(chunks)}")
++
++        # Next steps to add AFTER transcript stability:
++        # - AI clip discovery per chunk
++        # - global merge/rank, cap <= 30
++        # - write proposed clips to Google Sheets
++
++        JOBS[job_id]["status"] = "done"
++        JOBS[job_id]["step"] = "completed"
++        JOBS[job_id]["result"] = {
++            "video_id": video_id,
++            "segments": len(transcript),
++            "chunks": len(chunks),
++        }
++        JOBS[job_id]["elapsed_s"] = round(time.time() - started, 2)
++
++        logger.info(f"[{job_id}] discovery done elapsed_s={JOBS[job_id]['elapsed_s']}")
++
++    except Exception as e:
++        msg = str(e)
++        JOBS[job_id]["status"] = "error"
++        JOBS[job_id]["step"] = "failed"
++        JOBS[job_id]["error"] = msg
++        JOBS[job_id]["elapsed_s"] = round(time.time() - started, 2)
++
++        logger.exception(f"[{job_id}] discovery failed: {e}")
+ 
+ # -------------------------
+ # DISCOVER ENDPOINT (Zapier-safe)
+ # -------------------------
+ @app.post("/discover", response_model=DiscoverResponse, status_code=202)
+ def discover(req: DiscoverRequest):
+     if not RAPIDAPI_KEY:
+         raise HTTPException(status_code=500, detail="RAPIDAPI_KEY not configured")
+ 
+     job_id = str(uuid.uuid4())
+     JOBS[job_id] = {
+         "job_id": job_id,
+         "video_id": req.video_id,
+         "status": "queued",
+         "step": "queued",
+         "created_at": time.time(),
+     }
+ 
+     executor.submit(run_discovery, job_id, req.video_id)
+     return {"status": "accepted", "job_id": job_id, "video_id": req.video_id}
+ 
+ # -------------------------
+ # JOB STATUS (debug)
+ # -------------------------
+ @app.get("/jobs/{job_id}")
+ 
+EOF
+)
