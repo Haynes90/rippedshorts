@@ -142,8 +142,6 @@ def get_transcript(video_id: str) -> List[dict]:
         "Transcript3 call=transcript status=%s success=%s",
         resp.status_code,
         data.get("success"),
-@@ -141,93 +189,181 @@ def chunk_transcript(segments: List[dict], chunk_seconds: int = 120) -> List[dic
-    total = 0.0
 
     for segment in segments:
         if total + segment["duration"] > chunk_seconds and current:
