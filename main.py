@@ -138,10 +138,51 @@ def get_transcript(video_id: str) -> List[dict]:
     except Exception as exc:
         raise RuntimeError(f"Transcript API non-JSON ({resp.status_code}): {resp.text}") from exc
 
-    logger.info(
-        "Transcript3 call=transcript status=%s success=%s",
-        resp.status_code,
-        data.get("success"),
+    logger.info("Transcript3 call=transcript status=%s success=%s", resp.status_code, data.get("success"))
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"Transcript API HTTP error ({resp.status_code}): {data}")
+
+    if not data.get("success"):
+        raise RuntimeError(f"Transcript API reported failure: {data}")
+
+    transcript = data.get("transcript")
+    if not transcript or not isinstance(transcript, list):
+        raise RuntimeError(f"Transcript empty or malformed: {data}")
+
+    segments: List[dict] = []
+    for entry in transcript:
+        text = (entry.get("text") or "").strip()
+        if not text:
+            continue
+        start = entry.get("start")
+        if start is None:
+            start = entry.get("offset", 0.0)
+        segments.append({
+            "start": float(start or 0.0),
+            "duration": float(entry.get("duration", 0.0)),
+            "text": text,
+        })
+
+    if not segments:
+        raise RuntimeError("Transcript contained no usable segments")
+
+    return segments
+
+
+# -------------------------
+# Chunking (3hr-safe)
+# -------------------------
+
+def chunk_transcript(segments: List[dict], chunk_seconds: int = 120) -> List[dict]:
+    """
+    Chunk by time window. 120s chunks is good for long videos.
+    We do NOT return chunks to Zapier — internal use only.
+    """
+    chunks = []
+    current = []
+    current_start = segments[0]["start"]
+    total = 0.0
 
     for segment in segments:
         if total + segment["duration"] > chunk_seconds and current:
