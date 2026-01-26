@@ -408,14 +408,43 @@ def call_openai_for_clips(transcript_segments: List[dict], prompt_override: Opti
         raise RuntimeError(f"OpenAI response was not valid JSON: {content}") from exc
 
 
-def write_clips_to_sheet(sheet_id: str, sheet_tab: str, clips_payload: dict) -> dict:
+def write_clips_to_sheet(
+    sheet_id: str,
+    sheet_tab: str,
+    clips_payload: dict,
+    video_id: str,
+    transcript_segments: List[dict],
+) -> dict:
     _, _, sheets_service = get_google_services()
     segments = clips_payload.get("segments", [])
-    if not segments:
-        values = [["No segments returned"]]
+    transcript_lookup = {seg["start"]: seg["text"] for seg in transcript_segments}
+    values = []
+    for segment in segments:
+        start = segment.get("start", 0.0)
+        duration = segment.get("duration", 0.0)
+        text = transcript_lookup.get(start, "")
+        values.append([
+            video_id,
+            start,
+            duration,
+            text,
+            segment.get("score"),
+            segment.get("category"),
+            segment.get("reason"),
+        ])
+    if not values:
+        values = [[video_id, "", "", "", "", "", "No segments returned"]]
+
+    existing = sheets_service.spreadsheets().values().get(
+        spreadsheetId=sheet_id,
+        range=f"{sheet_tab}!A:A",
+    ).execute()
+    existing_values = existing.get("values", [])
+    if not existing_values:
+        start_row = 2
     else:
-        values = [[json.dumps(segment, ensure_ascii=False)] for segment in segments]
-    range_name = f"{sheet_tab}!A2"
+        start_row = len(existing_values) + 1
+    range_name = f"{sheet_tab}!A{start_row}"
     result = sheets_service.spreadsheets().values().update(
         spreadsheetId=sheet_id,
         range=range_name,
@@ -460,7 +489,13 @@ def run_discovery(job_id: str, video_id: str):
         sheet_id = (JOBS[job_id].get("sheet_id") or DEFAULT_SHEET_ID).strip()
         sheet_tab = (JOBS[job_id].get("sheet_tab") or DEFAULT_SHEET_TAB).strip()
         logger.info("[%s] writing clips to sheet_id=%s tab=%s", job_id, sheet_id, sheet_tab)
-        sheet_info = write_clips_to_sheet(sheet_id, sheet_tab, clips_payload)
+        sheet_info = write_clips_to_sheet(
+            sheet_id,
+            sheet_tab,
+            clips_payload,
+            video_id,
+            transcript,
+        )
         logger.info("[%s] sheet updated range=%s", job_id, sheet_info.get("range"))
 
         JOBS[job_id]["status"] = "done"
