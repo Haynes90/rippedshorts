@@ -390,6 +390,7 @@ def call_openai_for_clips(transcript_segments: List[dict], prompt_override: Opti
             {"role": "system", "content": "You are a helpful assistant that returns strict JSON only."},
             {"role": "user", "content": prompt},
         ],
+        "response_format": {"type": "json_object"},
         "temperature": 0.2,
     }
     resp = requests.post(
@@ -402,10 +403,22 @@ def call_openai_for_clips(transcript_segments: List[dict], prompt_override: Opti
         raise RuntimeError(f"OpenAI API error ({resp.status_code}): {resp.text}")
     data = resp.json()
     content = data["choices"][0]["message"]["content"]
+    raw_content = content.strip()
+    if raw_content.startswith("```"):
+        lines = raw_content.splitlines()
+        if len(lines) >= 2:
+            raw_content = "\n".join(lines[1:-1]).strip()
     try:
-        return json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"OpenAI response was not valid JSON: {content}") from exc
+        return json.loads(raw_content)
+    except json.JSONDecodeError:
+        start = raw_content.find("{")
+        end = raw_content.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(raw_content[start : end + 1])
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"OpenAI response was not valid JSON: {raw_content}") from exc
+        raise RuntimeError(f"OpenAI response was not valid JSON: {raw_content}")
 
 
 def write_clips_to_sheet(
@@ -481,7 +494,11 @@ def run_discovery(job_id: str, video_id: str):
             logger.warning("[%s] OPENAI_API_KEY missing, skipping clip discovery", job_id)
             clips_payload = {"segments": [], "error": "OPENAI_API_KEY not configured"}
         else:
-            clips_payload = call_openai_for_clips(transcript, JOBS[job_id].get("prompt"))
+            try:
+                clips_payload = call_openai_for_clips(transcript, JOBS[job_id].get("prompt"))
+            except Exception as exc:
+                logger.exception("[%s] clip discovery failed, continuing with empty results", job_id)
+                clips_payload = {"segments": [], "error": str(exc)}
         clip_segments = clips_payload.get("segments", [])
         logger.info("[%s] clips=%s", job_id, len(clip_segments))
 
