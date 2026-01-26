@@ -448,13 +448,18 @@ def run_discovery(job_id: str, video_id: str):
         logger.info("[%s] chunks=%s", job_id, len(chunks))
 
         JOBS[job_id]["step"] = "clip_discovery"
-        clips_payload = call_openai_for_clips(transcript, JOBS[job_id].get("prompt"))
+        if not OPENAI_API_KEY:
+            logger.warning("[%s] OPENAI_API_KEY missing, skipping clip discovery", job_id)
+            clips_payload = {"segments": [], "error": "OPENAI_API_KEY not configured"}
+        else:
+            clips_payload = call_openai_for_clips(transcript, JOBS[job_id].get("prompt"))
         clip_segments = clips_payload.get("segments", [])
         logger.info("[%s] clips=%s", job_id, len(clip_segments))
 
         JOBS[job_id]["step"] = "sheet_write"
         sheet_id = JOBS[job_id].get("sheet_id") or DEFAULT_SHEET_ID
         sheet_tab = JOBS[job_id].get("sheet_tab") or DEFAULT_SHEET_TAB
+        logger.info("[%s] writing clips to sheet_id=%s tab=%s", job_id, sheet_id, sheet_tab)
         sheet_info = write_clips_to_sheet(sheet_id, sheet_tab, clips_payload)
         logger.info("[%s] sheet updated range=%s", job_id, sheet_info.get("range"))
 
