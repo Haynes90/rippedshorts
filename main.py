@@ -457,8 +457,8 @@ def run_discovery(job_id: str, video_id: str):
         logger.info("[%s] clips=%s", job_id, len(clip_segments))
 
         JOBS[job_id]["step"] = "sheet_write"
-        sheet_id = JOBS[job_id].get("sheet_id") or DEFAULT_SHEET_ID
-        sheet_tab = JOBS[job_id].get("sheet_tab") or DEFAULT_SHEET_TAB
+        sheet_id = (JOBS[job_id].get("sheet_id") or DEFAULT_SHEET_ID).strip()
+        sheet_tab = (JOBS[job_id].get("sheet_tab") or DEFAULT_SHEET_TAB).strip()
         logger.info("[%s] writing clips to sheet_id=%s tab=%s", job_id, sheet_id, sheet_tab)
         sheet_info = write_clips_to_sheet(sheet_id, sheet_tab, clips_payload)
         logger.info("[%s] sheet updated range=%s", job_id, sheet_info.get("range"))
