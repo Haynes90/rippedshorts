@@ -4,8 +4,11 @@ import re
 import time
 import uuid
 import logging
+import math
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import subprocess
 from urllib.parse import urlparse, parse_qs
 
 import requests
@@ -13,6 +16,9 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+import cv2
+import mediapipe as mp
 
 # -------------------------
 # LOGGING (visible in Railway logs)
@@ -45,6 +51,7 @@ RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/api/transcript"
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID") or os.getenv("Drive_Folder_ID")
 DEFAULT_SHEET_ID = os.getenv("DEFAULT_SHEET_ID", "1xfp-sjO9Mnvwe7-bM6htT-0RKiOig21HfP_otzO9xws")
 DEFAULT_SHEET_TAB = os.getenv("DEFAULT_SHEET_TAB", "Sheet1")
+API_VIDEO_KEY = os.getenv("API_VIDEO_KEY")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
 GOOGLE_CLIENT_EMAIL = os.getenv("GOOGLE_CLIENT_EMAIL")
@@ -69,6 +76,8 @@ if GOOGLE_API_KEY:
     logger.info("GOOGLE_API provided but not used for Docs/Drive write access.")
 if not OPENAI_API_KEY:
     logger.warning("OPENAI_API_KEY not set (clip discovery will fail until configured).")
+if not API_VIDEO_KEY:
+    logger.warning("API_VIDEO_KEY not set (api.video clipping will be unavailable).")
 
 # -------------------------
 # MODELS
@@ -331,6 +340,210 @@ def create_transcript_doc(video_id: str, segments: List[dict]) -> Dict[str, str]
     }
 
 
+def download_youtube_video(video_id: str, youtube_url: Optional[str], workdir: Path) -> Path:
+    workdir.mkdir(parents=True, exist_ok=True)
+    url = youtube_url or f"https://www.youtube.com/watch?v={video_id}"
+    output_template = str(workdir / f"{video_id}.%(ext)s")
+    command = [
+        "yt-dlp",
+        "-f",
+        "mp4",
+        "-o",
+        output_template,
+        url,
+    ]
+    subprocess.run(command, check=True, capture_output=True)
+    for candidate in workdir.glob(f"{video_id}.*"):
+        if candidate.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}:
+            return candidate
+    raise RuntimeError("Unable to find downloaded video file")
+
+
+def _probe_video_dimensions(video_path: Path) -> tuple[int, int]:
+    cap = cv2.VideoCapture(str(video_path))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    if width <= 0 or height <= 0:
+        raise RuntimeError("Unable to read video dimensions")
+    return width, height
+
+
+def _estimate_speaker_center_x(video_path: Path, start: float, duration: float) -> float:
+    mp_face = mp.solutions.face_detection
+    detector = mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.5)
+    cap = cv2.VideoCapture(str(video_path))
+    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+    centers = []
+    total_frames = int(min(duration, 30) * 2)
+    step = max(1, int(cap.get(cv2.CAP_PROP_FPS) // 2 or 1))
+    frame_idx = 0
+    while len(centers) < total_frames:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if frame_idx % step == 0:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = detector.process(rgb)
+            if results.detections:
+                bbox = results.detections[0].location_data.relative_bounding_box
+                center_x = bbox.xmin + bbox.width / 2
+                centers.append(center_x)
+        frame_idx += 1
+    cap.release()
+    detector.close()
+    if centers:
+        return sum(centers) / len(centers)
+    return 0.5
+
+
+def _build_crop_filter(video_path: Path, start: float, duration: float) -> str:
+    width, height = _probe_video_dimensions(video_path)
+    target_width = int(height * 9 / 16)
+    center_ratio = _estimate_speaker_center_x(video_path, start, duration)
+    center_x = int(center_ratio * width)
+    crop_x = max(0, min(width - target_width, center_x - target_width // 2))
+    return f"crop={target_width}:{height}:{crop_x}:0"
+
+
+def create_clip_file(video_path: Path, start: float, duration: float, output_path: Path) -> None:
+    crop_filter = _build_crop_filter(video_path, start, duration)
+    command = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start:.2f}",
+        "-t",
+        f"{duration:.2f}",
+        "-i",
+        str(video_path),
+        "-vf",
+        f"{crop_filter},scale=1080:1920",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    subprocess.run(command, check=True, capture_output=True)
+
+
+def upload_clip_to_drive(clip_path: Path, clip_name: str) -> dict:
+    if not DRIVE_FOLDER_ID:
+        raise RuntimeError("Drive folder id not configured (Drive_Folder_ID/DRIVE_FOLDER_ID)")
+    drive_service, _, _ = get_google_services()
+    file_metadata = {
+        "name": clip_name,
+        "parents": [DRIVE_FOLDER_ID],
+    }
+    media = MediaFileUpload(str(clip_path), mimetype="video/mp4", resumable=True)
+    uploaded = drive_service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, webViewLink",
+        supportsAllDrives=True,
+    ).execute()
+    return {
+        "clip_id": uploaded["id"],
+        "clip_url": uploaded.get("webViewLink") or f"https://drive.google.com/file/d/{uploaded['id']}/view",
+    }
+
+
+def _seconds_to_timecode(seconds: float) -> str:
+    total_seconds = int(max(0, math.floor(seconds)))
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def create_apivideo_clip(
+    source_url: str,
+    clip_name: str,
+    start: float,
+    duration: float,
+) -> dict:
+    if not API_VIDEO_KEY:
+        raise RuntimeError("API_VIDEO_KEY not configured")
+    end = start + duration
+    payload = {
+        "title": clip_name,
+        "source": source_url,
+        "clip": {
+            "startTimecode": _seconds_to_timecode(start),
+            "endTimecode": _seconds_to_timecode(end),
+        },
+    }
+    resp = requests.post(
+        "https://ws.api.video/videos",
+        headers={
+            "Authorization": f"Bearer {API_VIDEO_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=(10, 60),
+    )
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"api.video create failed ({resp.status_code}): {resp.text}")
+    data = resp.json()
+    assets = data.get("assets", {}) if isinstance(data, dict) else {}
+    return {
+        "clip_id": data.get("videoId") if isinstance(data, dict) else None,
+        "clip_url": assets.get("player") or assets.get("hls") or assets.get("mp4"),
+    }
+
+
+def attach_clip_assets(
+    clips_payload: dict,
+    video_id: str,
+    youtube_url: Optional[str],
+) -> dict:
+    segments = clips_payload.get("segments", [])
+    if not segments:
+        return clips_payload
+    if API_VIDEO_KEY and youtube_url:
+        for idx, segment in enumerate(segments, start=1):
+            start = float(segment.get("start", 0.0))
+            duration = float(segment.get("duration", 0.0))
+            end = segment.get("end")
+            if duration <= 0 and end is not None:
+                duration = max(0.0, float(end) - start)
+            if duration <= 0:
+                continue
+            clip_name = f"{video_id}_{idx:02d}"
+            clip_info = create_apivideo_clip(
+                youtube_url,
+                clip_name,
+                start,
+                duration,
+            )
+            segment["clip_name"] = clip_name
+            segment["clip_url"] = clip_info.get("clip_url")
+        return clips_payload
+
+    workdir = Path("/tmp") / f"clips_{video_id}"
+    video_path = download_youtube_video(video_id, youtube_url, workdir)
+    for idx, segment in enumerate(segments, start=1):
+        start = float(segment.get("start", 0.0))
+        duration = float(segment.get("duration", 0.0))
+        end = segment.get("end")
+        if duration <= 0 and end is not None:
+            duration = max(0.0, float(end) - start)
+        if duration <= 0:
+            continue
+        clip_name = f"{video_id}_{idx:02d}.mp4"
+        output_path = workdir / clip_name
+        create_clip_file(video_path, start, duration, output_path)
+        clip_info = upload_clip_to_drive(output_path, clip_name)
+        segment["clip_name"] = clip_name
+        segment["clip_url"] = clip_info["clip_url"]
+    return clips_payload
+
+
 def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optional[str]) -> str:
     base_prompt = prompt_override or (
         "TASK\n"
@@ -503,9 +716,11 @@ def write_clips_to_sheet(
             segment.get("score"),
             segment.get("category") or segment.get("primary_category"),
             segment.get("reason"),
+            segment.get("clip_url", ""),
+            segment.get("clip_name", ""),
         ])
     if not values:
-        values = [[video_id, "", "", "", "", "", "No segments returned"]]
+        values = [[video_id, "", "", "", "", "", "No segments returned", "", ""]]
 
     existing = sheets_service.spreadsheets().values().get(
         spreadsheetId=sheet_id,
@@ -561,6 +776,11 @@ def run_discovery(job_id: str, video_id: str):
                 clips_payload = {"segments": [], "error": str(exc)}
         clip_segments = clips_payload.get("segments", [])
         logger.info("[%s] clips=%s", job_id, len(clip_segments))
+
+        JOBS[job_id]["step"] = "clip_render"
+        if clip_segments:
+            youtube_url = JOBS[job_id].get("youtube_url")
+            clips_payload = attach_clip_assets(clips_payload, video_id, youtube_url)
 
         JOBS[job_id]["step"] = "sheet_write"
         sheet_id = (JOBS[job_id].get("sheet_id") or DEFAULT_SHEET_ID).strip()
