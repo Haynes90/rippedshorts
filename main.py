@@ -333,6 +333,9 @@ def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optiona
     base_prompt = prompt_override or (
         "TASK\nReturn up to 20 clip-worthy segments.\n\n"
         "Length:\n- 10–90 seconds\n\n"
+        "Selection priority:\n"
+        "- Choose the most impactful clips based on the full transcript.\n"
+        "- Each clip must be a complete thought or idea (no cut-off statements).\n\n"
         "Eligible content types (must meet one or all):\n"
         "- Teaching moments, or biblical explanation\n"
         "- Testimony or lived experience\n"
