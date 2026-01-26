@@ -487,7 +487,7 @@ def create_apivideo_clip(
         json=payload,
         timeout=(10, 60),
     )
-    if resp.status_code not in (200, 201):
+    if resp.status_code not in (200, 201, 202):
         raise RuntimeError(f"api.video create failed ({resp.status_code}): {resp.text}")
     data = resp.json()
     assets = data.get("assets", {}) if isinstance(data, dict) else {}
@@ -515,12 +515,16 @@ def attach_clip_assets(
             if duration <= 0:
                 continue
             clip_name = f"{video_id}_{idx:02d}"
-            clip_info = create_apivideo_clip(
-                youtube_url,
-                clip_name,
-                start,
-                duration,
-            )
+                       try:
+                clip_info = create_apivideo_clip(
+                    youtube_url,
+                    clip_name,
+                    start,
+                    duration,
+                )
+            except Exception as exc:
+                logger.exception("[%s] api.video clip failed for %s: %s", video_id, clip_name, exc)
+                continue
             segment["clip_name"] = clip_name
             segment["clip_url"] = clip_info.get("clip_url")
         return clips_payload
