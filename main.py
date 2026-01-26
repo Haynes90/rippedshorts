@@ -43,6 +43,8 @@ RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
 RAPIDAPI_HOST = "youtube-transcript3.p.rapidapi.com"
 RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/api/transcript"
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID") or os.getenv("Drive_Folder_ID")
+DEFAULT_SHEET_ID = os.getenv("DEFAULT_SHEET_ID", "1xfp-sjO9Mnvwe7-bM6htT-0RKiOig21HfP_otzO9xws")
+DEFAULT_SHEET_TAB = os.getenv("DEFAULT_SHEET_TAB", "Sheet1")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
 GOOGLE_CLIENT_EMAIL = os.getenv("GOOGLE_CLIENT_EMAIL")
@@ -51,6 +53,8 @@ GOOGLE_PRIVATE_KEY_ID = os.getenv("GOOGLE_PRIVATE_KEY_ID")
 GOOGLE_PROJECT_ID = os.getenv("GOOGLE_PROJECT_ID")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 if not RAPIDAPI_KEY:
     logger.warning("RAPIDAPI_KEY not set (discover will fail until configured).")
@@ -63,6 +67,8 @@ if not GOOGLE_CREDENTIALS and not GOOGLE_SERVICE_ACCOUNT_FILE and not (GOOGLE_CL
     )
 if GOOGLE_API_KEY:
     logger.info("GOOGLE_API provided but not used for Docs/Drive write access.")
+if not OPENAI_API_KEY:
+    logger.warning("OPENAI_API_KEY not set (clip discovery will fail until configured).")
 
 # -------------------------
 # MODELS
@@ -75,6 +81,7 @@ class DiscoverRequest(BaseModel):
     youtube_url: Optional[str] = None
     sheet_id: Optional[str] = None
     sheet_tab: Optional[str] = None
+    prompt: Optional[str] = None
 
 
 class DiscoverResponse(BaseModel):
@@ -251,6 +258,7 @@ def get_google_services():
     scopes = [
         "https://www.googleapis.com/auth/drive",
         "https://www.googleapis.com/auth/documents",
+        "https://www.googleapis.com/auth/spreadsheets",
     ]
     if GOOGLE_CREDENTIALS:
         info = json.loads(GOOGLE_CREDENTIALS)
@@ -283,14 +291,15 @@ def get_google_services():
 
     drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
     docs_service = build("docs", "v1", credentials=creds, cache_discovery=False)
-    return drive_service, docs_service
+    sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return drive_service, docs_service, sheets_service
 
 
 def create_transcript_doc(video_id: str, segments: List[dict]) -> Dict[str, str]:
     if not DRIVE_FOLDER_ID:
         raise RuntimeError("Drive folder id not configured (Drive_Folder_ID/DRIVE_FOLDER_ID)")
 
-    drive_service, docs_service = get_google_services()
+    drive_service, docs_service, _ = get_google_services()
     title = f"{video_id} Full transcript"
     file_metadata = {
         "name": title,
@@ -319,6 +328,102 @@ def create_transcript_doc(video_id: str, segments: List[dict]) -> Dict[str, str]
         "document_url": f"https://docs.google.com/document/d/{doc_id}/edit",
     }
 
+
+def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optional[str]) -> str:
+    base_prompt = prompt_override or (
+        "TASK\nReturn up to 20 clip-worthy segments.\n\n"
+        "Length:\n- 10–90 seconds\n\n"
+        "Eligible content types (must meet one or all):\n"
+        "- Teaching moments, or biblical explanation\n"
+        "- Testimony or lived experience\n"
+        "- Impactful or declarative statements/mantras\n"
+        "- Calls to action (faith responses, encouragement, challenges)\n"
+        "- Chants, repetitions, or congregational moments\n"
+        "- Humorous moments that reinforce the message\n"
+        "- Educational or ministry-focused commentary\n"
+        "- Any Tell Your Neighbor moments\n\n"
+        "Tone & intent (must meet one or all):\n"
+        "- Faith-centered, authentic, and purposeful\n"
+        "- Humor is allowed when it supports or amplifies the message\n"
+        "- Emotional or high-energy moments are encouraged if meaningful\n\n"
+        "Content boundaries:\n"
+        "- Avoid empty filler, long pauses, or setup with no payoff\n"
+        "- Intros and outros are allowed only if they are impactful or message-driven\n"
+        "- Do not clip logistical announcements unless spiritually relevant\n\n"
+        "Accuracy & structure:\n"
+        "- Use transcript offsets exactly as provided\n"
+        "- Do not paraphrase, infer, or reconstruct missing context\n\n"
+        "Quality gate:\n"
+        "- If no segment is clearly meaningful, spiritually relevant, or impactful, "
+        "return clips referencing biblical or Christian concepts or motivational moments.\n\n"
+        "OUTPUT FORMAT (STRICT JSON ONLY)\n\n"
+        "{\n"
+        "  \"segments\": [\n"
+        "    {\n"
+        "      \"start\": number,\n"
+        "      \"duration\": number,\n"
+        "      \"score\": number (0–100),\n"
+        "      \"category\": \"teaching\" | \"testimony\" | \"motivation\" | "
+        "\"call-to-action\" | \"chant-song\" | \"humor\" | \"worship\" | \"education\",\n"
+        "      \"reason\": \"short justification\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "If nothing qualifies:\n"
+        "{\"segments\": []}\n"
+    )
+    transcript_payload = [
+        {"offset": seg["start"], "duration": seg["duration"], "text": seg["text"]}
+        for seg in transcript_segments
+    ]
+    return f"{base_prompt}\n\nTranscript Segments:\n{json.dumps(transcript_payload, ensure_ascii=False)}"
+
+
+def call_openai_for_clips(transcript_segments: List[dict], prompt_override: Optional[str]) -> dict:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not configured")
+
+    prompt = openai_clip_prompt(transcript_segments, prompt_override)
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant that returns strict JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+    }
+    resp = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=(10, 180),
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenAI API error ({resp.status_code}): {resp.text}")
+    data = resp.json()
+    content = data["choices"][0]["message"]["content"]
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"OpenAI response was not valid JSON: {content}") from exc
+
+
+def write_clips_to_sheet(sheet_id: str, sheet_tab: str, clips_payload: dict) -> dict:
+    _, _, sheets_service = get_google_services()
+    segments = clips_payload.get("segments", [])
+    if not segments:
+        values = [["No segments returned"]]
+    else:
+        values = [[json.dumps(segment, ensure_ascii=False)] for segment in segments]
+    range_name = f"{sheet_tab}!A2"
+    result = sheets_service.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=range_name,
+        valueInputOption="RAW",
+        body={"values": values},
+    ).execute()
+    return {"updated_cells": result.get("updatedCells"), "range": result.get("updatedRange")}
+
 # -------------------------
 # Background job (DISCOVERY)
 # -------------------------
@@ -342,6 +447,17 @@ def run_discovery(job_id: str, video_id: str):
         chunks = chunk_transcript(transcript, chunk_seconds=120)
         logger.info("[%s] chunks=%s", job_id, len(chunks))
 
+        JOBS[job_id]["step"] = "clip_discovery"
+        clips_payload = call_openai_for_clips(transcript, JOBS[job_id].get("prompt"))
+        clip_segments = clips_payload.get("segments", [])
+        logger.info("[%s] clips=%s", job_id, len(clip_segments))
+
+        JOBS[job_id]["step"] = "sheet_write"
+        sheet_id = JOBS[job_id].get("sheet_id") or DEFAULT_SHEET_ID
+        sheet_tab = JOBS[job_id].get("sheet_tab") or DEFAULT_SHEET_TAB
+        sheet_info = write_clips_to_sheet(sheet_id, sheet_tab, clips_payload)
+        logger.info("[%s] sheet updated range=%s", job_id, sheet_info.get("range"))
+
         JOBS[job_id]["status"] = "done"
         JOBS[job_id]["step"] = "completed"
         JOBS[job_id]["result"] = {
@@ -350,6 +466,10 @@ def run_discovery(job_id: str, video_id: str):
             "chunks": len(chunks),
             "document_id": doc_info["document_id"],
             "document_url": doc_info["document_url"],
+            "clips": clip_segments,
+            "sheet_id": sheet_id,
+            "sheet_tab": sheet_tab,
+            "sheet_range": sheet_info.get("range"),
         }
         JOBS[job_id]["elapsed_s"] = round(time.time() - started, 2)
 
@@ -383,6 +503,7 @@ def discover(req: DiscoverRequest):
         "youtube_url": req.youtube_url,
         "sheet_id": req.sheet_id,
         "sheet_tab": req.sheet_tab,
+        "prompt": req.prompt,
         "status": "queued",
         "step": "queued",
         "created_at": time.time(),
