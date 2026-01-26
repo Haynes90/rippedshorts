@@ -292,15 +292,17 @@ def create_transcript_doc(video_id: str, segments: List[dict]) -> Dict[str, str]
 
     drive_service, docs_service = get_google_services()
     title = f"{video_id} Full transcript"
-    doc = docs_service.documents().create(body={"title": title}).execute()
-    doc_id = doc["documentId"]
-
-    drive_service.files().update(
-        fileId=doc_id,
-        addParents=DRIVE_FOLDER_ID,
-        removeParents="root",
+    file_metadata = {
+        "name": title,
+        "mimeType": "application/vnd.google-apps.document",
+        "parents": [DRIVE_FOLDER_ID],
+    }
+    file_obj = drive_service.files().create(
+        body=file_metadata,
         fields="id, parents",
+        supportsAllDrives=True,
     ).execute()
+    doc_id = file_obj["id"]
 
     transcript_text = build_transcript_text(segments)
     docs_service.documents().batchUpdate(
