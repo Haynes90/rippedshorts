@@ -332,103 +332,110 @@ def create_transcript_doc(video_id: str, segments: List[dict]) -> Dict[str, str]
 
 
 def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optional[str]) -> str:
-    base_prompt = prompt_override or """TASK
-You are a highlight editor for ANY type of content (not just faith). Review the ENTIRE transcript and:
-1) Identify the main theme and 3–8 key ideas.
-2) Select up to 20 clip-worthy segments (10–90s) that best represent those ideas and will perform on social.
-3) Categorize each selected clip using the MASTER CATEGORY LIST below.
+    base_prompt = prompt_override or (
+        "TASK\n"
+        "You are a highlight editor for ANY type of content. Review the ENTIRE transcript in chronological order "
+        "and select the best short-form clips.\n"
+        "Return a MAX of 20 clips, each 10–90 seconds, prioritized by engagement and standalone clarity.\n\n"
+        "TRANSCRIPT FORMAT (YOU MUST FOLLOW THIS)\n"
+        "- Each transcript line is already time-aligned and looks like:\n"
+        "  [MM:SS | start=###.##s | dur=##.##s] text...\n"
+        "- The transcript is an ordered timeline. Do NOT reorder lines.\n"
+        "- You may create a clip by selecting ONE line OR combining MULTIPLE ADJACENT lines only.\n"
+        "- Never combine non-adjacent lines.\n"
+        "- For a combined clip:\n"
+        "  - start = start of the first included line\n"
+        "  - end = (start of last included line) + (dur of last included line)\n"
+        "  - duration = end - start\n"
+        "  - transcript = exact concatenation of included texts, in order\n"
+        "- Use timestamps EXACTLY as provided. Do not guess.\n\n"
+        "HARD REQUIREMENTS\n"
+        "- Each chosen clip MUST be 10–90 seconds.\n"
+        "- Each clip MUST be a complete, standalone thought (no cut-off setup, mid-sentence starts, "
+        "or missing payoff).\n"
+        "- Do NOT paraphrase, rewrite, infer missing context, or fabricate.\n"
+        "- Avoid duplicates/near-duplicates; maximize variety.\n\n"
+        "PROCESS\n"
+        "1) First pass: determine main_theme + 3–8 key ideas.\n"
+        "2) Second pass: pick clips that best support those ideas AND will perform on social.\n"
+        "3) Categorize each clip using the MASTER CATEGORY LIST.\n\n"
+        "MASTER CATEGORY LIST (choose ONE per clip)\n"
+        "- inspiration\n"
+        "- education\n"
+        "- humor\n"
+        "- story\n"
+        "- insight\n"
+        "- call-to-action\n"
+        "- controversy\n"
+        "- behind-the-scenes\n"
+        "- social-proof\n"
+        "- empathy\n"
+        "- mindset\n"
+        "- leadership\n"
+        "- business\n"
+        "- science-tech\n"
+        "- lifestyle\n"
+        "- spirituality\n"
+        "- community\n"
+        "- quote\n\n"
+        "SCORING (0–100)\n"
+        "- Hook strength in first 2–3 seconds (0–30)\n"
+        "- Standalone clarity / completeness (0–25)\n"
+        "- Impact (emotion/usefulness/novelty) (0–25)\n"
+        "- Shareability / quoteability (0–10)\n"
+        "- Variety contribution vs other picks (0–10)\n\n"
+        "OUTPUT FORMAT (STRICT JSON ONLY)\n"
+        "{\n"
+        "  \"analysis\": {\n"
+        "    \"main_theme\": \"string\",\n"
+        "    \"key_ideas\": [\"string\", \"string\"]\n"
+        "  },\n"
+        "  \"segments\": [\n"
+        "    {\n"
+        "      \"video_id\": \"string\",\n"
+        "      \"start\": number,\n"
+        "      \"end\": number,\n"
+        "      \"duration\": number,\n"
+        "      \"transcript\": \"string\",\n"
+        "      \"score\": number,\n"
+        "      \"category\": \"inspiration\" | \"education\" | \"humor\" | \"story\" | \"insight\" | "
+        "\"call-to-action\" | \"controversy\" | \"behind-the-scenes\" | \"social-proof\" | \"empathy\" | "
+        "\"mindset\" | \"leadership\" | \"business\" | \"science-tech\" | \"lifestyle\" | \"spirituality\" | "
+        "\"community\" | \"quote\",\n"
+        "      \"reason\": \"short justification\",\n"
+        "      \"source_lines\": [\n"
+        "        \"[MM:SS | start=###.##s | dur=##.##s] ...\",\n"
+        "        \"[MM:SS | start=###.##s | dur=##.##s] ...\"\n"
+        "      ]\n"
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "If nothing qualifies:\n"
+        "{ \"analysis\": {\"main_theme\": \"\", \"key_ideas\": []}, \"segments\": [] }\n"
+    )
 
-HARD REQUIREMENTS
-- Each chosen clip MUST be 10–90 seconds long.
-- Each clip MUST be a complete, standalone thought (no cut-off setup, mid-sentence starts, or missing payoff).
-- Use transcript offsets EXACTLY as provided.
-- Do NOT paraphrase, rewrite, infer missing context, or fabricate.
-- No duplicates or near-duplicates; maximize variety across picks.
+    def _mmss(seconds: float) -> str:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes:02d}:{secs:02d}"
 
-HOW TO WORK (IMPORTANT)
-A) FIRST PASS: Produce a short transcript understanding:
-   - main_theme: 1 sentence
-   - key_ideas: 3–8 bullets
-B) SECOND PASS: Choose clips that strongly support the main_theme/key_ideas and have high engagement potential.
-C) THIRD PASS: Categorize each clip using ONLY the master categories, and briefly justify why it will perform.
+    video_id = ""
+    lines = []
+    for seg in transcript_segments:
+        start = float(seg["start"])
+        dur = float(seg["duration"])
+        text = str(seg["text"]).replace("\n", " ").strip()
+        video_id = seg.get("video_id", video_id) or video_id
+        lines.append(f"[{_mmss(start)} | start={start:.2f}s | dur={dur:.2f}s] {text}")
 
-MASTER CATEGORY LIST (choose 1 primary, optional 0–2 secondary)
-- inspiration: uplifting, motivating, empowering, hopeful, emotional resonance
-- education: teaches a concept, explains how/why, tutorial-like, definitions, frameworks
-- humor: funny moments, punchlines, witty observations (must still make sense standalone)
-- story: narrative/testimony/anecdote with a clear arc or point
-- insight: counterintuitive idea, strong opinion, reframing, “aha” moment
-- call-to-action: direct challenge, next steps, invitation to act/try/reflect
-- controversy: debate-worthy take, strong stance, surprising claim (not misinformation)
-- behind-the-scenes: process, real-time problem solving, making-of, candid moments
-- social-proof: results, wins, evidence, credibility, before/after, metrics
-- empathy: vulnerability, struggle, validation, mental-health/relationship honesty
-- mindset: habits, discipline, productivity, resilience, identity, self-talk
-- leadership: management, teamwork, values, culture, decision-making
-- business: strategy, marketing, sales, money, career, negotiation
-- science-tech: data, experiments, tech concepts, engineering, AI, research
-- lifestyle: wellness, fitness, food, travel, daily life, routines
-- spirituality: faith, purpose, meaning, prayer/meditation, morals
-- community: audience interaction, chants, call-and-response, group moments
-- quote: a highly quotable one-liner/mantra (use when the clip is primarily a quote)
+    transcript_block = "\n".join(lines)
 
-SELECTION GOAL (pick what will perform)
-Select moments that drive engagement because they are:
-- Hooky in the first 2–3 seconds
-- Clear without extra context
-- Emotionally resonant OR immediately useful OR very shareable
-- Unique vs other picks (variety across categories and key ideas)
-
-SCORING (0–100)
-Score each segment based on:
-- Hook strength in first 2–3 seconds (0–30)
-- Standalone clarity / completeness (0–25)
-- Impact (emotion/usefulness/novelty) (0–25)
-- Shareability / quoteability (0–10)
-- Variety contribution vs other picks (0–10)
-
-SEGMENT CONSTRUCTION RULES
-- You MAY select a single provided segment if it already fits 10–90 seconds.
-- OR you MAY combine ADJACENT segments ONLY if the combined result stays 10–90 seconds and remains one coherent thought.
-- Never combine non-adjacent segments.
-- When combining, use the earliest start offset and total combined duration.
-
-CONTENT BOUNDARIES
-- Avoid filler, long pauses, housekeeping/logistics unless unusually compelling.
-- Avoid misleading or medically/legal/financially dangerous advice; do not select clips that promote harm.
-
-OUTPUT FORMAT (STRICT JSON ONLY)
-{
-  "analysis": {
-    "main_theme": "string",
-    "key_ideas": ["string", "string"],
-    "dominant_categories": ["string", "string", "string"]
-  },
-  "segments": [
-    {
-      "start": number,
-      "duration": number,
-      "score": number,
-      "primary_category": "inspiration" | "education" | "humor" | "story" | "insight" | "call-to-action" | "controversy" | "behind-the-scenes" | "social-proof" | "empathy" | "mindset" | "leadership" | "business" | "science-tech" | "lifestyle" | "spirituality" | "community" | "quote",
-      "secondary_categories": ["inspiration" | "education" | "humor" | "story" | "insight" | "call-to-action" | "controversy" | "behind-the-scenes" | "social-proof" | "empathy" | "mindset" | "leadership" | "business" | "science-tech" | "lifestyle" | "spirituality" | "community" | "quote"],
-      "hook": "the first 5–12 words of the segment",
-      "reason": "1 short sentence why this will perform",
-      "key_idea": "which key idea this clip supports (must match one of analysis.key_ideas)"
-    }
-  ]
-}
-
-If nothing qualifies:
-{
-  "analysis": {"main_theme": "", "key_ideas": [], "dominant_categories": []},
-  "segments": []
-}
-"""
-    transcript_payload = [
-        {"offset": seg["start"], "duration": seg["duration"], "text": seg["text"]}
-        for seg in transcript_segments
-    ]
-    return f"{base_prompt}\n\nTranscript Segments:\n{json.dumps(transcript_payload, ensure_ascii=False)}"
+    return (
+        f"{base_prompt}\n\n"
+        f"VIDEO_ID: {video_id or 'unknown'}\n"
+        "TRANSCRIPT_TIMELINE (chronological, do not reorder):\n"
+        f"{transcript_block}"
+    )
 
 
 def call_openai_for_clips(transcript_segments: List[dict], prompt_override: Optional[str]) -> dict:
@@ -487,14 +494,14 @@ def write_clips_to_sheet(
     for segment in segments:
         start = segment.get("start", 0.0)
         duration = segment.get("duration", 0.0)
-        text = transcript_lookup.get(start, "")
+        text = segment.get("transcript") or transcript_lookup.get(start, "")
         values.append([
             video_id,
             start,
             duration,
             text,
             segment.get("score"),
-            segment.get("primary_category") or segment.get("category"),
+            segment.get("category") or segment.get("primary_category"),
             segment.get("reason"),
         ])
     if not values:
@@ -547,7 +554,8 @@ def run_discovery(job_id: str, video_id: str):
             clips_payload = {"segments": [], "error": "OPENAI_API_KEY not configured"}
         else:
             try:
-                clips_payload = call_openai_for_clips(transcript, JOBS[job_id].get("prompt"))
+                transcript_with_id = [dict(seg, video_id=video_id) for seg in transcript]
+                clips_payload = call_openai_for_clips(transcript_with_id, JOBS[job_id].get("prompt"))
             except Exception as exc:
                 logger.exception("[%s] clip discovery failed, continuing with empty results", job_id)
                 clips_payload = {"segments": [], "error": str(exc)}
