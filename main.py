@@ -45,13 +45,24 @@ RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/api/transcript"
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID") or os.getenv("Drive_Folder_ID")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+GOOGLE_CLIENT_EMAIL = os.getenv("GOOGLE_CLIENT_EMAIL")
+GOOGLE_PRIVATE_KEY = os.getenv("GOOGLE_PRIVATE_KEY")
+GOOGLE_PRIVATE_KEY_ID = os.getenv("GOOGLE_PRIVATE_KEY_ID")
+GOOGLE_PROJECT_ID = os.getenv("GOOGLE_PROJECT_ID")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API")
 
 if not RAPIDAPI_KEY:
     logger.warning("RAPIDAPI_KEY not set (discover will fail until configured).")
 if not DRIVE_FOLDER_ID:
     logger.warning("Drive folder id not set (DRIVE_FOLDER_ID).")
-if not GOOGLE_CREDENTIALS and not GOOGLE_SERVICE_ACCOUNT_FILE:
-    logger.warning("Google credentials not set (GOOGLE_CREDENTIALS or GOOGLE_SERVICE_ACCOUNT_FILE).")
+if not GOOGLE_CREDENTIALS and not GOOGLE_SERVICE_ACCOUNT_FILE and not (GOOGLE_CLIENT_EMAIL and GOOGLE_PRIVATE_KEY):
+    logger.warning(
+        "Google credentials not set (GOOGLE_CREDENTIALS, GOOGLE_SERVICE_ACCOUNT_FILE, "
+        "or GOOGLE_CLIENT_EMAIL + GOOGLE_PRIVATE_KEY)."
+    )
+if GOOGLE_API_KEY:
+    logger.info("GOOGLE_API provided but not used for Docs/Drive write access.")
 
 # -------------------------
 # MODELS
@@ -249,8 +260,26 @@ def get_google_services():
             GOOGLE_SERVICE_ACCOUNT_FILE,
             scopes=scopes,
         )
+    elif GOOGLE_CLIENT_EMAIL and GOOGLE_PRIVATE_KEY:
+        private_key = GOOGLE_PRIVATE_KEY.replace("\\n", "\n")
+        info = {
+            "type": "service_account",
+            "client_email": GOOGLE_CLIENT_EMAIL,
+            "private_key": private_key,
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+        if GOOGLE_PRIVATE_KEY_ID:
+            info["private_key_id"] = GOOGLE_PRIVATE_KEY_ID
+        if GOOGLE_PROJECT_ID:
+            info["project_id"] = GOOGLE_PROJECT_ID
+        if GOOGLE_CLIENT_ID:
+            info["client_id"] = GOOGLE_CLIENT_ID
+        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
     else:
-        raise RuntimeError("Google credentials not configured (GOOGLE_CREDENTIALS or GOOGLE_SERVICE_ACCOUNT_FILE)")
+        raise RuntimeError(
+            "Google credentials not configured (GOOGLE_CREDENTIALS, "
+            "GOOGLE_SERVICE_ACCOUNT_FILE, or GOOGLE_CLIENT_EMAIL + GOOGLE_PRIVATE_KEY)"
+        )
 
     drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
     docs_service = build("docs", "v1", credentials=creds, cache_discovery=False)
