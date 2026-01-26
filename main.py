@@ -250,7 +250,9 @@ def build_transcript_text(segments: List[dict]) -> str:
     lines = []
     for segment in segments:
         timestamp = format_timestamp(segment["start"])
-        lines.append(f"[{timestamp}] {segment['text']}")
+        start = float(segment["start"])
+        duration = float(segment.get("duration", 0.0))
+        lines.append(f"[{timestamp} | start={start:.2f}s | dur={duration:.2f}s] {segment['text']}")
     return "\n".join(lines)
 
 
@@ -330,51 +332,98 @@ def create_transcript_doc(video_id: str, segments: List[dict]) -> Dict[str, str]
 
 
 def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optional[str]) -> str:
-    base_prompt = prompt_override or (
-        "TASK\nReturn up to 20 clip-worthy segments.\n\n"
-        "Length:\n- 10–90 seconds\n\n"
-        "Selection priority:\n"
-        "- Choose the most impactful clips based on the full transcript.\n"
-        "- Each clip must be a complete thought or idea (no cut-off statements).\n\n"
-        "Eligible content types (must meet one or all):\n"
-        "- Teaching moments, or biblical explanation\n"
-        "- Testimony or lived experience\n"
-        "- Impactful or declarative statements/mantras\n"
-        "- Calls to action (faith responses, encouragement, challenges)\n"
-        "- Chants, repetitions, or congregational moments\n"
-        "- Humorous moments that reinforce the message\n"
-        "- Educational or ministry-focused commentary\n"
-        "- Any Tell Your Neighbor moments\n\n"
-        "Tone & intent (must meet one or all):\n"
-        "- Faith-centered, authentic, and purposeful\n"
-        "- Humor is allowed when it supports or amplifies the message\n"
-        "- Emotional or high-energy moments are encouraged if meaningful\n\n"
-        "Content boundaries:\n"
-        "- Avoid empty filler, long pauses, or setup with no payoff\n"
-        "- Intros and outros are allowed only if they are impactful or message-driven\n"
-        "- Do not clip logistical announcements unless spiritually relevant\n\n"
-        "Accuracy & structure:\n"
-        "- Use transcript offsets exactly as provided\n"
-        "- Do not paraphrase, infer, or reconstruct missing context\n\n"
-        "Quality gate:\n"
-        "- If no segment is clearly meaningful, spiritually relevant, or impactful, "
-        "return clips referencing biblical or Christian concepts or motivational moments.\n\n"
-        "OUTPUT FORMAT (STRICT JSON ONLY)\n\n"
-        "{\n"
-        "  \"segments\": [\n"
-        "    {\n"
-        "      \"start\": number,\n"
-        "      \"duration\": number,\n"
-        "      \"score\": number (0–100),\n"
-        "      \"category\": \"teaching\" | \"testimony\" | \"motivation\" | "
-        "\"call-to-action\" | \"chant-song\" | \"humor\" | \"worship\" | \"education\",\n"
-        "      \"reason\": \"short justification\"\n"
-        "    }\n"
-        "  ]\n"
-        "}\n\n"
-        "If nothing qualifies:\n"
-        "{\"segments\": []}\n"
-    )
+    base_prompt = prompt_override or """TASK
+You are a highlight editor for ANY type of content (not just faith). Review the ENTIRE transcript and:
+1) Identify the main theme and 3–8 key ideas.
+2) Select up to 20 clip-worthy segments (10–90s) that best represent those ideas and will perform on social.
+3) Categorize each selected clip using the MASTER CATEGORY LIST below.
+
+HARD REQUIREMENTS
+- Each chosen clip MUST be 10–90 seconds long.
+- Each clip MUST be a complete, standalone thought (no cut-off setup, mid-sentence starts, or missing payoff).
+- Use transcript offsets EXACTLY as provided.
+- Do NOT paraphrase, rewrite, infer missing context, or fabricate.
+- No duplicates or near-duplicates; maximize variety across picks.
+
+HOW TO WORK (IMPORTANT)
+A) FIRST PASS: Produce a short transcript understanding:
+   - main_theme: 1 sentence
+   - key_ideas: 3–8 bullets
+B) SECOND PASS: Choose clips that strongly support the main_theme/key_ideas and have high engagement potential.
+C) THIRD PASS: Categorize each clip using ONLY the master categories, and briefly justify why it will perform.
+
+MASTER CATEGORY LIST (choose 1 primary, optional 0–2 secondary)
+- inspiration: uplifting, motivating, empowering, hopeful, emotional resonance
+- education: teaches a concept, explains how/why, tutorial-like, definitions, frameworks
+- humor: funny moments, punchlines, witty observations (must still make sense standalone)
+- story: narrative/testimony/anecdote with a clear arc or point
+- insight: counterintuitive idea, strong opinion, reframing, “aha” moment
+- call-to-action: direct challenge, next steps, invitation to act/try/reflect
+- controversy: debate-worthy take, strong stance, surprising claim (not misinformation)
+- behind-the-scenes: process, real-time problem solving, making-of, candid moments
+- social-proof: results, wins, evidence, credibility, before/after, metrics
+- empathy: vulnerability, struggle, validation, mental-health/relationship honesty
+- mindset: habits, discipline, productivity, resilience, identity, self-talk
+- leadership: management, teamwork, values, culture, decision-making
+- business: strategy, marketing, sales, money, career, negotiation
+- science-tech: data, experiments, tech concepts, engineering, AI, research
+- lifestyle: wellness, fitness, food, travel, daily life, routines
+- spirituality: faith, purpose, meaning, prayer/meditation, morals
+- community: audience interaction, chants, call-and-response, group moments
+- quote: a highly quotable one-liner/mantra (use when the clip is primarily a quote)
+
+SELECTION GOAL (pick what will perform)
+Select moments that drive engagement because they are:
+- Hooky in the first 2–3 seconds
+- Clear without extra context
+- Emotionally resonant OR immediately useful OR very shareable
+- Unique vs other picks (variety across categories and key ideas)
+
+SCORING (0–100)
+Score each segment based on:
+- Hook strength in first 2–3 seconds (0–30)
+- Standalone clarity / completeness (0–25)
+- Impact (emotion/usefulness/novelty) (0–25)
+- Shareability / quoteability (0–10)
+- Variety contribution vs other picks (0–10)
+
+SEGMENT CONSTRUCTION RULES
+- You MAY select a single provided segment if it already fits 10–90 seconds.
+- OR you MAY combine ADJACENT segments ONLY if the combined result stays 10–90 seconds and remains one coherent thought.
+- Never combine non-adjacent segments.
+- When combining, use the earliest start offset and total combined duration.
+
+CONTENT BOUNDARIES
+- Avoid filler, long pauses, housekeeping/logistics unless unusually compelling.
+- Avoid misleading or medically/legal/financially dangerous advice; do not select clips that promote harm.
+
+OUTPUT FORMAT (STRICT JSON ONLY)
+{
+  "analysis": {
+    "main_theme": "string",
+    "key_ideas": ["string", "string"],
+    "dominant_categories": ["string", "string", "string"]
+  },
+  "segments": [
+    {
+      "start": number,
+      "duration": number,
+      "score": number,
+      "primary_category": "inspiration" | "education" | "humor" | "story" | "insight" | "call-to-action" | "controversy" | "behind-the-scenes" | "social-proof" | "empathy" | "mindset" | "leadership" | "business" | "science-tech" | "lifestyle" | "spirituality" | "community" | "quote",
+      "secondary_categories": ["inspiration" | "education" | "humor" | "story" | "insight" | "call-to-action" | "controversy" | "behind-the-scenes" | "social-proof" | "empathy" | "mindset" | "leadership" | "business" | "science-tech" | "lifestyle" | "spirituality" | "community" | "quote"],
+      "hook": "the first 5–12 words of the segment",
+      "reason": "1 short sentence why this will perform",
+      "key_idea": "which key idea this clip supports (must match one of analysis.key_ideas)"
+    }
+  ]
+}
+
+If nothing qualifies:
+{
+  "analysis": {"main_theme": "", "key_ideas": [], "dominant_categories": []},
+  "segments": []
+}
+"""
     transcript_payload = [
         {"offset": seg["start"], "duration": seg["duration"], "text": seg["text"]}
         for seg in transcript_segments
@@ -445,7 +494,7 @@ def write_clips_to_sheet(
             duration,
             text,
             segment.get("score"),
-            segment.get("category"),
+            segment.get("primary_category") or segment.get("category"),
             segment.get("reason"),
         ])
     if not values:
