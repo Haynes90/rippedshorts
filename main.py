@@ -497,6 +497,20 @@ def create_apivideo_clip(
     }
 
 
+def create_apivideo_clip_safe(
+    source_url: str,
+    clip_name: str,
+    start: float,
+    duration: float,
+    video_id: str,
+) -> Optional[dict]:
+    try:
+        return create_apivideo_clip(source_url, clip_name, start, duration)
+    except Exception as exc:
+        logger.exception("[%s] api.video clip failed for %s: %s", video_id, clip_name, exc)
+        return None
+
+
 def attach_clip_assets(
     clips_payload: dict,
     video_id: str,
@@ -515,15 +529,14 @@ def attach_clip_assets(
             if duration <= 0:
                 continue
             clip_name = f"{video_id}_{idx:02d}"
-                       try:
-                clip_info = create_apivideo_clip(
-                    youtube_url,
-                    clip_name,
-                    start,
-                    duration,
-                )
-            except Exception as exc:
-                logger.exception("[%s] api.video clip failed for %s: %s", video_id, clip_name, exc)
+            clip_info = create_apivideo_clip_safe(
+                youtube_url,
+                clip_name,
+                start,
+                duration,
+                video_id,
+            )
+            if not clip_info:
                 continue
             segment["clip_name"] = clip_name
             segment["clip_url"] = clip_info.get("clip_url")
