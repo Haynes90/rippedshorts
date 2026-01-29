@@ -453,6 +453,16 @@ def upload_clip_to_drive(clip_path: Path, clip_name: str) -> dict:
     }
 
 
+def download_video_asset(asset_url: str, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with requests.get(asset_url, stream=True, timeout=(10, 120)) as resp:
+        resp.raise_for_status()
+        with output_path.open("wb") as handle:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    handle.write(chunk)
+
+
 def _seconds_to_timecode(seconds: float) -> str:
     total_seconds = int(max(0, math.floor(seconds)))
     hours = total_seconds // 3600
@@ -494,6 +504,9 @@ def create_apivideo_clip(
     return {
         "clip_id": data.get("videoId") if isinstance(data, dict) else None,
         "clip_url": assets.get("player") or assets.get("hls") or assets.get("mp4"),
+        "player_url": assets.get("player"),
+        "hls_url": assets.get("hls"),
+        "mp4_url": assets.get("mp4"),
     }
 
 
@@ -540,6 +553,17 @@ def attach_clip_assets(
                 continue
             segment["clip_name"] = clip_name
             segment["clip_url"] = clip_info.get("clip_url")
+            mp4_url = clip_info.get("mp4_url")
+            if DRIVE_FOLDER_ID and mp4_url:
+                try:
+                    workdir = Path("/tmp") / f"apivideo_{video_id}"
+                    output_path = workdir / f"{clip_name}.mp4"
+                    download_video_asset(mp4_url, output_path)
+                    drive_info = upload_clip_to_drive(output_path, output_path.name)
+                    segment["drive_clip_id"] = drive_info.get("clip_id")
+                    segment["drive_clip_url"] = drive_info.get("clip_url")
+                except Exception as exc:
+                    logger.exception("[%s] drive upload failed for %s: %s", video_id, clip_name, exc)
         return clips_payload
 
     workdir = Path("/tmp") / f"clips_{video_id}"
@@ -566,7 +590,8 @@ def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optiona
         "TASK\n"
         "You are a highlight editor for ANY type of content. Review the ENTIRE transcript in chronological order "
         "and select the best short-form clips.\n"
-        "Return a MAX of 20 clips, each 10–90 seconds, prioritized by engagement and standalone clarity.\n\n"
+        "Return a MAX of 20 clips, each 10–90 seconds, prioritized by engagement and standalone clarity.\n"
+        "You MUST scan the full transcript before selecting any clips.\n\n"
         "TRANSCRIPT FORMAT (YOU MUST FOLLOW THIS)\n"
         "- Each transcript line is already time-aligned and looks like:\n"
         "  [MM:SS | start=###.##s | dur=##.##s] text...\n"
@@ -583,7 +608,10 @@ def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optiona
         "- Each chosen clip MUST be 10–90 seconds.\n"
         "- Each clip MUST be a complete, standalone thought (no cut-off setup, mid-sentence starts, "
         "or missing payoff).\n"
+        "- Every clip MUST represent a complete sentence or complete thought.\n"
+        "- Each clip MUST deliver at least one of: an impactful lesson, a strong insight, or a quotable line.\n"
         "- Do NOT paraphrase, rewrite, infer missing context, or fabricate.\n"
+        "- Do NOT return duplicate or near-duplicate clips; each clip must be materially distinct.\n"
         "- Avoid duplicates/near-duplicates; maximize variety.\n\n"
         "PROCESS\n"
         "1) First pass: determine main_theme + 3–8 key ideas.\n"
