@@ -510,6 +510,28 @@ def create_apivideo_clip(
     }
 
 
+def fetch_apivideo_assets(video_id: str, wait_seconds: int = 90, poll_interval: float = 5.0) -> dict:
+    if not API_VIDEO_KEY:
+        raise RuntimeError("API_VIDEO_KEY not configured")
+    deadline = time.time() + wait_seconds
+    last_assets: dict = {}
+    while time.time() < deadline:
+        resp = requests.get(
+            f"https://ws.api.video/videos/{video_id}",
+            headers={"Authorization": f"Bearer {API_VIDEO_KEY}"},
+            timeout=(10, 30),
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            assets = data.get("assets", {}) if isinstance(data, dict) else {}
+            if assets:
+                last_assets = assets
+                if assets.get("mp4"):
+                    return assets
+        time.sleep(poll_interval)
+    return last_assets
+
+
 def create_apivideo_clip_safe(
     source_url: str,
     clip_name: str,
@@ -554,6 +576,14 @@ def attach_clip_assets(
             segment["clip_name"] = clip_name
             segment["clip_url"] = clip_info.get("clip_url")
             mp4_url = clip_info.get("mp4_url")
+            if not mp4_url and clip_info.get("clip_id"):
+                try:
+                    assets = fetch_apivideo_assets(clip_info["clip_id"])
+                    mp4_url = assets.get("mp4")
+                    if not segment.get("clip_url"):
+                        segment["clip_url"] = assets.get("player") or assets.get("hls") or assets.get("mp4")
+                except Exception as exc:
+                    logger.exception("[%s] api.video asset fetch failed for %s: %s", video_id, clip_name, exc)
             if DRIVE_FOLDER_ID and mp4_url:
                 try:
                     workdir = Path("/tmp") / f"apivideo_{video_id}"
