@@ -640,7 +640,7 @@ def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optiona
         "TASK\n"
         "You are a highlight editor for ANY type of content. Review the ENTIRE transcript in chronological order "
         "and select the best short-form clips.\n"
-        "Return a MAX of 20 clips, each 10–90 seconds, prioritized by engagement and standalone clarity.\n"
+        "Return a MAX of 20 segements of text that would be great clips for social media, each 10–90 seconds, prioritized by content of the sentence, engagement and standalone clarity.\n"
         "You MUST scan the full transcript before selecting any clips.\n\n"
         "TRANSCRIPT FORMAT (YOU MUST FOLLOW THIS)\n"
         "- Each transcript line is already time-aligned and looks like:\n"
