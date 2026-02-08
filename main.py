@@ -48,6 +48,8 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
 RAPIDAPI_HOST = "youtube-transcript3.p.rapidapi.com"
 RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/api/transcript"
+YOUTUBE_DL_HOST = os.environ.get("YOUTUBE_DL_HOST", "youtube-scrapper.p.rapidapi.com")
+YOUTUBE_DL_URL = f"https://{YOUTUBE_DL_HOST}/youtube-video-downloader"
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID") or os.getenv("Drive_Folder_ID")
 DEFAULT_SHEET_ID = os.getenv("DEFAULT_SHEET_ID", "1xfp-sjO9Mnvwe7-bM6htT-0RKiOig21HfP_otzO9xws")
 DEFAULT_SHEET_TAB = os.getenv("DEFAULT_SHEET_TAB", "Sheet1")
@@ -65,6 +67,8 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 if not RAPIDAPI_KEY:
     logger.warning("RAPIDAPI_KEY not set (discover will fail until configured).")
+if not YOUTUBE_DL_HOST:
+    logger.warning("YOUTUBE_DL_HOST not set (youtube downloader will fail until configured).")
 if not DRIVE_FOLDER_ID:
     logger.warning("Drive folder id not set (DRIVE_FOLDER_ID).")
 if not GOOGLE_CREDENTIALS and not GOOGLE_SERVICE_ACCOUNT_FILE and not (GOOGLE_CLIENT_EMAIL and GOOGLE_PRIVATE_KEY):
@@ -343,20 +347,36 @@ def create_transcript_doc(video_id: str, segments: List[dict]) -> Dict[str, str]
 def download_youtube_video(video_id: str, youtube_url: Optional[str], workdir: Path) -> Path:
     workdir.mkdir(parents=True, exist_ok=True)
     url = youtube_url or f"https://www.youtube.com/watch?v={video_id}"
-    output_template = str(workdir / f"{video_id}.%(ext)s")
-    command = [
-        "yt-dlp",
-        "-f",
-        "mp4",
-        "-o",
-        output_template,
-        url,
-    ]
-    subprocess.run(command, check=True, capture_output=True)
-    for candidate in workdir.glob(f"{video_id}.*"):
-        if candidate.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}:
-            return candidate
-    raise RuntimeError("Unable to find downloaded video file")
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": YOUTUBE_DL_HOST,
+    }
+    resp = requests.get(
+        YOUTUBE_DL_URL,
+        headers=headers,
+        params={"url": url},
+        timeout=(10, 60),
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Youtube download API error ({resp.status_code}): {resp.text}")
+    payload = resp.json()
+    download_url = (
+        payload.get("url")
+        or payload.get("download")
+        or payload.get("downloadUrl")
+        or payload.get("videoUrl")
+    )
+    if not download_url and isinstance(payload.get("downloads"), list):
+        for item in payload["downloads"]:
+            if isinstance(item, dict):
+                download_url = item.get("url") or item.get("download") or item.get("downloadUrl")
+                if download_url:
+                    break
+    if not download_url:
+        raise RuntimeError(f"Unable to extract download URL from API response: {payload}")
+    output_path = workdir / f"{video_id}.mp4"
+    download_video_asset(download_url, output_path)
+    return output_path
 
 
 def _probe_video_dimensions(video_path: Path) -> tuple[int, int]:
