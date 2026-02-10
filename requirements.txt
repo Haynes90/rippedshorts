@@ -8,3 +8,4 @@ mediapipe
 google-api-python-client
 google-auth
 api.video
+ 
