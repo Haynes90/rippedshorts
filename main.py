@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import subprocess
+import shutil
 from urllib.parse import urlparse, parse_qs
 
 import requests
@@ -379,6 +380,20 @@ def download_youtube_video(video_id: str, youtube_url: Optional[str], workdir: P
     return output_path
 
 
+def cleanup_old_temp_downloads(max_age_hours: int = 24) -> None:
+    cutoff = time.time() - (max_age_hours * 3600)
+    tmp_root = Path("/tmp")
+    for path in tmp_root.glob("clips_*"):
+        try:
+            if not path.is_dir():
+                continue
+            if path.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception as exc:
+            logger.warning("Failed to cleanup temp dir %s: %s", path, exc)
+
+
 def _probe_video_dimensions(video_path: Path) -> tuple[int, int]:
     import cv2
 
@@ -501,6 +516,7 @@ def attach_clip_assets(
     video_id: str,
     youtube_url: Optional[str],
 ) -> dict:
+    cleanup_old_temp_downloads(max_age_hours=24)
     segments = clips_payload.get("segments", [])
     if not segments:
         return clips_payload
