@@ -17,8 +17,6 @@ from pydantic import BaseModel, Field
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-import cv2
-import mediapipe as mp
 
 # -------------------------
 # LOGGING (visible in Railway logs)
@@ -53,7 +51,6 @@ YOUTUBE_DL_URL = f"https://{YOUTUBE_DL_HOST}/youtube-video-downloader"
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID") or os.getenv("Drive_Folder_ID")
 DEFAULT_SHEET_ID = os.getenv("DEFAULT_SHEET_ID", "1xfp-sjO9Mnvwe7-bM6htT-0RKiOig21HfP_otzO9xws")
 DEFAULT_SHEET_TAB = os.getenv("DEFAULT_SHEET_TAB", "Sheet1")
-API_VIDEO_KEY = os.getenv("API_VIDEO_KEY")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
 GOOGLE_CLIENT_EMAIL = os.getenv("GOOGLE_CLIENT_EMAIL")
@@ -80,8 +77,6 @@ if GOOGLE_API_KEY:
     logger.info("GOOGLE_API provided but not used for Docs/Drive write access.")
 if not OPENAI_API_KEY:
     logger.warning("OPENAI_API_KEY not set (clip discovery will fail until configured).")
-if not API_VIDEO_KEY:
-    logger.warning("API_VIDEO_KEY not set (api.video clipping will be unavailable).")
 
 # -------------------------
 # MODELS
@@ -95,12 +90,17 @@ class DiscoverRequest(BaseModel):
     sheet_id: Optional[str] = None
     sheet_tab: Optional[str] = None
     prompt: Optional[str] = None
+    wait_for_result: bool = False
+    wait_timeout_s: int = Field(0, ge=0, le=600)
 
 
 class DiscoverResponse(BaseModel):
     status: str
     job_id: str
     video_id: str
+    step: Optional[str] = None
+    error: Optional[str] = None
+    elapsed_s: Optional[float] = None
 
 # -------------------------
 # HEALTH
@@ -380,6 +380,8 @@ def download_youtube_video(video_id: str, youtube_url: Optional[str], workdir: P
 
 
 def _probe_video_dimensions(video_path: Path) -> tuple[int, int]:
+    import cv2
+
     cap = cv2.VideoCapture(str(video_path))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -390,6 +392,9 @@ def _probe_video_dimensions(video_path: Path) -> tuple[int, int]:
 
 
 def _estimate_speaker_center_x(video_path: Path, start: float, duration: float) -> float:
+    import cv2
+    import mediapipe as mp
+
     mp_face = mp.solutions.face_detection
     detector = mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.5)
     cap = cv2.VideoCapture(str(video_path))
@@ -491,81 +496,6 @@ def _seconds_to_timecode(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def create_apivideo_clip(
-    source_url: str,
-    clip_name: str,
-    start: float,
-    duration: float,
-) -> dict:
-    if not API_VIDEO_KEY:
-        raise RuntimeError("API_VIDEO_KEY not configured")
-    end = start + duration
-    payload = {
-        "title": clip_name,
-        "source": source_url,
-        "clip": {
-            "startTimecode": _seconds_to_timecode(start),
-            "endTimecode": _seconds_to_timecode(end),
-        },
-    }
-    resp = requests.post(
-        "https://ws.api.video/videos",
-        headers={
-            "Authorization": f"Bearer {API_VIDEO_KEY}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=(10, 60),
-    )
-    if resp.status_code not in (200, 201, 202):
-        raise RuntimeError(f"api.video create failed ({resp.status_code}): {resp.text}")
-    data = resp.json()
-    assets = data.get("assets", {}) if isinstance(data, dict) else {}
-    return {
-        "clip_id": data.get("videoId") if isinstance(data, dict) else None,
-        "clip_url": assets.get("player") or assets.get("hls") or assets.get("mp4"),
-        "player_url": assets.get("player"),
-        "hls_url": assets.get("hls"),
-        "mp4_url": assets.get("mp4"),
-    }
-
-
-def fetch_apivideo_assets(video_id: str, wait_seconds: int = 90, poll_interval: float = 5.0) -> dict:
-    if not API_VIDEO_KEY:
-        raise RuntimeError("API_VIDEO_KEY not configured")
-    deadline = time.time() + wait_seconds
-    last_assets: dict = {}
-    while time.time() < deadline:
-        resp = requests.get(
-            f"https://ws.api.video/videos/{video_id}",
-            headers={"Authorization": f"Bearer {API_VIDEO_KEY}"},
-            timeout=(10, 30),
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            assets = data.get("assets", {}) if isinstance(data, dict) else {}
-            if assets:
-                last_assets = assets
-                if assets.get("mp4"):
-                    return assets
-        time.sleep(poll_interval)
-    return last_assets
-
-
-def create_apivideo_clip_safe(
-    source_url: str,
-    clip_name: str,
-    start: float,
-    duration: float,
-    video_id: str,
-) -> Optional[dict]:
-    try:
-        return create_apivideo_clip(source_url, clip_name, start, duration)
-    except Exception as exc:
-        logger.exception("[%s] api.video clip failed for %s: %s", video_id, clip_name, exc)
-        return None
-
-
 def attach_clip_assets(
     clips_payload: dict,
     video_id: str,
@@ -573,47 +503,6 @@ def attach_clip_assets(
 ) -> dict:
     segments = clips_payload.get("segments", [])
     if not segments:
-        return clips_payload
-    if API_VIDEO_KEY and youtube_url:
-        for idx, segment in enumerate(segments, start=1):
-            start = float(segment.get("start", 0.0))
-            duration = float(segment.get("duration", 0.0))
-            end = segment.get("end")
-            if duration <= 0 and end is not None:
-                duration = max(0.0, float(end) - start)
-            if duration <= 0:
-                continue
-            clip_name = f"{video_id}_{idx:02d}"
-            clip_info = create_apivideo_clip_safe(
-                youtube_url,
-                clip_name,
-                start,
-                duration,
-                video_id,
-            )
-            if not clip_info:
-                continue
-            segment["clip_name"] = clip_name
-            segment["clip_url"] = clip_info.get("clip_url")
-            mp4_url = clip_info.get("mp4_url")
-            if not mp4_url and clip_info.get("clip_id"):
-                try:
-                    assets = fetch_apivideo_assets(clip_info["clip_id"])
-                    mp4_url = assets.get("mp4")
-                    if not segment.get("clip_url"):
-                        segment["clip_url"] = assets.get("player") or assets.get("hls") or assets.get("mp4")
-                except Exception as exc:
-                    logger.exception("[%s] api.video asset fetch failed for %s: %s", video_id, clip_name, exc)
-            if DRIVE_FOLDER_ID and mp4_url:
-                try:
-                    workdir = Path("/tmp") / f"apivideo_{video_id}"
-                    output_path = workdir / f"{clip_name}.mp4"
-                    download_video_asset(mp4_url, output_path)
-                    drive_info = upload_clip_to_drive(output_path, output_path.name)
-                    segment["drive_clip_id"] = drive_info.get("clip_id")
-                    segment["drive_clip_url"] = drive_info.get("clip_url")
-                except Exception as exc:
-                    logger.exception("[%s] drive upload failed for %s: %s", video_id, clip_name, exc)
         return clips_payload
 
     workdir = Path("/tmp") / f"clips_{video_id}"
@@ -640,7 +529,7 @@ def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optiona
         "TASK\n"
         "You are a highlight editor for ANY type of content. Review the ENTIRE transcript in chronological order "
         "and select the best short-form clips.\n"
-        "Return a MAX of 20 segements of text that would be great clips for social media, each 10–90 seconds, prioritized by content of the sentence, engagement and standalone clarity.\n"
+        "Return a MAX of 20 clips, each 10–90 seconds, prioritized by engagement and standalone clarity.\n"
         "You MUST scan the full transcript before selecting any clips.\n\n"
         "TRANSCRIPT FORMAT (YOU MUST FOLLOW THIS)\n"
         "- Each transcript line is already time-aligned and looks like:\n"
@@ -942,8 +831,24 @@ def discover(req: DiscoverRequest):
     }
 
     executor.submit(run_discovery, job_id, resolved_video_id)
+    if req.wait_for_result:
+        timeout = req.wait_timeout_s if req.wait_timeout_s > 0 else 120
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            job = JOBS.get(job_id, {})
+            status = job.get("status")
+            if status in {"done", "error"}:
+                return {
+                    "status": status,
+                    "job_id": job_id,
+                    "video_id": resolved_video_id,
+                    "step": job.get("step"),
+                    "error": job.get("error"),
+                    "elapsed_s": job.get("elapsed_s"),
+                }
+            time.sleep(1)
 
-    return {"status": "accepted", "job_id": job_id, "video_id": resolved_video_id}
+    return {"status": "accepted", "job_id": job_id, "video_id": resolved_video_id, "step": "queued"}
 
 # -------------------------
 # JOB STATUS (debug endpoint)
