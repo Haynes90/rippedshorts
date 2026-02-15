@@ -47,8 +47,8 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
 RAPIDAPI_HOST = "youtube-transcript3.p.rapidapi.com"
 RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/api/transcript"
-YOUTUBE_DL_HOST = os.environ.get("YOUTUBE_DL_HOST", "youtube-scrapper.p.rapidapi.com")
-YOUTUBE_DL_URL = f"https://{YOUTUBE_DL_HOST}/youtube-video-downloader"
+YOUTUBE_DL_HOST = os.environ.get("YOUTUBE_DL_HOST", "youtube-video-fast-downloader-24-7.p.rapidapi.com")
+YOUTUBE_DL_PATH_TEMPLATE = os.environ.get("YOUTUBE_DL_PATH_TEMPLATE", "/download_video/{video_id}")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID") or os.getenv("Drive_Folder_ID")
 DEFAULT_SHEET_ID = os.getenv("DEFAULT_SHEET_ID", "1xfp-sjO9Mnvwe7-bM6htT-0RKiOig21HfP_otzO9xws")
 DEFAULT_SHEET_TAB = os.getenv("DEFAULT_SHEET_TAB", "Sheet1")
@@ -347,32 +347,62 @@ def create_transcript_doc(video_id: str, segments: List[dict]) -> Dict[str, str]
 
 def download_youtube_video(video_id: str, youtube_url: Optional[str], workdir: Path) -> Path:
     workdir.mkdir(parents=True, exist_ok=True)
-    url = youtube_url or f"https://www.youtube.com/watch?v={video_id}"
     headers = {
         "x-rapidapi-key": RAPIDAPI_KEY,
         "x-rapidapi-host": YOUTUBE_DL_HOST,
     }
-    resp = requests.get(
-        YOUTUBE_DL_URL,
-        headers=headers,
-        params={"url": url},
-        timeout=(10, 60),
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Youtube download API error ({resp.status_code}): {resp.text}")
-    payload = resp.json()
-    download_url = (
-        payload.get("url")
-        or payload.get("download")
-        or payload.get("downloadUrl")
-        or payload.get("videoUrl")
-    )
-    if not download_url and isinstance(payload.get("downloads"), list):
-        for item in payload["downloads"]:
-            if isinstance(item, dict):
-                download_url = item.get("url") or item.get("download") or item.get("downloadUrl")
-                if download_url:
-                    break
+    endpoint = f"https://{YOUTUBE_DL_HOST}{YOUTUBE_DL_PATH_TEMPLATE.format(video_id=video_id)}"
+
+    def _extract_download_url(payload: dict) -> Optional[str]:
+        download_url = (
+            payload.get("url")
+            or payload.get("download")
+            or payload.get("download_url")
+            or payload.get("downloadUrl")
+            or payload.get("videoUrl")
+            or payload.get("mainDownloadUrl")
+        )
+        if download_url:
+            return download_url
+        formats = payload.get("formats")
+        if isinstance(formats, list):
+            best: Optional[str] = None
+            for item in formats:
+                if not isinstance(item, dict):
+                    continue
+                candidate = item.get("downloadUrl") or item.get("download_url") or item.get("url")
+                if not candidate:
+                    continue
+                mime = str(item.get("mimeType", "")).lower()
+                has_video = bool(item.get("hasVideo"))
+                has_audio = bool(item.get("hasAudio"))
+                if has_video and "video/mp4" in mime and has_audio:
+                    return candidate
+                if has_video and "video/mp4" in mime and not best:
+                    best = candidate
+            if best:
+                return best
+        return None
+
+    def _request_download() -> tuple[dict, Optional[str]]:
+        resp = requests.get(
+            endpoint,
+            headers=headers,
+            params={"quality": "247"},
+            timeout=(10, 60),
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Youtube download API error ({resp.status_code}): {resp.text}")
+        payload = resp.json()
+        return payload, _extract_download_url(payload)
+
+    payload, download_url = _request_download()
+    if not download_url:
+        time.sleep(420)
+        payload, download_url = _request_download()
+    if not download_url:
+        time.sleep(120)
+        payload, download_url = _request_download()
     if not download_url:
         raise RuntimeError(f"Unable to extract download URL from API response: {payload}")
     output_path = workdir / f"{video_id}.mp4"
