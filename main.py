@@ -1,194 +1,23 @@
+import json
 import os
+import re
+import time
 import uuid
-import timediff --git a/main.py b/main.py
-index c9b54b2e6e16961bf40a386cb5597cf043a0a817..4ae9aca15d4ce812e243dc47d9c4f39b9a149853 100644
---- a/main.py
-+++ b/main.py
-@@ -1,13 +1,15 @@
- import os
-+import re
- import uuid
- import time
- import logging
- from typing import List, Optional, Dict, Any
-+from urllib.parse import urlparse, parse_qs
- from concurrent.futures import ThreadPoolExecutor
- 
- import requests
- from fastapi import FastAPI, HTTPException
--from pydantic import BaseModel, Field
-+from pydantic import BaseModel, Field, root_validator, validator
- 
- # -------------------------
- # LOGGING (visible in Railway logs)
-@@ -44,10 +46,52 @@ if not RAPIDAPI_KEY:
- # -------------------------
- # MODELS
- # -------------------------
-+YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
-+
-+
-+def extract_video_id(youtube_url: str) -> Optional[str]:
-+    parsed = urlparse(youtube_url)
-+    host = parsed.netloc.lower()
-+    if "youtube.com" in host:
-+        query = parse_qs(parsed.query)
-+        if "v" in query and query["v"]:
-+            return query["v"][0]
-+        if parsed.path.startswith("/shorts/"):
-+            return parsed.path.split("/shorts/")[-1].split("/")[0]
-+        if parsed.path.startswith("/embed/"):
-+            return parsed.path.split("/embed/")[-1].split("/")[0]
-+    if "youtu.be" in host:
-+        return parsed.path.lstrip("/").split("/")[0]
-+    return None
-+
-+
- class DiscoverRequest(BaseModel):
--    video_id: str = Field(..., min_length=6)
-+    video_id: Optional[str] = Field(None, min_length=6)
-     youtube_url: Optional[str] = None  # optional convenience
- 
-+    @root_validator(pre=True)
-+    def require_id_or_url(cls, values):
-+        video_id = values.get("video_id")
-+        youtube_url = values.get("youtube_url")
-+        if not video_id and not youtube_url:
-+            raise ValueError("Either video_id or youtube_url is required")
-+        return values
-+
-+    @validator("video_id")
-+    def validate_video_id(cls, value):
-+        if value and not YOUTUBE_ID_RE.match(value):
-+            raise ValueError("video_id must be a valid YouTube id")
-+        return value
-+
-+    @validator("youtube_url")
-+    def validate_youtube_url(cls, value):
-+        if value is None:
-+            return value
-+        parsed = urlparse(value)
-+        if not parsed.scheme or not parsed.netloc:
-+            raise ValueError("youtube_url must be a valid URL")
-+        return value
-+
- class DiscoverResponse(BaseModel):
-     status: str
-     job_id: str
-@@ -107,30 +151,58 @@ def get_transcript(video_id: str) -> List[dict]:
- # -------------------------
- # Chunking (3hr-safe)
- # -------------------------
--def chunk_transcript(segments: List[dict], chunk_seconds: int = 120) -> List[dict]:
-+SENTENCE_END_RE = re.compile(r"[.!?…]+$")  # simple heuristic for thought completion
-+
-+
-+def chunk_transcript(
-+    segments: List[dict],
-+    chunk_seconds: int = 120,
-+    min_chunk_seconds: int = 30,
-+) -> List[dict]:
-     """
--    Chunk by time window. 120s chunks is good for long videos.
-+    Chunk by time window while trying to end on a sentence boundary.
-     We do NOT return chunks to Zapier — internal use only.
-     """
-+    if not segments:
-+        return []
-     chunks = []
-     current = []
-     current_start = segments[0]["start"]
-     total = 0.0
-+    last_sentence_break_index = None
- 
-     for s in segments:
--        if total + s["duration"] > chunk_seconds and current:
--            chunks.append({
--                "start": float(current_start),
--                "end": float(current_start + total),
--                "segments": current
--            })
--            current = []
-+        if not current:
-             current_start = s["start"]
--            total = 0.0
--
-         current.append(s)
-         total += float(s["duration"])
- 
-+        if s["text"] and SENTENCE_END_RE.search(s["text"]):
-+            last_sentence_break_index = len(current) - 1
-+
-+        if total > chunk_seconds and current:
-+            if last_sentence_break_index is not None and total >= min_chunk_seconds:
-+                split_at = last_sentence_break_index + 1
-+                chunk_segments = current[:split_at]
-+                chunks.append({
-+                    "start": float(current_start),
-+                    "end": float(chunk_segments[-1]["start"] + chunk_segments[-1]["duration"]),
-+                    "segments": chunk_segments,
-+                })
-+                current = current[split_at:]
-+                current_start = current[0]["start"] if current else current_start
-+                total = sum(seg["duration"] for seg in current)
-+                last_sentence_break_index = None
-+            else:
-+                chunks.append({
-+                    "start": float(current_start),
-+                    "end": float(current_start + total),
-+                    "segments": current
-+                })
-+                current = []
-+                total = 0.0
-+                last_sentence_break_index = None
-+
-     if current:
-         chunks.append({
-             "start": float(current_start),
-@@ -194,20 +266,32 @@ def discover(req: DiscoverRequest):
-         # Return a clear error early rather than accepting jobs that cannot run.
-         raise HTTPException(status_code=500, detail="RAPIDAPI_KEY not configured")
- 
-+    resolved_video_id = req.video_id
-+    if req.youtube_url:
-+        extracted = extract_video_id(req.youtube_url)
-+        if not extracted:
-+            raise HTTPException(status_code=400, detail="Unable to parse youtube_url")
-+        if resolved_video_id and resolved_video_id != extracted:
-+            raise HTTPException(status_code=400, detail="video_id does not match youtube_url")
-+        resolved_video_id = extracted
-+
-+    if not resolved_video_id:
-+        raise HTTPException(status_code=400, detail="video_id could not be resolved")
-+
-     job_id = str(uuid.uuid4())
-     JOBS[job_id] = {
-         "job_id": job_id,
--        "video_id": req.video_id,
-+        "video_id": resolved_video_id,
-         "status": "queued",
-         "step": "queued",
-         "created_at": time.time(),
-     }
- 
-     # Offload to background thread
--    executor.submit(run_discovery, job_id, req.video_id)
-+    executor.submit(run_discovery, job_id, resolved_video_id)
- 
-     # IMPORTANT: return immediately, no transcript, no chunks
--    return {"status": "accepted", "job_id": job_id, "video_id": req.video_id}
-+    return {"status": "accepted", "job_id": job_id, "video_id": resolved_video_id}
- 
- # -------------------------
- # JOB STATUS (debug endpoint)
-
 import logging
-from typing import List, Optional, Dict, Any
+import math
+from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import subprocess
+import shutil
+from urllib.parse import urlparse, parse_qs
 
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
 # -------------------------
 # LOGGING (visible in Railway logs)
@@ -216,23 +45,63 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 # ENV
 # -------------------------
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
-RAPIDAPI_HOST = "youtube-transcripts-transcribe-youtube-video-to-text.p.rapidapi.com"
-RAPIDAPI_URL = "https://youtube-transcripts-transcribe-youtube-video-to-text.p.rapidapi.com/transcribe"
+RAPIDAPI_HOST = "youtube-transcript3.p.rapidapi.com"
+RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/api/transcript"
+YOUTUBE_DL_HOST = os.environ.get("YOUTUBE_DL_HOST", "youtube-video-fast-downloader-24-7.p.rapidapi.com")
+YOUTUBE_DL_PATH_TEMPLATE = os.environ.get("YOUTUBE_DL_PATH_TEMPLATE", "/download_video/{video_id}")
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID") or os.getenv("Drive_Folder_ID")
+DEFAULT_SHEET_ID = os.getenv("DEFAULT_SHEET_ID", "1xfp-sjO9Mnvwe7-bM6htT-0RKiOig21HfP_otzO9xws")
+DEFAULT_SHEET_TAB = os.getenv("DEFAULT_SHEET_TAB", "Sheet1")
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
+GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+GOOGLE_CLIENT_EMAIL = os.getenv("GOOGLE_CLIENT_EMAIL")
+GOOGLE_PRIVATE_KEY = os.getenv("GOOGLE_PRIVATE_KEY")
+GOOGLE_PRIVATE_KEY_ID = os.getenv("GOOGLE_PRIVATE_KEY_ID")
+GOOGLE_PROJECT_ID = os.getenv("GOOGLE_PROJECT_ID")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 if not RAPIDAPI_KEY:
     logger.warning("RAPIDAPI_KEY not set (discover will fail until configured).")
+if not YOUTUBE_DL_HOST:
+    logger.warning("YOUTUBE_DL_HOST not set (youtube downloader will fail until configured).")
+if not DRIVE_FOLDER_ID:
+    logger.warning("Drive folder id not set (DRIVE_FOLDER_ID).")
+if not GOOGLE_CREDENTIALS and not GOOGLE_SERVICE_ACCOUNT_FILE and not (GOOGLE_CLIENT_EMAIL and GOOGLE_PRIVATE_KEY):
+    logger.warning(
+        "Google credentials not set (GOOGLE_CREDENTIALS, GOOGLE_SERVICE_ACCOUNT_FILE, "
+        "or GOOGLE_CLIENT_EMAIL + GOOGLE_PRIVATE_KEY)."
+    )
+if GOOGLE_API_KEY:
+    logger.info("GOOGLE_API provided but not used for Docs/Drive write access.")
+if not OPENAI_API_KEY:
+    logger.warning("OPENAI_API_KEY not set (clip discovery will fail until configured).")
 
 # -------------------------
 # MODELS
 # -------------------------
+YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
+
+
 class DiscoverRequest(BaseModel):
-    video_id: str = Field(..., min_length=6)
-    youtube_url: Optional[str] = None  # optional convenience
+    video_id: Optional[str] = Field(None, min_length=6)
+    youtube_url: Optional[str] = None
+    sheet_id: Optional[str] = None
+    sheet_tab: Optional[str] = None
+    prompt: Optional[str] = None
+    wait_for_result: bool = False
+    wait_timeout_s: int = Field(0, ge=0, le=600)
+
 
 class DiscoverResponse(BaseModel):
     status: str
     job_id: str
     video_id: str
+    step: Optional[str] = None
+    error: Optional[str] = None
+    elapsed_s: Optional[float] = None
 
 # -------------------------
 # HEALTH
@@ -241,6 +110,7 @@ class DiscoverResponse(BaseModel):
 def ping():
     return {"pong": True}
 
+
 @app.get("/")
 def health():
     return {"status": "ok"}
@@ -248,76 +118,88 @@ def health():
 # -------------------------
 # RapidAPI transcript fetch
 # -------------------------
+
+def resolve_video_id(video_id: Optional[str], youtube_url: Optional[str]) -> str:
+    if not video_id and not youtube_url:
+        raise ValueError("video_id or youtube_url is required")
+    resolved = video_id
+    if youtube_url:
+        extracted = extract_video_id(youtube_url)
+        if not extracted:
+            raise ValueError("Unable to parse youtube_url")
+        if resolved and resolved != extracted:
+            raise ValueError("video_id does not match youtube_url")
+        resolved = extracted
+    if not resolved or not YOUTUBE_ID_RE.match(resolved):
+        raise ValueError("video_id must be a valid YouTube id")
+    return resolved
+
+
+def extract_video_id(youtube_url: str) -> Optional[str]:
+    parsed = urlparse(youtube_url)
+    host = parsed.netloc.lower()
+    if "youtube.com" in host:
+        query = parse_qs(parsed.query)
+        if "v" in query and query["v"]:
+            return query["v"][0]
+        if parsed.path.startswith("/shorts/"):
+            return parsed.path.split("/shorts/")[-1].split("/")[0]
+        if parsed.path.startswith("/embed/"):
+            return parsed.path.split("/embed/")[-1].split("/")[0]
+    if "youtu.be" in host:
+        return parsed.path.lstrip("/").split("/")[0]
+    return None
+
+
 def get_transcript(video_id: str) -> List[dict]:
-    """
-    youtube-transcript3 ONLY, but uses BOTH endpoints for reliability:
-      1) /api/transcript?videoId=...
-      2) /api/transcript-with-url?url=...
-    """
     if not RAPIDAPI_KEY:
         raise RuntimeError("RAPIDAPI_KEY not configured")
 
     headers = {
-        "x-rapidapi-host": YTT3_HOST,
+        "x-rapidapi-host": RAPIDAPI_HOST,
         "x-rapidapi-key": RAPIDAPI_KEY,
     }
 
-    # Always keep timestamps
-    lang = os.getenv("TRANSCRIPT_LANG", "auto")
-    flat_text = "false"  # force timestamps always
+    resp = requests.get(
+        RAPIDAPI_URL,
+        headers=headers,
+        params={"videoId": video_id},
+        timeout=(10, 120),
+    )
 
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
-
-    def _call(endpoint: str, params: dict) -> dict:
-        resp = requests.get(endpoint, headers=headers, params=params, timeout=(10, 120))
-        try:
-            data = resp.json()
-        except Exception:
-            raise RuntimeError(f"Transcript API non-JSON ({resp.status_code}): {resp.text}")
-
-        # Log minimal debug context (safe)
-        logger.info(f"Transcript3 call={endpoint.split('/')[-1]} status={resp.status_code} success={data.get('success')}")
-
-        if resp.status_code != 200:
-            raise RuntimeError(f"Transcript API HTTP error ({resp.status_code}): {data}")
-
-        if not data.get("success"):
-            raise RuntimeError(f"Transcript API reported failure: {data}")
-
-        return data
-
-    # Attempt 1: by videoId
     try:
-        data = _call(
-            YTT3_URL,
-            {"videoId": video_id, "lang": lang, "flat_text": flat_text},
-        )
-    except Exception as e1:
-        logger.warning(f"Transcript3 videoId attempt failed: {e1}")
+        data = resp.json()
+    except Exception as exc:
+        raise RuntimeError(f"Transcript API non-JSON ({resp.status_code}): {resp.text}") from exc
 
-        # Attempt 2: by URL (same provider)
-        url_endpoint = "https://youtube-transcript3.p.rapidapi.com/api/transcript-with-url"
-        data = _call(
-            url_endpoint,
-            {"url": video_url, "lang": lang, "flat_text": flat_text},
-        )
+    logger.info("Transcript3 call=transcript status=%s success=%s", resp.status_code, data.get("success"))
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"Transcript API HTTP error ({resp.status_code}): {data}")
+
+    if not data.get("success"):
+        raise RuntimeError(f"Transcript API reported failure: {data}")
 
     transcript = data.get("transcript")
-
-    if isinstance(transcript, str):
-        raise RuntimeError("Provider returned flat text; timestamps unavailable (flat_text must be false).")
-
     if not transcript or not isinstance(transcript, list):
         raise RuntimeError(f"Transcript empty or malformed: {data}")
 
     segments: List[dict] = []
-    for t in transcript:
-        text = (t.get("text") or "").strip()
+    for entry in transcript:
+        if not isinstance(entry, dict):
+            continue
+        raw_text = entry.get("text")
+        if raw_text is None:
+            raw_text = ""
+        text = str(raw_text).strip()
         if not text:
             continue
+        start = entry.get("start")
+        if start is None:
+            start = entry.get("offset", 0.0)
         segments.append({
-            "start": float(t.get("offset", 0.0)),
-            "duration": float(t.get("duration", 0.0)),
+            "start": float(start or 0.0),
+            "duration": float(entry.get("duration", 0.0)),
             "text": text,
         })
 
@@ -330,6 +212,7 @@ def get_transcript(video_id: str) -> List[dict]:
 # -------------------------
 # Chunking (3hr-safe)
 # -------------------------
+
 def chunk_transcript(segments: List[dict], chunk_seconds: int = 120) -> List[dict]:
     """
     Chunk by time window. 120s chunks is good for long videos.
@@ -340,54 +223,607 @@ def chunk_transcript(segments: List[dict], chunk_seconds: int = 120) -> List[dic
     current_start = segments[0]["start"]
     total = 0.0
 
-    for s in segments:
-        if total + s["duration"] > chunk_seconds and current:
+    for segment in segments:
+        if total + segment["duration"] > chunk_seconds and current:
             chunks.append({
                 "start": float(current_start),
                 "end": float(current_start + total),
-                "segments": current
+                "segments": current,
             })
             current = []
-            current_start = s["start"]
+            current_start = segment["start"]
             total = 0.0
 
-        current.append(s)
-        total += float(s["duration"])
+        current.append(segment)
+        total += float(segment["duration"])
 
     if current:
         chunks.append({
             "start": float(current_start),
             "end": float(current_start + total),
-            "segments": current
+            "segments": current,
         })
 
     return chunks
 
 # -------------------------
+# Google Docs transcript export
+# -------------------------
+
+def format_timestamp(seconds: float) -> str:
+    total_seconds = int(seconds)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def build_transcript_text(segments: List[dict]) -> str:
+    lines = []
+    for segment in segments:
+        timestamp = format_timestamp(segment["start"])
+        start = float(segment["start"])
+        duration = float(segment.get("duration", 0.0))
+        lines.append(f"[{timestamp} | start={start:.2f}s | dur={duration:.2f}s] {segment['text']}")
+    return "\n".join(lines)
+
+
+def get_google_services():
+    scopes = [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/documents",
+        "https://www.googleapis.com/auth/spreadsheets",
+    ]
+    if GOOGLE_CREDENTIALS:
+        info = json.loads(GOOGLE_CREDENTIALS)
+        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    elif GOOGLE_SERVICE_ACCOUNT_FILE:
+        creds = service_account.Credentials.from_service_account_file(
+            GOOGLE_SERVICE_ACCOUNT_FILE,
+            scopes=scopes,
+        )
+    elif GOOGLE_CLIENT_EMAIL and GOOGLE_PRIVATE_KEY:
+        private_key = GOOGLE_PRIVATE_KEY.replace("\\n", "\n")
+        info = {
+            "type": "service_account",
+            "client_email": GOOGLE_CLIENT_EMAIL,
+            "private_key": private_key,
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+        if GOOGLE_PRIVATE_KEY_ID:
+            info["private_key_id"] = GOOGLE_PRIVATE_KEY_ID
+        if GOOGLE_PROJECT_ID:
+            info["project_id"] = GOOGLE_PROJECT_ID
+        if GOOGLE_CLIENT_ID:
+            info["client_id"] = GOOGLE_CLIENT_ID
+        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    else:
+        raise RuntimeError(
+            "Google credentials not configured (GOOGLE_CREDENTIALS, "
+            "GOOGLE_SERVICE_ACCOUNT_FILE, or GOOGLE_CLIENT_EMAIL + GOOGLE_PRIVATE_KEY)"
+        )
+
+    drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    docs_service = build("docs", "v1", credentials=creds, cache_discovery=False)
+    sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return drive_service, docs_service, sheets_service
+
+
+def create_transcript_doc(video_id: str, segments: List[dict]) -> Dict[str, str]:
+    if not DRIVE_FOLDER_ID:
+        raise RuntimeError("Drive folder id not configured (Drive_Folder_ID/DRIVE_FOLDER_ID)")
+
+    drive_service, docs_service, _ = get_google_services()
+    title = f"{video_id} Full transcript"
+    file_metadata = {
+        "name": title,
+        "mimeType": "application/vnd.google-apps.document",
+        "parents": [DRIVE_FOLDER_ID],
+    }
+    file_obj = drive_service.files().create(
+        body=file_metadata,
+        fields="id, parents",
+        supportsAllDrives=True,
+    ).execute()
+    doc_id = file_obj["id"]
+
+    transcript_text = build_transcript_text(segments)
+    docs_service.documents().batchUpdate(
+        documentId=doc_id,
+        body={
+            "requests": [
+                {"insertText": {"location": {"index": 1}, "text": transcript_text}}
+            ]
+        },
+    ).execute()
+
+    return {
+        "document_id": doc_id,
+        "document_url": f"https://docs.google.com/document/d/{doc_id}/edit",
+    }
+
+
+def download_youtube_video(video_id: str, youtube_url: Optional[str], workdir: Path) -> Path:
+    workdir.mkdir(parents=True, exist_ok=True)
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": YOUTUBE_DL_HOST,
+    }
+    endpoint = f"https://{YOUTUBE_DL_HOST}{YOUTUBE_DL_PATH_TEMPLATE.format(video_id=video_id)}"
+
+    def _extract_download_url(payload: dict) -> Optional[str]:
+        download_url = (
+            payload.get("url")
+            or payload.get("download")
+            or payload.get("download_url")
+            or payload.get("downloadUrl")
+            or payload.get("videoUrl")
+            or payload.get("mainDownloadUrl")
+        )
+        if download_url:
+            return download_url
+        formats = payload.get("formats")
+        if isinstance(formats, list):
+            best: Optional[str] = None
+            for item in formats:
+                if not isinstance(item, dict):
+                    continue
+                candidate = item.get("downloadUrl") or item.get("download_url") or item.get("url")
+                if not candidate:
+                    continue
+                mime = str(item.get("mimeType", "")).lower()
+                has_video = bool(item.get("hasVideo"))
+                has_audio = bool(item.get("hasAudio"))
+                if has_video and "video/mp4" in mime and has_audio:
+                    return candidate
+                if has_video and "video/mp4" in mime and not best:
+                    best = candidate
+            if best:
+                return best
+        return None
+
+    def _request_download() -> tuple[dict, Optional[str]]:
+        resp = requests.get(
+            endpoint,
+            headers=headers,
+            params={"quality": "247"},
+            timeout=(10, 60),
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Youtube download API error ({resp.status_code}): {resp.text}")
+        payload = resp.json()
+        return payload, _extract_download_url(payload)
+
+    payload, download_url = _request_download()
+    if not download_url:
+        time.sleep(420)
+        payload, download_url = _request_download()
+    if not download_url:
+        time.sleep(120)
+        payload, download_url = _request_download()
+    if not download_url:
+        raise RuntimeError(f"Unable to extract download URL from API response: {payload}")
+    output_path = workdir / f"{video_id}.mp4"
+    download_video_asset(download_url, output_path)
+    return output_path
+
+
+def cleanup_old_temp_downloads(max_age_hours: int = 24) -> None:
+    cutoff = time.time() - (max_age_hours * 3600)
+    tmp_root = Path("/tmp")
+    for path in tmp_root.glob("clips_*"):
+        try:
+            if not path.is_dir():
+                continue
+            if path.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception as exc:
+            logger.warning("Failed to cleanup temp dir %s: %s", path, exc)
+
+
+def _probe_video_dimensions(video_path: Path) -> tuple[int, int]:
+    import cv2
+
+    cap = cv2.VideoCapture(str(video_path))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    if width <= 0 or height <= 0:
+        raise RuntimeError("Unable to read video dimensions")
+    return width, height
+
+
+def _estimate_speaker_center_x(video_path: Path, start: float, duration: float) -> float:
+    import cv2
+    import mediapipe as mp
+
+    mp_face = mp.solutions.face_detection
+    detector = mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.5)
+    cap = cv2.VideoCapture(str(video_path))
+    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+    centers = []
+    total_frames = int(min(duration, 30) * 2)
+    step = max(1, int(cap.get(cv2.CAP_PROP_FPS) // 2 or 1))
+    frame_idx = 0
+    while len(centers) < total_frames:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if frame_idx % step == 0:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = detector.process(rgb)
+            if results.detections:
+                bbox = results.detections[0].location_data.relative_bounding_box
+                center_x = bbox.xmin + bbox.width / 2
+                centers.append(center_x)
+        frame_idx += 1
+    cap.release()
+    detector.close()
+    if centers:
+        return sum(centers) / len(centers)
+    return 0.5
+
+
+def _build_crop_filter(video_path: Path, start: float, duration: float) -> str:
+    width, height = _probe_video_dimensions(video_path)
+    target_width = int(height * 9 / 16)
+    center_ratio = _estimate_speaker_center_x(video_path, start, duration)
+    center_x = int(center_ratio * width)
+    crop_x = max(0, min(width - target_width, center_x - target_width // 2))
+    return f"crop={target_width}:{height}:{crop_x}:0"
+
+
+def create_clip_file(video_path: Path, start: float, duration: float, output_path: Path) -> None:
+    crop_filter = _build_crop_filter(video_path, start, duration)
+    command = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start:.2f}",
+        "-t",
+        f"{duration:.2f}",
+        "-i",
+        str(video_path),
+        "-vf",
+        f"{crop_filter},scale=1080:1920",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    subprocess.run(command, check=True, capture_output=True)
+
+
+def upload_clip_to_drive(clip_path: Path, clip_name: str) -> dict:
+    if not DRIVE_FOLDER_ID:
+        raise RuntimeError("Drive folder id not configured (Drive_Folder_ID/DRIVE_FOLDER_ID)")
+    drive_service, _, _ = get_google_services()
+    file_metadata = {
+        "name": clip_name,
+        "parents": [DRIVE_FOLDER_ID],
+    }
+    media = MediaFileUpload(str(clip_path), mimetype="video/mp4", resumable=True)
+    uploaded = drive_service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, webViewLink",
+        supportsAllDrives=True,
+    ).execute()
+    return {
+        "clip_id": uploaded["id"],
+        "clip_url": uploaded.get("webViewLink") or f"https://drive.google.com/file/d/{uploaded['id']}/view",
+    }
+
+
+def download_video_asset(asset_url: str, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with requests.get(asset_url, stream=True, timeout=(10, 120)) as resp:
+        resp.raise_for_status()
+        with output_path.open("wb") as handle:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    handle.write(chunk)
+
+
+def _seconds_to_timecode(seconds: float) -> str:
+    total_seconds = int(max(0, math.floor(seconds)))
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def attach_clip_assets(
+    clips_payload: dict,
+    video_id: str,
+    youtube_url: Optional[str],
+) -> dict:
+    cleanup_old_temp_downloads(max_age_hours=24)
+    segments = clips_payload.get("segments", [])
+    if not segments:
+        return clips_payload
+
+    workdir = Path("/tmp") / f"clips_{video_id}"
+    video_path = download_youtube_video(video_id, youtube_url, workdir)
+    for idx, segment in enumerate(segments, start=1):
+        start = float(segment.get("start", 0.0))
+        duration = float(segment.get("duration", 0.0))
+        end = segment.get("end")
+        if duration <= 0 and end is not None:
+            duration = max(0.0, float(end) - start)
+        if duration <= 0:
+            continue
+        clip_name = f"{video_id}_{idx:02d}.mp4"
+        output_path = workdir / clip_name
+        create_clip_file(video_path, start, duration, output_path)
+        clip_info = upload_clip_to_drive(output_path, clip_name)
+        segment["clip_name"] = clip_name
+        segment["clip_url"] = clip_info["clip_url"]
+    return clips_payload
+
+
+def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optional[str]) -> str:
+    base_prompt = prompt_override or (
+        "TASK\n"
+        "You are a highlight editor for ANY type of content. Review the ENTIRE transcript in chronological order "
+        "and select the best short-form clips.\n"
+        "Return a MAX of 20 clips, each 10–90 seconds, prioritized by engagement and standalone clarity.\n"
+        "You MUST scan the full transcript before selecting any clips.\n\n"
+        "TRANSCRIPT FORMAT (YOU MUST FOLLOW THIS)\n"
+        "- Each transcript line is already time-aligned and looks like:\n"
+        "  [MM:SS | start=###.##s | dur=##.##s] text...\n"
+        "- The transcript is an ordered timeline. Do NOT reorder lines.\n"
+        "- You may create a clip by selecting ONE line OR combining MULTIPLE ADJACENT lines only.\n"
+        "- Never combine non-adjacent lines.\n"
+        "- For a combined clip:\n"
+        "  - start = start of the first included line\n"
+        "  - end = (start of last included line) + (dur of last included line)\n"
+        "  - duration = end - start\n"
+        "  - transcript = exact concatenation of included texts, in order\n"
+        "- Use timestamps EXACTLY as provided. Do not guess.\n\n"
+        "HARD REQUIREMENTS\n"
+        "- Each chosen clip MUST be 10–90 seconds.\n"
+        "- Each clip MUST be a complete, standalone thought (no cut-off setup, mid-sentence starts, "
+        "or missing payoff).\n"
+        "- Every clip MUST represent a complete sentence or complete thought.\n"
+        "- Each clip MUST deliver at least one of: an impactful lesson, a strong insight, or a quotable line.\n"
+        "- Do NOT paraphrase, rewrite, infer missing context, or fabricate.\n"
+        "- Do NOT return duplicate or near-duplicate clips; each clip must be materially distinct.\n"
+        "- Avoid duplicates/near-duplicates; maximize variety.\n\n"
+        "PROCESS\n"
+        "1) First pass: determine main_theme + 3–8 key ideas.\n"
+        "2) Second pass: pick clips that best support those ideas AND will perform on social.\n"
+        "3) Categorize each clip using the MASTER CATEGORY LIST.\n\n"
+        "MASTER CATEGORY LIST (choose ONE per clip)\n"
+        "- inspiration\n"
+        "- education\n"
+        "- humor\n"
+        "- story\n"
+        "- insight\n"
+        "- call-to-action\n"
+        "- controversy\n"
+        "- behind-the-scenes\n"
+        "- social-proof\n"
+        "- empathy\n"
+        "- mindset\n"
+        "- leadership\n"
+        "- business\n"
+        "- science-tech\n"
+        "- lifestyle\n"
+        "- spirituality\n"
+        "- community\n"
+        "- quote\n\n"
+        "SCORING (0–100)\n"
+        "- Hook strength in first 2–3 seconds (0–30)\n"
+        "- Standalone clarity / completeness (0–25)\n"
+        "- Impact (emotion/usefulness/novelty) (0–25)\n"
+        "- Shareability / quoteability (0–10)\n"
+        "- Variety contribution vs other picks (0–10)\n\n"
+        "OUTPUT FORMAT (STRICT JSON ONLY)\n"
+        "{\n"
+        "  \"analysis\": {\n"
+        "    \"main_theme\": \"string\",\n"
+        "    \"key_ideas\": [\"string\", \"string\"]\n"
+        "  },\n"
+        "  \"segments\": [\n"
+        "    {\n"
+        "      \"video_id\": \"string\",\n"
+        "      \"start\": number,\n"
+        "      \"end\": number,\n"
+        "      \"duration\": number,\n"
+        "      \"transcript\": \"string\",\n"
+        "      \"score\": number,\n"
+        "      \"category\": \"inspiration\" | \"education\" | \"humor\" | \"story\" | \"insight\" | "
+        "\"call-to-action\" | \"controversy\" | \"behind-the-scenes\" | \"social-proof\" | \"empathy\" | "
+        "\"mindset\" | \"leadership\" | \"business\" | \"science-tech\" | \"lifestyle\" | \"spirituality\" | "
+        "\"community\" | \"quote\",\n"
+        "      \"reason\": \"short justification\",\n"
+        "      \"source_lines\": [\n"
+        "        \"[MM:SS | start=###.##s | dur=##.##s] ...\",\n"
+        "        \"[MM:SS | start=###.##s | dur=##.##s] ...\"\n"
+        "      ]\n"
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "If nothing qualifies:\n"
+        "{ \"analysis\": {\"main_theme\": \"\", \"key_ideas\": []}, \"segments\": [] }\n"
+    )
+
+    def _mmss(seconds: float) -> str:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes:02d}:{secs:02d}"
+
+    video_id = ""
+    lines = []
+    for seg in transcript_segments:
+        start = float(seg["start"])
+        dur = float(seg["duration"])
+        text = str(seg["text"]).replace("\n", " ").strip()
+        video_id = seg.get("video_id", video_id) or video_id
+        lines.append(f"[{_mmss(start)} | start={start:.2f}s | dur={dur:.2f}s] {text}")
+
+    transcript_block = "\n".join(lines)
+
+    return (
+        f"{base_prompt}\n\n"
+        f"VIDEO_ID: {video_id or 'unknown'}\n"
+        "TRANSCRIPT_TIMELINE (chronological, do not reorder):\n"
+        f"{transcript_block}"
+    )
+
+
+def call_openai_for_clips(transcript_segments: List[dict], prompt_override: Optional[str]) -> dict:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not configured")
+
+    prompt = openai_clip_prompt(transcript_segments, prompt_override)
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant that returns strict JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2,
+    }
+    resp = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=(10, 180),
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenAI API error ({resp.status_code}): {resp.text}")
+    data = resp.json()
+    content = data["choices"][0]["message"]["content"]
+    raw_content = content.strip()
+    if raw_content.startswith("```"):
+        lines = raw_content.splitlines()
+        if len(lines) >= 2:
+            raw_content = "\n".join(lines[1:-1]).strip()
+    try:
+        return json.loads(raw_content)
+    except json.JSONDecodeError:
+        start = raw_content.find("{")
+        end = raw_content.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(raw_content[start : end + 1])
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"OpenAI response was not valid JSON: {raw_content}") from exc
+        raise RuntimeError(f"OpenAI response was not valid JSON: {raw_content}")
+
+
+def write_clips_to_sheet(
+    sheet_id: str,
+    sheet_tab: str,
+    clips_payload: dict,
+    video_id: str,
+    transcript_segments: List[dict],
+) -> dict:
+    _, _, sheets_service = get_google_services()
+    segments = clips_payload.get("segments", [])
+    transcript_lookup = {seg["start"]: seg["text"] for seg in transcript_segments}
+    values = []
+    for segment in segments:
+        start = segment.get("start", 0.0)
+        duration = segment.get("duration", 0.0)
+        text = segment.get("transcript") or transcript_lookup.get(start, "")
+        values.append([
+            video_id,
+            start,
+            duration,
+            text,
+            segment.get("score"),
+            segment.get("category") or segment.get("primary_category"),
+            segment.get("reason"),
+            segment.get("clip_url", ""),
+            segment.get("clip_name", ""),
+        ])
+    if not values:
+        values = [[video_id, "", "", "", "", "", "No segments returned", "", ""]]
+
+    existing = sheets_service.spreadsheets().values().get(
+        spreadsheetId=sheet_id,
+        range=f"{sheet_tab}!A:A",
+    ).execute()
+    existing_values = existing.get("values", [])
+    if not existing_values:
+        start_row = 2
+    else:
+        start_row = len(existing_values) + 1
+    range_name = f"{sheet_tab}!A{start_row}"
+    result = sheets_service.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=range_name,
+        valueInputOption="RAW",
+        body={"values": values},
+    ).execute()
+    return {"updated_cells": result.get("updatedCells"), "range": result.get("updatedRange")}
+
+# -------------------------
 # Background job (DISCOVERY)
 # -------------------------
+
 def run_discovery(job_id: str, video_id: str):
     started = time.time()
     JOBS[job_id]["status"] = "running"
     JOBS[job_id]["step"] = "transcript_fetch"
 
-    logger.info(f"[{job_id}] discovery start video_id={video_id}")
+    logger.info("[%s] discovery start video_id=%s", job_id, video_id)
 
     try:
         transcript = get_transcript(video_id)
-        logger.info(f"[{job_id}] transcript segments={len(transcript)}")
+        logger.info("[%s] transcript segments=%s", job_id, len(transcript))
+
+        JOBS[job_id]["step"] = "create_doc"
+        doc_info = create_transcript_doc(video_id, transcript)
+        logger.info("[%s] transcript doc=%s", job_id, doc_info["document_id"])
 
         JOBS[job_id]["step"] = "chunking"
         chunks = chunk_transcript(transcript, chunk_seconds=120)
-        logger.info(f"[{job_id}] chunks={len(chunks)}")
+        logger.info("[%s] chunks=%s", job_id, len(chunks))
 
-        # TODO (next):
-        # - AI clip discovery per chunk
-        # - global ranking / prune <= 30
-        # - write proposed clips to Google Sheet
-        #
-        # For now, we mark transcript ready and chunked.
-        # This keeps discover stable while you wire Sheets/AI cleanly.
+        JOBS[job_id]["step"] = "clip_discovery"
+        if not OPENAI_API_KEY:
+            logger.warning("[%s] OPENAI_API_KEY missing, skipping clip discovery", job_id)
+            clips_payload = {"segments": [], "error": "OPENAI_API_KEY not configured"}
+        else:
+            try:
+                transcript_with_id = [dict(seg, video_id=video_id) for seg in transcript]
+                clips_payload = call_openai_for_clips(transcript_with_id, JOBS[job_id].get("prompt"))
+            except Exception as exc:
+                logger.exception("[%s] clip discovery failed, continuing with empty results", job_id)
+                clips_payload = {"segments": [], "error": str(exc)}
+        clip_segments = clips_payload.get("segments", [])
+        logger.info("[%s] clips=%s", job_id, len(clip_segments))
+
+        JOBS[job_id]["step"] = "clip_render"
+        if clip_segments:
+            youtube_url = JOBS[job_id].get("youtube_url")
+            clips_payload = attach_clip_assets(clips_payload, video_id, youtube_url)
+
+        JOBS[job_id]["step"] = "sheet_write"
+        sheet_id = (JOBS[job_id].get("sheet_id") or DEFAULT_SHEET_ID).strip()
+        sheet_tab = (JOBS[job_id].get("sheet_tab") or DEFAULT_SHEET_TAB).strip()
+        logger.info("[%s] writing clips to sheet_id=%s tab=%s", job_id, sheet_id, sheet_tab)
+        sheet_info = write_clips_to_sheet(
+            sheet_id,
+            sheet_tab,
+            clips_payload,
+            video_id,
+            transcript,
+        )
+        logger.info("[%s] sheet updated range=%s", job_id, sheet_info.get("range"))
 
         JOBS[job_id]["status"] = "done"
         JOBS[job_id]["step"] = "completed"
@@ -395,18 +831,24 @@ def run_discovery(job_id: str, video_id: str):
             "video_id": video_id,
             "segments": len(transcript),
             "chunks": len(chunks),
+            "document_id": doc_info["document_id"],
+            "document_url": doc_info["document_url"],
+            "clips": clip_segments,
+            "sheet_id": sheet_id,
+            "sheet_tab": sheet_tab,
+            "sheet_range": sheet_info.get("range"),
         }
         JOBS[job_id]["elapsed_s"] = round(time.time() - started, 2)
 
-        logger.info(f"[{job_id}] discovery done elapsed_s={JOBS[job_id]['elapsed_s']}")
+        logger.info("[%s] discovery done elapsed_s=%s", job_id, JOBS[job_id]["elapsed_s"])
 
-    except Exception as e:
+    except Exception as exc:
         JOBS[job_id]["status"] = "error"
         JOBS[job_id]["step"] = "failed"
-        JOBS[job_id]["error"] = str(e)
+        JOBS[job_id]["error"] = str(exc)
         JOBS[job_id]["elapsed_s"] = round(time.time() - started, 2)
 
-        logger.exception(f"[{job_id}] discovery failed: {e}")
+        logger.exception("[%s] discovery failed: %s", job_id, exc)
 
 # -------------------------
 # DISCOVER ENDPOINT (Zapier-safe)
@@ -414,23 +856,45 @@ def run_discovery(job_id: str, video_id: str):
 @app.post("/discover", response_model=DiscoverResponse, status_code=202)
 def discover(req: DiscoverRequest):
     if not RAPIDAPI_KEY:
-        # Return a clear error early rather than accepting jobs that cannot run.
         raise HTTPException(status_code=500, detail="RAPIDAPI_KEY not configured")
+
+    try:
+        resolved_video_id = resolve_video_id(req.video_id, req.youtube_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {
         "job_id": job_id,
-        "video_id": req.video_id,
+        "video_id": resolved_video_id,
+        "youtube_url": req.youtube_url,
+        "sheet_id": req.sheet_id,
+        "sheet_tab": req.sheet_tab,
+        "prompt": req.prompt,
         "status": "queued",
         "step": "queued",
         "created_at": time.time(),
     }
 
-    # Offload to background thread
-    executor.submit(run_discovery, job_id, req.video_id)
+    executor.submit(run_discovery, job_id, resolved_video_id)
+    if req.wait_for_result:
+        timeout = req.wait_timeout_s if req.wait_timeout_s > 0 else 120
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            job = JOBS.get(job_id, {})
+            status = job.get("status")
+            if status in {"done", "error"}:
+                return {
+                    "status": status,
+                    "job_id": job_id,
+                    "video_id": resolved_video_id,
+                    "step": job.get("step"),
+                    "error": job.get("error"),
+                    "elapsed_s": job.get("elapsed_s"),
+                }
+            time.sleep(1)
 
-    # IMPORTANT: return immediately, no transcript, no chunks
-    return {"status": "accepted", "job_id": job_id, "video_id": req.video_id}
+    return {"status": "accepted", "job_id": job_id, "video_id": resolved_video_id, "step": "queued"}
 
 # -------------------------
 # JOB STATUS (debug endpoint)
