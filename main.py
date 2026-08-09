@@ -905,3 +905,8 @@ def job_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     return job
+
+
+# Audio Master downstream ingestion routes.
+from audio_master_handoff import router as audio_master_handoff_router
+app.include_router(audio_master_handoff_router)
