@@ -3,7 +3,7 @@ from pathlib import Path
 import unittest
 
 
-SOURCE = (Path(__file__).parent / "audio_master_handoff.py").read_text()
+SOURCE = (Path(__file__).resolve().parents[1] / "audio_master_handoff.py").read_text()
 TREE = ast.parse(SOURCE)
 FUNCTIONS = {
     node.name: node
