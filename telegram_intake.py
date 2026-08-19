@@ -65,6 +65,11 @@ def parse_request(text: str) -> dict[str, Any]:
 
 def _authorized(chat_id: str, user_id: str) -> bool:
     chats, users = _csv_env("TELEGRAM_ALLOWED_CHAT_IDS"), _csv_env("TELEGRAM_ALLOWED_USER_IDS")
+    # Reuse the existing Clip Master chat variable when the bot already has a
+    # single approved review chat. No second Telegram bot is required.
+    existing_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if existing_chat:
+        chats.add(existing_chat)
     # Fail closed: at least one allow-list must be configured.
     if not chats and not users:
         return False
@@ -110,6 +115,34 @@ def _reusable_youtube_job(video_id: str) -> dict | None:
 def _segments(path: Path) -> list[dict]:
     data = json.loads(path.read_text(encoding="utf-8"))
     return data.get("segments", data) if isinstance(data, dict) else data
+
+
+def validate_complete_candidates(payload: dict, transcript_segments: list[dict], tolerance: float = 0.75) -> dict:
+    """Keep only candidates whose boundaries and quoted words exist in the transcript."""
+    boundaries = []
+    for item in transcript_segments:
+        start = float(item.get("start", 0))
+        end = float(item.get("end", start + float(item.get("duration", 0))))
+        boundaries.append((start, end, str(item.get("text", "")).strip()))
+    valid = []
+    rejected = []
+    for candidate in payload.get("segments", []):
+        start = float(candidate.get("start", -1))
+        end = float(candidate.get("end", start + float(candidate.get("duration", 0))))
+        begins_cleanly = any(abs(start - seg_start) <= tolerance for seg_start, _, _ in boundaries)
+        ends_cleanly = any(abs(end - seg_end) <= tolerance for _, seg_end, _ in boundaries)
+        included = [text for seg_start, seg_end, text in boundaries if seg_start >= start - tolerance and seg_end <= end + tolerance]
+        expected = " ".join(included).casefold()
+        quoted = str(candidate.get("transcript", "")).strip().casefold()
+        transcript_matches = bool(quoted and expected and (quoted in expected or expected in quoted))
+        if begins_cleanly and ends_cleanly and transcript_matches and end > start:
+            candidate["start"] = start
+            candidate["end"] = end
+            candidate["duration"] = round(end - start, 3)
+            valid.append(candidate)
+        else:
+            rejected.append({"start": start, "end": end, "reason": "Candidate did not align to complete transcript boundaries or quoted unsupported text"})
+    return {**payload, "segments": valid, "validation_rejections": rejected}
 
 
 def _transcribe(video_path: Path) -> list[dict]:
@@ -186,6 +219,7 @@ def _process(request_id: str) -> None:
         import main
         enriched = [{**item, "video_id": state["parsed"].get("video_id", "drive-source")} for item in segments]
         result = main.call_openai_for_clips(enriched, None)
+        result = validate_complete_candidates(result, enriched)
         # Existing renderer is shorts-only. Topic requests are retained for the dual-lane selector.
         if row["mode"] == "topics":
             raise RuntimeError("Topic-only Telegram processing requires the dual-lane selector before rendering")
