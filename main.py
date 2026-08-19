@@ -545,6 +545,7 @@ def attach_clip_assets(
     clips_payload: dict,
     video_id: str,
     youtube_url: Optional[str],
+    video_path_override: Optional[Path] = None,
 ) -> dict:
     cleanup_old_temp_downloads(max_age_hours=24)
     segments = clips_payload.get("segments", [])
@@ -552,7 +553,7 @@ def attach_clip_assets(
         return clips_payload
 
     workdir = Path("/tmp") / f"clips_{video_id}"
-    video_path = download_youtube_video(video_id, youtube_url, workdir)
+    video_path = video_path_override or download_youtube_video(video_id, youtube_url, workdir)
     for idx, segment in enumerate(segments, start=1):
         start = float(segment.get("start", 0.0))
         duration = float(segment.get("duration", 0.0))
@@ -910,3 +911,6 @@ def job_status(job_id: str):
 # Audio Master downstream ingestion routes.
 from audio_master_handoff import router as audio_master_handoff_router
 app.include_router(audio_master_handoff_router)
+
+from telegram_intake import router as telegram_intake_router
+app.include_router(telegram_intake_router)
