@@ -39,3 +39,11 @@ def test_learning_log_uses_decisions_without_user_score():
     assert '"approved"' in source
     assert '"rejected"' in source
     assert 'candidate.get("score")' not in source
+
+
+def test_telegram_reports_render_progress_and_drive_completion():
+    source = (ROOT / "telegram_intake.py").read_text()
+    assert "is now rendering" in source
+    assert "rendered and uploaded to DRIVE_FOLDER_ID" in source
+    assert "Current Ripped Shorts render queue complete" in source
+    assert "drive.google.com/drive/folders/" in source
