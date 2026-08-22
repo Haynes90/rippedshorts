@@ -636,8 +636,9 @@ def _plan_framing_sections(
     cursor = 0.0
     while duration - cursor > maximum_seconds:
         low = cursor + minimum_seconds
-        ideal = cursor + target_seconds
-        high = min(duration, cursor + maximum_seconds)
+        # Leave at least the minimum hold for the final section too.
+        high = min(cursor + maximum_seconds, duration - minimum_seconds)
+        ideal = min(cursor + target_seconds, high)
         choices = [value for value in preferred if low <= value <= high]
         boundary = min(choices, key=lambda value: abs(value - ideal)) if choices else ideal
         boundaries.append(boundary)
