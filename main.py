@@ -554,13 +554,11 @@ def attach_clip_assets(
             duration = max(0.0, float(end) - start)
         if duration <= 0:
             continue
-        end_seconds = start + duration
-        clip_key = (
-            f"{int(round(start * 1000)):010d}-"
-            f"{int(round(end_seconds * 1000)):010d}"
-        )
-        clip_name = f"{video_id}_{clip_key}.mp4"
-        output_path = workdir / clip_name
+        candidate_number = int(segment.get("candidate_number") or idx)
+        clip_name = f"{video_id}_Clip_{candidate_number}.mp4"
+        # Keep the user-facing Drive filename predictable while ensuring
+        # simultaneous FFmpeg processes never write to the same local path.
+        output_path = workdir / f".render-{uuid.uuid4().hex}-{clip_name}"
         create_clip_file(video_path, start, duration, output_path)
         clip_info = upload_clip_to_drive(output_path, clip_name)
         segment["clip_name"] = clip_name
