@@ -646,6 +646,10 @@ def _process(request_id: str) -> None:
             approved_clips = approval_history["unfinished"]
             rendered_clips = approval_history["rendered"]
             prior_shorts = _reviewed_short_history_from_sheet(video_id)
+            if force_rerip:
+                # A re-rip is a fresh editorial pass; old approvals are learning
+                # examples, not automatic render instructions.
+                approved_clips = []
 
             # Ten reviewed shorts is enough history to treat this ID as already
             # discovered. Below ten, search again for additional distinct shorts.
@@ -726,7 +730,13 @@ def _process(request_id: str) -> None:
                 "source_reused": reused,
             },
         )
-        if prior_count:
+        if force_rerip:
+            send(
+                chat_id,
+                f"🧠 Re-ripping YouTube ID {video_id}. Selecting a fresh set of up "
+                "to 20 Shorts using your approval and rejection history.",
+            )
+        elif prior_count:
             send(
                 chat_id,
                 f"🧠 Only {prior_count} previously reviewed short(s) were found for "
