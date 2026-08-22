@@ -46,6 +46,35 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _render_progress_text(request_id: str) -> str:
+    with _LOCK, _telegram_db() as db:
+        row = db.execute(
+            "SELECT state_json FROM telegram_requests WHERE request_id=?", (request_id,)
+        ).fetchone()
+    if not row:
+        return "Render progress unavailable."
+    state = json.loads(row["state_json"])
+    reviews = dict(state.get("candidate_reviews") or {})
+    statuses = [
+        str(review.get("status") or "")
+        for review in reviews.values()
+        if str(review.get("status") or "")
+        in {"queued", "rendering", "rendered", "render_failed"}
+    ]
+    total = len(statuses)
+    rendered = sum(status == "rendered" for status in statuses)
+    failed = sum(status == "render_failed" for status in statuses)
+    rendering = sum(status == "rendering" for status in statuses)
+    queued = sum(status == "queued" for status in statuses)
+    processed = rendered + failed
+    percent = round((processed / total) * 100) if total else 0
+    return (
+        f"Progress: {processed}/{total} processed ({percent}%)"
+        f" | {rendering} rendering | {queued} queued"
+        f" | {rendered} rendered | {failed} failed"
+    )
+
+
 def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
     """Send one Telegram summary when the currently approved render queue drains."""
     summary = None
@@ -523,7 +552,8 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
             send(
                 chat_id,
                 f"Candidate {index + 1} approved and queued for rendering. "
-                f"Up to {RIPPED_SHORTS_RENDER_WORKERS} clips render at once; the rest wait.",
+                f"Up to {RIPPED_SHORTS_RENDER_WORKERS} clips render at once; the rest wait.\n"
+                f"{_render_progress_text(request_id)}",
             )
         else:
             _safe_log_candidate(
@@ -579,7 +609,11 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(state), now(), request_id),
             )
-        send(chat_id, f"🎬 Candidate {index + 1} is now rendering.")
+        send(
+            chat_id,
+            f"🎬 Candidate {index + 1} is now rendering.\n"
+            f"{_render_progress_text(request_id)}",
+        )
         candidate = state["result"]["segments"][index]
         user_id = str(
             (state.get("candidate_reviews") or {}).get(str(index), {}).get("user_id", "")
@@ -628,7 +662,8 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         send(
             chat_id,
             f"✅ Candidate {index + 1} rendered and uploaded to DRIVE_FOLDER_ID:\n"
-            f"{clip.get('clip_url', '')}",
+            f"{clip.get('clip_url', '')}\n"
+            f"{_render_progress_text(request_id)}",
         )
         _notify_render_queue_complete(request_id, chat_id)
     except Exception as exc:
@@ -664,7 +699,11 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             )
         except Exception:
             logger.exception("Could not persist render failure")
-        send(chat_id, f"❌ Candidate {index + 1} render failed:\n{str(exc)[:1500]}")
+        send(
+            chat_id,
+            f"❌ Candidate {index + 1} render failed:\n{str(exc)[:1500]}\n"
+            f"{_render_progress_text(request_id)}",
+        )
         _notify_render_queue_complete(request_id, chat_id)
 
 
