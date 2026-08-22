@@ -7,6 +7,8 @@ import re
 import sqlite3
 import threading
 import uuid
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -27,6 +29,16 @@ router = APIRouter()
 YOUTUBE_RE = re.compile(r"https?://(?:www\.)?(?:youtube\.com/(?:watch\?[^\s]*v=|shorts/)|youtu\.be/)([A-Za-z0-9_-]{6,20})", re.I)
 DRIVE_RE = re.compile(r"https?://drive\.google\.com/(?:file/d/|open\?id=|uc\?(?:[^\s]*&)?id=)([A-Za-z0-9_-]+)", re.I)
 _LOCK = threading.RLock()
+logger = logging.getLogger("ripped-shorts.telegram")
+RENDER_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(1, int(os.getenv("RIPPED_SHORTS_RENDER_WORKERS", "3")))
+)
+RIPPED_LOG_SHEET_ID = (
+    os.getenv("RIPPED_SHORTS_LOG_SHEET_ID")
+    or os.getenv("PODCAST_SHEET_ID")
+    or "14VruBxjaaE9DyPSdBidMeuPHew3nHUC5sRNGXtLCsis"
+).strip()
+RIPPED_LOG_SHEET_TAB = os.getenv("RIPPED_SHORTS_LOG_SHEET_TAB", "Ripped Shorts").strip()
 
 
 def now() -> str:
@@ -150,6 +162,86 @@ def _timecode(seconds: float) -> str:
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _log_candidate_decision(
+    state: dict[str, Any],
+    request_id: str,
+    index: int,
+    decision: str,
+    user_id: str,
+    *,
+    render_status: str,
+    clip_url: str = "",
+    rendered_at: str = "",
+) -> None:
+    """Upsert one candidate decision into the Podcast/Ripped Shorts worksheet."""
+    import main
+
+    candidate = state["result"]["segments"][index]
+    analysis = state["result"].get("analysis") or {}
+    parsed = state.get("parsed") or {}
+    reviewed = (state.get("candidate_reviews") or {}).get(str(index), {})
+    row_values = [
+        now(),
+        request_id,
+        parsed.get("video_id", ""),
+        parsed.get("source_value", ""),
+        analysis.get("content_type", ""),
+        analysis.get("main_theme", ""),
+        ", ".join(str(value) for value in analysis.get("key_ideas", [])),
+        ", ".join(str(value) for value in analysis.get("keywords", [])),
+        index + 1,
+        float(candidate.get("start", 0)),
+        float(candidate.get("end", 0)),
+        float(candidate.get("duration", 0)),
+        candidate.get("category", ""),
+        candidate.get("transcript", ""),
+        candidate.get("reason", ""),
+        decision,
+        reviewed.get("reviewed_at", ""),
+        rendered_at,
+        clip_url,
+        render_status,
+        user_id,
+    ]
+    _, _, sheets = main.get_google_services()
+    response = sheets.spreadsheets().values().get(
+        spreadsheetId=RIPPED_LOG_SHEET_ID,
+        range=f"'{RIPPED_LOG_SHEET_TAB}'!A:U",
+    ).execute()
+    rows = response.get("values", [])
+    target_row = None
+    for row_number, values in enumerate(rows[1:], start=2):
+        if (
+            len(values) > 8
+            and str(values[1]) == request_id
+            and str(values[8]) == str(index + 1)
+        ):
+            target_row = row_number
+            break
+    if target_row is None:
+        sheets.spreadsheets().values().append(
+            spreadsheetId=RIPPED_LOG_SHEET_ID,
+            range=f"'{RIPPED_LOG_SHEET_TAB}'!A:U",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row_values]},
+        ).execute()
+    else:
+        sheets.spreadsheets().values().update(
+            spreadsheetId=RIPPED_LOG_SHEET_ID,
+            range=f"'{RIPPED_LOG_SHEET_TAB}'!A{target_row}:U{target_row}",
+            valueInputOption="RAW",
+            body={"values": [row_values]},
+        ).execute()
+
+
+def _safe_log_candidate(*args, **kwargs) -> None:
+    try:
+        _log_candidate_decision(*args, **kwargs)
+    except Exception as exc:
+        logger.exception("Ripped Shorts decision log failed: %s", exc)
 
 
 def _send_candidates(chat_id: str, request_id: str, result: dict) -> None:
@@ -336,16 +428,54 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
             row = db.execute("SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)).fetchone()
         if not row:
             return {"status": "not_found"}
-        state = json.loads(row["state_json"])
-        reviews = dict(state.get("candidate_reviews") or {})
-        reviews[str(index)] = {"status": verb, "reviewed_at": now(), "user_id": user_id}
-        state["candidate_reviews"] = reviews
-        _save(request_id, "awaiting_review" if verb == "reject" else "approved", state)
-        # Rendering is deliberately queued only after approval; the candidate
-        # package remains durable even if the worker restarts.
+        with _LOCK, _telegram_db() as db:
+            current = db.execute(
+                "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+            state = json.loads(current["state_json"])
+            reviews = dict(state.get("candidate_reviews") or {})
+            existing_status = (reviews.get(str(index)) or {}).get("status")
+            if verb == "approve" and existing_status in {"queued", "rendering", "rendered"}:
+                return {
+                    "status": f"already_{existing_status}",
+                    "request_id": request_id,
+                    "candidate_index": index,
+                }
+            reviews[str(index)] = {
+                "status": "queued" if verb == "approve" else "reject",
+                "reviewed_at": now(),
+                "user_id": user_id,
+            }
+            state["candidate_reviews"] = reviews
+            db.execute(
+                "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
+                (
+                    "awaiting_review",
+                    json.dumps(state),
+                    now(),
+                    request_id,
+                ),
+            )
         if verb == "approve":
-            background_tasks.add_task(_render_approved, request_id, index, chat_id)
+            _safe_log_candidate(
+                state,
+                request_id,
+                index,
+                "approved",
+                user_id,
+                render_status="queued",
+            )
+            RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
+            send(chat_id, f"Candidate {index + 1} approved and queued for rendering.")
         else:
+            _safe_log_candidate(
+                state,
+                request_id,
+                index,
+                "rejected",
+                user_id,
+                render_status="not_rendered",
+            )
             send(chat_id, f"Candidate {index + 1} rejected.")
         return {"status": verb, "request_id": request_id, "candidate_index": index}
     retry_match = re.fullmatch(r"/retry\s+([A-Za-z0-9-]+)", text, re.I)
@@ -370,23 +500,112 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
 
 
 def _render_approved(request_id: str, index: int, chat_id: str) -> None:
+    user_id = ""
     try:
         with _LOCK, _telegram_db() as db:
-            row = db.execute("SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)).fetchone()
+            row = db.execute(
+                "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+        if not row:
+            raise RuntimeError(f"Ripped Shorts request not found: {request_id}")
         state = json.loads(row["state_json"])
+        reviews = dict(state.get("candidate_reviews") or {})
+        reviews[str(index)] = {
+            **reviews.get(str(index), {}),
+            "status": "rendering",
+            "render_started_at": now(),
+        }
+        state["candidate_reviews"] = reviews
+        with _LOCK, _telegram_db() as db:
+            db.execute(
+                "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+                (json.dumps(state), now(), request_id),
+            )
         candidate = state["result"]["segments"][index]
+        user_id = str(
+            (state.get("candidate_reviews") or {}).get(str(index), {}).get("user_id", "")
+        )
         video = Path(state["video_path"])
         import main
-        payload = {"segments": [dict(candidate)]}
-        rendered = main.attach_clip_assets(payload, state["parsed"].get("video_id", request_id), None, video_path_override=video)
+
+        payload_candidate = dict(candidate)
+        payload_candidate["candidate_number"] = index + 1
+        payload = {"segments": [payload_candidate]}
+        rendered = main.attach_clip_assets(
+            payload,
+            state["parsed"].get("video_id", request_id),
+            None,
+            video_path_override=video,
+        )
         clip = rendered["segments"][0]
-        reviews = dict(state.get("candidate_reviews") or {})
-        reviews[str(index)] = {**reviews.get(str(index), {}), "status": "rendered", "clip_url": clip.get("clip_url"), "rendered_at": now()}
-        state["candidate_reviews"] = reviews
-        _save(request_id, "awaiting_review", state)
-        send(chat_id, f"✅ Candidate {index + 1} rendered and uploaded:\n{clip.get('clip_url', '')}")
+        rendered_at = now()
+        with _LOCK, _telegram_db() as db:
+            latest = db.execute(
+                "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+            latest_state = json.loads(latest["state_json"])
+            reviews = dict(latest_state.get("candidate_reviews") or {})
+            reviews[str(index)] = {
+                **reviews.get(str(index), {}),
+                "status": "rendered",
+                "clip_url": clip.get("clip_url"),
+                "rendered_at": rendered_at,
+            }
+            latest_state["candidate_reviews"] = reviews
+            db.execute(
+                "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
+                ("awaiting_review", json.dumps(latest_state), now(), request_id),
+            )
+        _safe_log_candidate(
+            latest_state,
+            request_id,
+            index,
+            "approved",
+            user_id,
+            render_status="rendered",
+            clip_url=clip.get("clip_url", ""),
+            rendered_at=rendered_at,
+        )
+        send(
+            chat_id,
+            f"✅ Candidate {index + 1} rendered and uploaded:\n{clip.get('clip_url', '')}",
+        )
     except Exception as exc:
+        logger.exception(
+            "Candidate render failed request_id=%s candidate=%s", request_id, index + 1
+        )
+        try:
+            with _LOCK, _telegram_db() as db:
+                latest = db.execute(
+                    "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+                ).fetchone()
+                latest_state = json.loads(latest["state_json"])
+                reviews = dict(latest_state.get("candidate_reviews") or {})
+                reviews[str(index)] = {
+                    **reviews.get(str(index), {}),
+                    "status": "render_failed",
+                    "render_error": str(exc),
+                    "rendered_at": now(),
+                }
+                latest_state["candidate_reviews"] = reviews
+                db.execute(
+                    "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
+                    ("awaiting_review", json.dumps(latest_state), now(), request_id),
+                )
+            _safe_log_candidate(
+                latest_state,
+                request_id,
+                index,
+                "approved",
+                user_id,
+                render_status="render_failed",
+                rendered_at=now(),
+            )
+        except Exception:
+            logger.exception("Could not persist render failure")
         send(chat_id, f"❌ Candidate {index + 1} render failed:\n{str(exc)[:1500]}")
+
+
 
 
 @router.get("/api/ripped-shorts/runtime-info")

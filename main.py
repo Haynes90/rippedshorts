@@ -405,9 +405,15 @@ def _estimate_speaker_center_x(video_path: Path, start: float, duration: float) 
             "MediaPipe face detection unavailable; using OpenCV/center crop: %s", exc
         )
 
-    cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+    cascade = (
+        cv2.CascadeClassifier(str(cascade_path))
+        if cascade_path.is_file()
+        else None
     )
+    if cascade is None or cascade.empty():
+        cascade = None
+        logger.info("OpenCV face cascade unavailable; using safe center crop fallback")
     frame_index = 0
     while len(centers) < total_samples:
         ok, frame = cap.read()
@@ -425,7 +431,7 @@ def _estimate_speaker_center_x(video_path: Path, start: float, duration: float) 
                     logger.warning("MediaPipe frame detection failed; falling back: %s", exc)
                     detector.close()
                     detector = None
-            if center is None and not cascade.empty():
+            if center is None and cascade is not None:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 faces = cascade.detectMultiScale(
                     gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40)
@@ -447,7 +453,8 @@ def _estimate_speaker_center_x(video_path: Path, start: float, duration: float) 
 
 def _build_crop_filter(video_path: Path, start: float, duration: float) -> str:
     width, height = _probe_video_dimensions(video_path)
-    target_width = int(height * 9 / 16)
+    target_width = min(width, int(height * 9 / 16))
+    target_width = max(2, target_width - (target_width % 2))
     center_ratio = _estimate_speaker_center_x(video_path, start, duration)
     center_x = int(center_ratio * width)
     crop_x = max(0, min(width - target_width, center_x - target_width // 2))
@@ -477,7 +484,14 @@ def create_clip_file(video_path: Path, start: float, duration: float, output_pat
         "+faststart",
         str(output_path),
     ]
-    subprocess.run(command, check=True, capture_output=True)
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=3600)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"FFmpeg render failed with code {completed.returncode}: "
+            f"{(completed.stderr or completed.stdout)[-3000:]}"
+        )
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError(f"FFmpeg render produced no usable clip: {output_path}")
 
 
 def upload_clip_to_drive(clip_path: Path, clip_name: str) -> dict:
@@ -540,8 +554,11 @@ def attach_clip_assets(
             duration = max(0.0, float(end) - start)
         if duration <= 0:
             continue
-        clip_name = f"{video_id}_{idx:02d}.mp4"
-        output_path = workdir / clip_name
+        candidate_number = int(segment.get("candidate_number") or idx)
+        clip_name = f"{video_id}_Clip_{candidate_number}.mp4"
+        # Keep the user-facing Drive filename predictable while ensuring
+        # simultaneous FFmpeg processes never write to the same local path.
+        output_path = workdir / f".render-{uuid.uuid4().hex}-{clip_name}"
         create_clip_file(video_path, start, duration, output_path)
         clip_info = upload_clip_to_drive(output_path, clip_name)
         segment["clip_name"] = clip_name
@@ -581,7 +598,7 @@ def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optiona
         "- Prefer fewer excellent complete thoughts over padding the result to 20.\n"
         "- Avoid repeated lessons, examples, stories, claims, setups, and payoffs; maximize topical variety.\n\n"
         "PROCESS\n"
-        "1) First pass: determine main_theme + 3–8 key ideas.\n"
+        "1) First pass: classify content_type, determine main_theme, 3–8 key ideas, and useful topic keywords.\n"
         "2) Second pass: build a larger candidate pool across the beginning, middle, and end.\n"
         "3) Remove clips that overlap, repeat a point, lack their setup/payoff, or cut a sentence.\n"
         "4) Rank the remaining distinct candidates and return no more than 20.\n"
@@ -614,8 +631,10 @@ def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optiona
         "OUTPUT FORMAT (STRICT JSON ONLY)\n"
         "{\n"
         "  \"analysis\": {\n"
+        "    \"content_type\": \"church | podcast | livestream | interview | teaching | other\",\n"
         "    \"main_theme\": \"string\",\n"
-        "    \"key_ideas\": [\"string\", \"string\"]\n"
+        "    \"key_ideas\": [\"string\", \"string\"],\n"
+        "    \"keywords\": [\"string\", \"string\"]\n"
         "  },\n"
         "  \"segments\": [\n"
         "    {\n"
@@ -638,7 +657,8 @@ def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optiona
         "  ]\n"
         "}\n\n"
         "If nothing qualifies:\n"
-        "{ \"analysis\": {\"main_theme\": \"\", \"key_ideas\": []}, \"segments\": [] }\n"
+        "{ \"analysis\": {\"content_type\": \"other\", \"main_theme\": \"\", "
+        "\"key_ideas\": [], \"keywords\": []}, \"segments\": [] }\n"
     )
 
     def _mmss(seconds: float) -> str:
