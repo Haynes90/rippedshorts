@@ -45,6 +45,57 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
+    """Send one Telegram summary when the currently approved render queue drains."""
+    summary = None
+    with _LOCK, _telegram_db() as db:
+        row = db.execute(
+            "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if not row:
+            return
+        state = json.loads(row["state_json"])
+        reviews = dict(state.get("candidate_reviews") or {})
+        statuses = {
+            str(index): str(review.get("status") or "")
+            for index, review in reviews.items()
+            if str(review.get("status") or "")
+            in {"queued", "rendering", "rendered", "render_failed"}
+        }
+        active = sum(status in {"queued", "rendering"} for status in statuses.values())
+        rendered = sum(status == "rendered" for status in statuses.values())
+        failed = sum(status == "render_failed" for status in statuses.values())
+        if active or not (rendered or failed):
+            return
+        signature = json.dumps(statuses, sort_keys=True)
+        if state.get("render_queue_completion_signature") == signature:
+            return
+        state["render_queue_completion_signature"] = signature
+        db.execute(
+            "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+            (json.dumps(state), now(), request_id),
+        )
+        summary = (rendered, failed)
+
+    if summary:
+        rendered, failed = summary
+        folder_id = (
+            os.getenv("DRIVE_FOLDER_ID") or os.getenv("Drive_Folder_ID") or ""
+        ).strip()
+        folder_line = (
+            f"\nDrive folder: https://drive.google.com/drive/folders/{folder_id}"
+            if folder_id
+            else ""
+        )
+        send(
+            chat_id,
+            "✅ Current Ripped Shorts render queue complete"
+            f"\nRendered: {rendered}"
+            f"\nFailed: {failed}"
+            f"{folder_line}",
+        )
+
+
 def _csv_env(name: str) -> set[str]:
     return {item.strip() for item in os.getenv(name, "").split(",") if item.strip()}
 
@@ -447,6 +498,8 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
                 "user_id": user_id,
             }
             state["candidate_reviews"] = reviews
+            if verb == "approve":
+                state.pop("render_queue_completion_signature", None)
             db.execute(
                 "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
                 (
@@ -466,7 +519,11 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
                 render_status="queued",
             )
             RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
-            send(chat_id, f"Candidate {index + 1} approved and queued for rendering.")
+            send(
+                chat_id,
+                f"Candidate {index + 1} approved and queued for rendering. "
+                f"Up to {RENDER_EXECUTOR._max_workers} clips render at once; the rest wait.",
+            )
         else:
             _safe_log_candidate(
                 state,
@@ -521,6 +578,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(state), now(), request_id),
             )
+        send(chat_id, f"🎬 Candidate {index + 1} is now rendering.")
         candidate = state["result"]["segments"][index]
         user_id = str(
             (state.get("candidate_reviews") or {}).get(str(index), {}).get("user_id", "")
@@ -568,8 +626,10 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         )
         send(
             chat_id,
-            f"✅ Candidate {index + 1} rendered and uploaded:\n{clip.get('clip_url', '')}",
+            f"✅ Candidate {index + 1} rendered and uploaded to DRIVE_FOLDER_ID:\n"
+            f"{clip.get('clip_url', '')}",
         )
+        _notify_render_queue_complete(request_id, chat_id)
     except Exception as exc:
         logger.exception(
             "Candidate render failed request_id=%s candidate=%s", request_id, index + 1
@@ -604,6 +664,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         except Exception:
             logger.exception("Could not persist render failure")
         send(chat_id, f"❌ Candidate {index + 1} render failed:\n{str(exc)[:1500]}")
+        _notify_render_queue_complete(request_id, chat_id)
 
 
 
