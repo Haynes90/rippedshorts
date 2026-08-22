@@ -68,6 +68,30 @@ class TelegramParsingTests(unittest.TestCase):
     def test_existing_clipmaster_chat_is_reused(self):
         self.assertIn('os.getenv("TELEGRAM_CHAT_ID"', SOURCE)
 
+    def test_rapid_approvals_use_bounded_concurrent_render_pool(self):
+        self.assertIn("RIPPED_SHORTS_RENDER_WORKERS", SOURCE)
+        self.assertIn("RENDER_EXECUTOR.submit(_render_approved", SOURCE)
+        self.assertIn('"status": "queued"', SOURCE)
+
+    def test_candidate_decisions_are_logged_without_user_scores(self):
+        self.assertIn("def _log_candidate_decision", SOURCE)
+        self.assertIn('RIPPED_LOG_SHEET_TAB', SOURCE)
+        self.assertIn('"Ripped Shorts"', SOURCE)
+        log_function = ast.get_source_segment(
+            SOURCE,
+            next(
+                node
+                for node in TREE.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "_log_candidate_decision"
+            ),
+        )
+        self.assertNotIn('candidate.get("score"', log_function)
+
+    def test_concurrent_review_updates_reload_latest_state(self):
+        self.assertIn("latest_state", SOURCE)
+        self.assertIn("render_failed", SOURCE)
+
 
 if __name__ == "__main__":
     unittest.main()
