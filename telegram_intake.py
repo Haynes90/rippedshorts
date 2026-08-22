@@ -390,6 +390,33 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         send(chat_id, f"❌ Candidate {index + 1} render failed:\n{str(exc)[:1500]}")
 
 
+@router.get("/api/ripped-shorts/runtime-info")
+def ripped_shorts_runtime_info() -> dict:
+    audio_master_url = (os.getenv("AUDIO_MASTER_INTERNAL_URL") or "").strip()
+    if audio_master_url and "://" not in audio_master_url:
+        audio_master_url = f"https://{audio_master_url}"
+    return {
+        "service_role": os.getenv("SERVICE_ROLE", "").strip(),
+        "audio_master_internal_url": audio_master_url.rstrip("/"),
+        "audio_master_ingest_secret_set": bool(
+            os.getenv("AUDIO_MASTER_INGEST_SECRET")
+            or os.getenv("AUDIO_MASTER_WEBHOOK_SECRET")
+        ),
+        "drive_folder_id_set": bool(
+            os.getenv("DRIVE_FOLDER_ID") or os.getenv("Drive_Folder_ID")
+        ),
+        "google_credentials_set": bool(
+            os.getenv("GOOGLE_CREDENTIALS")
+            or (os.getenv("GOOGLE_CLIENT_EMAIL") and os.getenv("GOOGLE_PRIVATE_KEY"))
+        ),
+        "openai_key_set": bool(os.getenv("OPENAI_API_KEY")),
+        "telegram_bot_token_set": bool(os.getenv("TELEGRAM_BOT_TOKEN")),
+        "telegram_chat_id_set": bool(os.getenv("TELEGRAM_CHAT_ID")),
+        "ingestion_mode": "drive_id_reuse_then_audio_master",
+        "podhome_mode": "disabled_for_ripped_shorts_ingest",
+    }
+
+
 @router.post("/api/telegram/webhook")
 async def telegram_gateway(request: Request, x_telegram_bot_api_secret_token: str | None = Header(None)):
     """Clip Master owns Telegram and forwards only Ripped Shorts messages."""
