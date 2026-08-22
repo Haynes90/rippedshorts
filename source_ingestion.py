@@ -7,11 +7,13 @@ import binascii
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
 from googleapiclient.http import MediaFileUpload
 from yt_dlp import YoutubeDL
+import requests
 
 from google_drive import docs_service, download_drive_file, drive_service
 
@@ -183,6 +185,64 @@ def reuse_from_drive(video_id: str, workdir: Path) -> dict[str, Any]:
         "reused_transcript": bool(transcript_segments),
     }
 
+
+
+def ingest_with_audio_master(video_id: str, youtube_url: str) -> dict[str, Any]:
+    """Run Audio Master's cache/download/transcription path and wait for Drive assets."""
+    base = (os.getenv("AUDIO_MASTER_INTERNAL_URL") or "").strip().rstrip("/")
+    secret = (
+        os.getenv("AUDIO_MASTER_INGEST_SECRET")
+        or os.getenv("AUDIO_MASTER_WEBHOOK_SECRET")
+        or ""
+    ).strip()
+    if not base or not secret:
+        raise RuntimeError(
+            "Audio Master ingestion is not configured. Set AUDIO_MASTER_INTERNAL_URL "
+            "and AUDIO_MASTER_INGEST_SECRET in Ripped Shorts."
+        )
+    headers = {"x-ripped-shorts-ingest-secret": secret}
+    response = requests.post(
+        f"{base}/api/ripped-shorts/ingest",
+        json={"video_id": video_id, "youtube_url": youtube_url, "title": video_id},
+        headers=headers,
+        timeout=(10, 60),
+    )
+    if response.status_code not in {200, 202}:
+        raise RuntimeError(f"Audio Master ingest failed ({response.status_code}): {response.text[:1000]}")
+    accepted = response.json()
+    job_id = str(accepted.get("job_id") or "")
+    if not job_id:
+        raise RuntimeError(f"Audio Master ingest returned no job_id: {accepted}")
+
+    timeout_seconds = max(60, int(os.getenv("AUDIO_MASTER_INGEST_TIMEOUT_SECONDS", "5400")))
+    poll_seconds = max(3, int(os.getenv("AUDIO_MASTER_INGEST_POLL_SECONDS", "15")))
+    deadline = time.monotonic() + timeout_seconds
+    last: dict[str, Any] = accepted
+    while time.monotonic() < deadline:
+        status_response = requests.get(
+            f"{base}/api/ripped-shorts/ingest/{job_id}",
+            headers=headers,
+            timeout=(10, 60),
+        )
+        if status_response.status_code != 200:
+            raise RuntimeError(
+                f"Audio Master status failed ({status_response.status_code}): {status_response.text[:1000]}"
+            )
+        last = status_response.json()
+        status = str(last.get("status") or "").lower()
+        if status in {"failed", "error", "download_failed", "transcription_failed"}:
+            raise RuntimeError(f"Audio Master ingestion failed: {last.get('error') or last}")
+        transcript = last.get("transcript") or {}
+        source_video = last.get("source_video") or {}
+        transcript_ready = bool(transcript.get("drive_files"))
+        source_ready = bool(source_video.get("drive_file_id")) or source_video.get("status") == "ready"
+        if transcript_ready and source_ready:
+            return last
+        time.sleep(poll_seconds)
+    raise RuntimeError(
+        f"Audio Master ingestion timed out after {timeout_seconds}s; "
+        f"last status={last.get('status')}, job_id={job_id}"
+    )
 
 def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -> Path:
     """Use Audio Master's yt-dlp fallback pattern instead of a paid download API."""
