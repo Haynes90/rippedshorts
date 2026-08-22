@@ -876,6 +876,19 @@ def _process(request_id: str) -> None:
                 else:
                     state.setdefault("warnings", []).append("Approved sermon boundary did not contain reusable transcript segments.")
 
+        if row["mode"] in {"topics", "both"}:
+            state = _process_topics(
+                request_id,
+                state,
+                chat_id,
+                video_id,
+                video,
+                segments,
+                reused,
+            )
+            if row["mode"] == "topics":
+                return
+
         force_rerip = bool(state.get("force_rerip"))
         reuse_existing = bool(state.get("reuse_existing"))
         approved_clips: list[dict[str, Any]] = []
@@ -1044,11 +1057,6 @@ def _process(request_id: str) -> None:
         ) + 1
         for offset, clip in enumerate(new_segments):
             clip["candidate_number"] = next_number + offset
-
-        if row["mode"] == "topics":
-            raise RuntimeError(
-                "Topic-only Telegram processing requires the dual-lane selector before rendering"
-            )
 
         combined = approved_clips + new_segments
         result["segments"] = combined
