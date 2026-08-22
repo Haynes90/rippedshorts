@@ -599,7 +599,9 @@ def _process(request_id: str) -> None:
         enriched = [{**item, "video_id": state["parsed"].get("video_id", "drive-source")} for item in segments]
         result = main.call_openai_for_clips(enriched, None)
         result = validate_complete_candidates(result, enriched)
-        result["segments"] = select_non_overlapping(result.get("segments", []), limit=20)
+        result["segments"] = select_non_overlapping(
+            result.get("segments", []), limit=20, allow_overlap=True
+        )
         # Existing renderer is shorts-only. Topic requests are retained for the dual-lane selector.
         if row["mode"] == "topics":
             raise RuntimeError("Topic-only Telegram processing requires the dual-lane selector before rendering")
