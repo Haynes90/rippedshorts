@@ -370,6 +370,36 @@ def _approved_clip_history_from_sheet(video_id: str) -> dict[str, list[dict[str,
     }
 
 
+def _reviewed_short_history_from_sheet(video_id: str) -> list[dict[str, Any]]:
+    """Return distinct reviewed shorts, including approvals and rejections."""
+    import main
+
+    _, _, sheets = main.get_google_services()
+    response = sheets.spreadsheets().values().get(
+        spreadsheetId=RIPPED_LOG_SHEET_ID,
+        range=f"'{RIPPED_LOG_SHEET_TAB}'!A:U",
+    ).execute()
+    rows = response.get("values", [])
+    found: dict[tuple[float, float], dict[str, Any]] = {}
+    for values in rows[1:]:
+        padded = list(values) + [""] * (21 - len(values))
+        if str(padded[2]).strip() != video_id:
+            continue
+        try:
+            start, end = float(padded[9]), float(padded[10])
+            number = int(float(padded[8]))
+        except (TypeError, ValueError):
+            continue
+        found[(start, end)] = {
+            "start": start,
+            "end": end,
+            "transcript": str(padded[13]).strip(),
+            "decision": str(padded[15]).strip().lower(),
+            "candidate_number": number,
+        }
+    return sorted(found.values(), key=lambda item: item["candidate_number"])
+
+
 def _safe_log_candidate(*args, **kwargs) -> None:
     try:
         _log_candidate_decision(*args, **kwargs)
@@ -377,15 +407,25 @@ def _safe_log_candidate(*args, **kwargs) -> None:
         logger.exception("Ripped Shorts decision log failed: %s", exc)
 
 
-def _send_candidates(chat_id: str, request_id: str, result: dict) -> None:
+def _send_candidates(
+    chat_id: str, request_id: str, result: dict, *, start_index: int = 0
+) -> None:
     clips = result.get("segments", [])
-    send(chat_id, f"✅ Analysis complete\nJob ID: {request_id}\nComplete-thought candidates: {len(clips)}\n\nNothing has been rendered yet. Approve only the clips you want created.")
-    for index, clip in enumerate(clips, 1):
+    review_count = max(0, len(clips) - start_index)
+    send(
+        chat_id,
+        f"✅ Analysis complete\nJob ID: {request_id}\n"
+        f"New shorts for review: {review_count}\n\n"
+        "Approve only the shorts you want created.",
+    )
+    for zero_index in range(start_index, len(clips)):
+        clip = clips[zero_index]
+        short_number = int(clip.get("candidate_number") or zero_index + 1)
         transcript = str(clip.get("transcript", "")).strip()
         if len(transcript) > 2600:
             transcript = transcript[:2597] + "..."
         text = (
-            f"Candidate {index} of {len(clips)}\n\n"
+            f"Short {short_number}\n\n"
             f"Time: {_timecode(float(clip['start']))}–{_timecode(float(clip['end']))}\n"
             f"Duration: {round(float(clip['duration']))} seconds\n"
             f"Category: {clip.get('category', 'social clip')}\n"
@@ -398,8 +438,8 @@ def _send_candidates(chat_id: str, request_id: str, result: dict) -> None:
             "text": text,
             "disable_web_page_preview": True,
             "reply_markup": {"inline_keyboard": [[
-                {"text": "✅ Approve & Render", "callback_data": f"rs:approve:{request_id}:{index-1}"},
-                {"text": "❌ Reject", "callback_data": f"rs:reject:{request_id}:{index-1}"},
+                {"text": "✅ Approve & Render", "callback_data": f"rs:approve:{request_id}:{zero_index}"},
+                {"text": "❌ Reject", "callback_data": f"rs:reject:{request_id}:{zero_index}"},
             ]]},
         })
 
@@ -524,90 +564,181 @@ def _process(request_id: str) -> None:
                 else:
                     state.setdefault("warnings", []).append("Approved sermon boundary did not contain reusable transcript segments.")
 
+        approved_clips: list[dict[str, Any]] = []
+        rendered_clips: list[dict[str, Any]] = []
+        prior_shorts: list[dict[str, Any]] = []
         if row["source_kind"] == "youtube":
             approval_history = _approved_clip_history_from_sheet(video_id)
             approved_clips = approval_history["unfinished"]
             rendered_clips = approval_history["rendered"]
-            if approved_clips:
-                reviews = {
-                    str(index): {
-                        "status": "queued",
-                        "reviewed_at": clip.get("_reviewed_at") or now(),
-                        "user_id": clip.get("_reviewer_user_id", ""),
-                        "recovered_from_sheet": True,
+            prior_shorts = _reviewed_short_history_from_sheet(video_id)
+
+            # Ten reviewed shorts is enough history to treat this ID as already
+            # discovered. Below ten, search again for additional distinct shorts.
+            if len(prior_shorts) >= 10:
+                if approved_clips:
+                    reviews = {
+                        str(index): {
+                            "status": "queued",
+                            "reviewed_at": clip.get("_reviewed_at") or now(),
+                            "user_id": clip.get("_reviewer_user_id", ""),
+                            "recovered_from_sheet": True,
+                        }
+                        for index, clip in enumerate(approved_clips)
                     }
-                    for index, clip in enumerate(approved_clips)
-                }
-                recovered_result = {
-                    "analysis": {"content_type": "", "main_theme": "", "key_ideas": [], "keywords": []},
-                    "segments": approved_clips,
-                }
-                recovered_state = {
-                    **state,
-                    "stage": "awaiting_review",
-                    "video_path": str(video),
-                    "source_reused": reused,
-                    "result": recovered_result,
-                    "candidate_reviews": reviews,
-                    "recovered_approvals_from_sheet": True,
-                }
-                _save(request_id, "awaiting_review", recovered_state)
-                send(
-                    chat_id,
-                    f"♻️ Recovered {len(approved_clips)} approved unfinished clip(s) "
-                    f"for YouTube ID {video_id} from the Ripped Shorts sheet. "
-                    "Rendering only those approved clips now."
-                    + (
-                        f" {len(rendered_clips)} previously rendered clip(s) were skipped."
-                        if rendered_clips
-                        else ""
-                    ),
-                )
-                for index in range(len(approved_clips)):
-                    RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
-                return
-            if rendered_clips:
-                existing_links = [
-                    str(clip.get("_clip_url") or "")
-                    for clip in rendered_clips
-                    if clip.get("_clip_url")
-                ]
-                _save(
-                    request_id,
-                    "already_rendered",
-                    {
+                    recovered_result = {
+                        "analysis": {
+                            "content_type": "",
+                            "main_theme": "",
+                            "key_ideas": [],
+                            "keywords": [],
+                        },
+                        "segments": approved_clips,
+                    }
+                    recovered_state = {
                         **state,
-                        "stage": "already_rendered",
+                        "stage": "awaiting_review",
                         "video_path": str(video),
                         "source_reused": reused,
-                        "existing_clip_links": existing_links,
-                    },
-                )
-                links_text = "\n".join(existing_links[:20])
-                send(
-                    chat_id,
-                    f"✅ YouTube ID {video_id} has already been clipped. "
-                    f"Found {len(rendered_clips)} rendered approved clip(s) in the "
-                    "Ripped Shorts sheet, so GPT selection was not run again."
-                    + (f"\n\n{links_text}" if links_text else ""),
-                )
-                return
+                        "result": recovered_result,
+                        "candidate_reviews": reviews,
+                        "recovered_approvals_from_sheet": True,
+                    }
+                    _save(request_id, "awaiting_review", recovered_state)
+                    send(
+                        chat_id,
+                        f"♻️ Recovered {len(approved_clips)} approved unfinished short(s) "
+                        f"for YouTube ID {video_id}. Rendering only those shorts now.",
+                    )
+                    for index in range(len(approved_clips)):
+                        RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
+                    return
+                if rendered_clips:
+                    existing_links = [
+                        str(clip.get("_clip_url") or "")
+                        for clip in rendered_clips
+                        if clip.get("_clip_url")
+                    ]
+                    _save(
+                        request_id,
+                        "already_rendered",
+                        {
+                            **state,
+                            "stage": "already_rendered",
+                            "video_path": str(video),
+                            "source_reused": reused,
+                            "existing_clip_links": existing_links,
+                        },
+                    )
+                    links_text = "\n".join(existing_links[:20])
+                    send(
+                        chat_id,
+                        f"✅ YouTube ID {video_id} already has "
+                        f"{len(prior_shorts)} reviewed shorts in the sheet, so GPT "
+                        "selection was not run again."
+                        + (f"\n\n{links_text}" if links_text else ""),
+                    )
+                    return
 
-        _save(request_id, "selecting", {**state, "stage": "selection", "video_path": str(video), "source_reused": reused})
-        send(chat_id, "🧠 Reviewing the full eligible transcript and selecting up to 20 distinct, non-overlapping complete thoughts.")
-        import main
-        enriched = [{**item, "video_id": state["parsed"].get("video_id", "drive-source")} for item in segments]
-        result = main.call_openai_for_clips(enriched, None)
-        result = validate_complete_candidates(result, enriched)
-        result["segments"] = select_non_overlapping(
-            result.get("segments", []), limit=20, allow_overlap=True
+        prior_count = len(prior_shorts)
+        needed = max(1, 20 - prior_count)
+        _save(
+            request_id,
+            "selecting",
+            {
+                **state,
+                "stage": "selection",
+                "video_path": str(video),
+                "source_reused": reused,
+            },
         )
-        # Existing renderer is shorts-only. Topic requests are retained for the dual-lane selector.
+        if prior_count:
+            send(
+                chat_id,
+                f"🧠 Only {prior_count} previously reviewed short(s) were found for "
+                f"{video_id}. Searching again for up to {needed} additional distinct shorts.",
+            )
+        else:
+            send(
+                chat_id,
+                "🧠 Reviewing the full eligible transcript and targeting approximately "
+                "20 distinct complete shorts.",
+            )
+        import main
+        enriched = [
+            {**item, "video_id": state["parsed"].get("video_id", "drive-source")}
+            for item in segments
+        ]
+        prior_summary = "\n".join(
+            f"- {item['start']:.2f}-{item['end']:.2f}: {item.get('transcript', '')}"
+            for item in prior_shorts
+        )
+        supplemental = (
+            f"Find up to {needed} ADDITIONAL distinct shorts. Do not repeat any "
+            "complete thought, lesson, payoff, or transcript below. Time overlap is "
+            "allowed only when the new short is materially different.\n"
+            f"PREVIOUSLY REVIEWED SHORTS:\n{prior_summary[:12000]}"
+            if prior_shorts
+            else None
+        )
+        result = main.call_openai_for_clips(enriched, supplemental)
+        result = validate_complete_candidates(result, enriched)
+        prior_texts = {
+            " ".join(str(item.get("transcript", "")).lower().split())
+            for item in prior_shorts
+            if item.get("transcript")
+        }
+        new_segments = [
+            clip
+            for clip in result.get("segments", [])
+            if " ".join(str(clip.get("transcript", "")).lower().split())
+            not in prior_texts
+        ]
+        new_segments = select_non_overlapping(
+            new_segments, limit=needed, allow_overlap=True
+        )
+        next_number = max(
+            [int(item.get("candidate_number") or 0) for item in prior_shorts] or [0]
+        ) + 1
+        for offset, clip in enumerate(new_segments):
+            clip["candidate_number"] = next_number + offset
+
         if row["mode"] == "topics":
-            raise RuntimeError("Topic-only Telegram processing requires the dual-lane selector before rendering")
-        clips = result.get("segments", [])
-        _save(request_id, "awaiting_review", {**state, "stage": "awaiting_review", "video_path": str(video), "source_reused": reused, "result": result, "candidate_reviews": {}})
-        _send_candidates(chat_id, request_id, result)
+            raise RuntimeError(
+                "Topic-only Telegram processing requires the dual-lane selector before rendering"
+            )
+
+        combined = approved_clips + new_segments
+        result["segments"] = combined
+        reviews = {
+            str(index): {
+                "status": "queued",
+                "reviewed_at": clip.get("_reviewed_at") or now(),
+                "user_id": clip.get("_reviewer_user_id", ""),
+                "recovered_from_sheet": True,
+            }
+            for index, clip in enumerate(approved_clips)
+        }
+        final_state = {
+            **state,
+            "stage": "awaiting_review",
+            "video_path": str(video),
+            "source_reused": reused,
+            "result": result,
+            "candidate_reviews": reviews,
+        }
+        _save(request_id, "awaiting_review", final_state)
+        if approved_clips:
+            send(
+                chat_id,
+                f"♻️ Resuming {len(approved_clips)} previously approved unfinished "
+                "short(s) while presenting additional shorts for review.",
+            )
+            for index in range(len(approved_clips)):
+                RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
+        _send_candidates(
+            chat_id, request_id, result, start_index=len(approved_clips)
+        )
     except Exception as exc:
         _save(request_id, "error", {**state, "stage": "error", "error_type": type(exc).__name__, "error": str(exc), "retryable": True})
         send(chat_id, f"❌ Processing failed\nJob ID: {request_id}\n{str(exc)[:1500]}\n\nSend /retry {request_id} to try again.")
@@ -643,7 +774,7 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
                 return {
                     "status": f"already_{existing_status}",
                     "request_id": request_id,
-                    "candidate_index": index,
+                    "short_index": index,
                 }
             reviews[str(index)] = {
                 "status": "queued" if verb == "approve" else "reject",
@@ -674,7 +805,7 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
             RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
             send(
                 chat_id,
-                f"Candidate {index + 1} approved and queued for rendering. "
+                f"Short {index + 1} approved and queued for rendering. "
                 f"Up to {RIPPED_SHORTS_RENDER_WORKERS} clips render at once; the rest wait.\n"
                 f"{_render_progress_text(request_id)}",
             )
@@ -687,8 +818,8 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
                 user_id,
                 render_status="not_rendered",
             )
-            send(chat_id, f"Candidate {index + 1} rejected.")
-        return {"status": verb, "request_id": request_id, "candidate_index": index}
+            send(chat_id, f"Short {index + 1} rejected.")
+        return {"status": verb, "request_id": request_id, "short_index": index}
     retry_match = re.fullmatch(r"/retry\s+([A-Za-z0-9-]+)", text, re.I)
     if retry_match:
         request_id = retry_match.group(1)
@@ -734,7 +865,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             )
         send(
             chat_id,
-            f"🎬 Candidate {index + 1} is now rendering.\n"
+            f"🎬 Short {index + 1} is now rendering.\n"
             f"{_render_progress_text(request_id)}",
         )
         candidate = state["result"]["segments"][index]
@@ -786,14 +917,14 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         )
         send(
             chat_id,
-            f"✅ Candidate {index + 1} rendered and uploaded to DRIVE_FOLDER_ID:\n"
+            f"✅ Short {index + 1} rendered and uploaded to DRIVE_FOLDER_ID:\n"
             f"{clip.get('clip_url', '')}\n"
             f"{_render_progress_text(request_id)}",
         )
         _notify_render_queue_complete(request_id, chat_id)
     except Exception as exc:
         logger.exception(
-            "Candidate render failed request_id=%s candidate=%s", request_id, index + 1
+            "Short render failed request_id=%s candidate=%s", request_id, index + 1
         )
         try:
             with _LOCK, _telegram_db() as db:
@@ -826,7 +957,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             logger.exception("Could not persist render failure")
         send(
             chat_id,
-            f"❌ Candidate {index + 1} render failed:\n{str(exc)[:1500]}\n"
+            f"❌ Short {index + 1} render failed:\n{str(exc)[:1500]}\n"
             f"{_render_progress_text(request_id)}",
         )
         _notify_render_queue_complete(request_id, chat_id)

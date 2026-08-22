@@ -382,84 +382,177 @@ def _probe_video_dimensions(video_path: Path) -> tuple[int, int]:
     return width, height
 
 
-def _estimate_speaker_center_x(video_path: Path, start: float, duration: float) -> float:
-    """Estimate the speaker position without making face detection a render gate."""
+def _load_face_cascade():
     import cv2
+
+    candidates = [
+        Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml",
+        Path("/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"),
+        Path("/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml"),
+    ]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        cascade = cv2.CascadeClassifier(str(path))
+        if not cascade.empty():
+            logger.info("OpenCV speaker tracker face model=%s", path)
+            return cascade
+    logger.warning("OpenCV face model unavailable; motion/center tracking will be used")
+    return None
+
+
+def _motion_center(previous_gray, gray) -> Optional[float]:
+    import cv2
+    import numpy as np
+
+    if previous_gray is None or previous_gray.shape != gray.shape:
+        return None
+    delta = cv2.absdiff(previous_gray, gray)
+    delta = cv2.GaussianBlur(delta, (9, 9), 0)
+    _, mask = cv2.threshold(delta, 24, 255, cv2.THRESH_BINARY)
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, np.ones((7, 7), dtype=np.uint8)
+    )
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    meaningful = [contour for contour in contours if cv2.contourArea(contour) >= 400]
+    if not meaningful:
+        return None
+    weighted_x = 0.0
+    total_area = 0.0
+    for contour in meaningful:
+        area = float(cv2.contourArea(contour))
+        x, _, width, _ = cv2.boundingRect(contour)
+        weighted_x += (x + width / 2) * area
+        total_area += area
+    return (weighted_x / total_area) / gray.shape[1] if total_area else None
+
+
+def _estimate_speaker_track(
+    video_path: Path, start: float, duration: float
+) -> list[tuple[float, float]]:
+    """Track the foreground/active face and return smoothed time/center samples."""
+    import cv2
+    import numpy as np
 
     cap = cv2.VideoCapture(str(video_path))
     cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
-    centers = []
-    total_samples = max(1, int(min(duration, 30) * 2))
-    step = max(1, int(cap.get(cv2.CAP_PROP_FPS) // 2 or 1))
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    sample_seconds = max(0.5, float(os.getenv("SPEAKER_TRACK_SAMPLE_SECONDS", "1.0")))
+    frame_step = max(1, int(round(fps * sample_seconds)))
+    total_frames = max(1, int(round(duration * fps)))
+    cascade = _load_face_cascade()
+    samples: list[tuple[float, float]] = []
+    previous_gray = None
+    previous_center = 0.5
+    previous_box = None
+    smoothed_center = 0.5
+    frame_number = 0
 
-    detector = None
-    try:
-        # Some MediaPipe wheels no longer export solutions at package level.
-        from mediapipe.python.solutions import face_detection
-
-        detector = face_detection.FaceDetection(
-            model_selection=0, min_detection_confidence=0.5
-        )
-    except (ImportError, AttributeError, RuntimeError) as exc:
-        logger.warning(
-            "MediaPipe face detection unavailable; using OpenCV/center crop: %s", exc
-        )
-
-    cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-    cascade = (
-        cv2.CascadeClassifier(str(cascade_path))
-        if cascade_path.is_file()
-        else None
-    )
-    if cascade is None or cascade.empty():
-        cascade = None
-        logger.info("OpenCV face cascade unavailable; using safe center crop fallback")
-    frame_index = 0
-    while len(centers) < total_samples:
+    while frame_number <= total_frames:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(round(start * fps)) + frame_number)
         ok, frame = cap.read()
         if not ok:
             break
-        if frame_index % step == 0:
-            center = None
-            if detector is not None:
-                try:
-                    results = detector.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                    if results.detections:
-                        box = results.detections[0].location_data.relative_bounding_box
-                        center = box.xmin + box.width / 2
-                except Exception as exc:
-                    logger.warning("MediaPipe frame detection failed; falling back: %s", exc)
-                    detector.close()
-                    detector = None
-            if center is None and cascade is not None:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                faces = cascade.detectMultiScale(
-                    gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40)
+        scale = min(1.0, 720.0 / max(frame.shape[:2]))
+        analysis_frame = (
+            cv2.resize(frame, None, fx=scale, fy=scale)
+            if scale < 1.0
+            else frame
+        )
+        gray = cv2.cvtColor(analysis_frame, cv2.COLOR_BGR2GRAY)
+        faces = []
+        if cascade is not None:
+            faces = list(
+                cascade.detectMultiScale(
+                    gray,
+                    scaleFactor=1.1,
+                    minNeighbors=5,
+                    minSize=(40, 40),
                 )
-                if len(faces):
-                    x, _, width, _ = max(faces, key=lambda face: face[2] * face[3])
-                    center = (x + width / 2) / frame.shape[1]
-            if center is not None:
-                centers.append(max(0.0, min(1.0, float(center))))
-        frame_index += 1
+            )
+
+        selected = None
+        selected_score = -1.0
+        frame_area = float(gray.shape[0] * gray.shape[1])
+        for x, y, width, height in faces:
+            center = (x + width / 2) / gray.shape[1]
+            area_score = (width * height) / frame_area
+            continuity = max(0.0, 1.0 - abs(center - previous_center) / 0.35)
+            motion_score = 0.0
+            if previous_gray is not None and previous_gray.shape == gray.shape:
+                y2, x2 = min(gray.shape[0], y + height), min(gray.shape[1], x + width)
+                if y2 > y and x2 > x:
+                    motion_score = float(
+                        np.mean(cv2.absdiff(previous_gray[y:y2, x:x2], gray[y:y2, x:x2]))
+                    ) / 255.0
+            foreground = min(1.0, area_score * 30.0)
+            score = foreground * 2.5 + motion_score * 3.0 + continuity * 1.5
+            if previous_box is not None:
+                px, py, pw, ph = previous_box
+                if abs(center - previous_center) < 0.12:
+                    score += 0.75
+            if score > selected_score:
+                selected_score = score
+                selected = (center, (x, y, width, height))
+
+        if selected is not None:
+            target_center, previous_box = selected
+        else:
+            target_center = _motion_center(previous_gray, gray)
+            if target_center is None:
+                target_center = previous_center
+
+        # Dead zone and exponential smoothing prevent jitter and abrupt face switches.
+        if abs(target_center - smoothed_center) < 0.025:
+            target_center = smoothed_center
+        smoothed_center = 0.72 * smoothed_center + 0.28 * target_center
+        smoothed_center = max(0.0, min(1.0, smoothed_center))
+        previous_center = smoothed_center
+        samples.append((frame_number / fps, smoothed_center))
+        previous_gray = gray
+        frame_number += frame_step
 
     cap.release()
-    if detector is not None:
-        detector.close()
-    if centers:
-        return sum(centers) / len(centers)
-    logger.info("No face detected for clip; using safe center crop")
-    return 0.5
+    if not samples:
+        return [(0.0, 0.5), (max(duration, 0.1), 0.5)]
+    if samples[-1][0] < duration:
+        samples.append((duration, samples[-1][1]))
+    return samples
+
+
+def _piecewise_crop_expression(
+    samples: list[tuple[float, float]], width: int, target_width: int
+) -> str:
+    positions = [
+        (
+            timestamp,
+            max(
+                0,
+                min(
+                    width - target_width,
+                    int(center * width) - target_width // 2,
+                ),
+            ),
+        )
+        for timestamp, center in samples
+    ]
+    expression = str(positions[-1][1])
+    for index in range(len(positions) - 2, -1, -1):
+        t0, x0 = positions[index]
+        t1, x1 = positions[index + 1]
+        span = max(0.001, t1 - t0)
+        interpolated = f"{x0}+({x1 - x0})*(t-{t0:.3f})/{span:.3f}"
+        expression = f"if(lt(t,{t1:.3f}),{interpolated},{expression})"
+    return expression
+
 
 def _build_crop_filter(video_path: Path, start: float, duration: float) -> str:
     width, height = _probe_video_dimensions(video_path)
     target_width = min(width, int(height * 9 / 16))
     target_width = max(2, target_width - (target_width % 2))
-    center_ratio = _estimate_speaker_center_x(video_path, start, duration)
-    center_x = int(center_ratio * width)
-    crop_x = max(0, min(width - target_width, center_x - target_width // 2))
-    return f"crop={target_width}:{height}:{crop_x}:0"
-
+    samples = _estimate_speaker_track(video_path, start, duration)
+    crop_expression = _piecewise_crop_expression(samples, width, target_width)
+    return f"crop={target_width}:{height}:x='{crop_expression}':y=0"
 
 def create_clip_file(video_path: Path, start: float, duration: float, output_path: Path) -> None:
     crop_filter = _build_crop_filter(video_path, start, duration)
@@ -568,7 +661,7 @@ def attach_clip_assets(
 
 
 def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optional[str]) -> str:
-    base_prompt = prompt_override or (
+    base_prompt = (
         "TASK\n"
         "You are a highlight editor for ANY type of content. Review the ENTIRE transcript in chronological order "
         "and select the best short-form clips.\n"
@@ -664,6 +757,12 @@ def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optiona
         "{ \"analysis\": {\"content_type\": \"other\", \"main_theme\": \"\", "
         "\"key_ideas\": [], \"keywords\": []}, \"segments\": [] }\n"
     )
+    if prompt_override:
+        base_prompt += (
+            "\n\nADDITIONAL DISCOVERY REQUIREMENTS\n"
+            + str(prompt_override).strip()
+            + "\n"
+        )
 
     def _mmss(seconds: float) -> str:
         minutes = int(seconds // 60)
