@@ -434,6 +434,13 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
             ).fetchone()
             state = json.loads(current["state_json"])
             reviews = dict(state.get("candidate_reviews") or {})
+            existing_status = (reviews.get(str(index)) or {}).get("status")
+            if verb == "approve" and existing_status in {"queued", "rendering", "rendered"}:
+                return {
+                    "status": f"already_{existing_status}",
+                    "request_id": request_id,
+                    "candidate_index": index,
+                }
             reviews[str(index)] = {
                 "status": "queued" if verb == "approve" else "reject",
                 "reviewed_at": now(),
@@ -502,6 +509,18 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         if not row:
             raise RuntimeError(f"Ripped Shorts request not found: {request_id}")
         state = json.loads(row["state_json"])
+        reviews = dict(state.get("candidate_reviews") or {})
+        reviews[str(index)] = {
+            **reviews.get(str(index), {}),
+            "status": "rendering",
+            "render_started_at": now(),
+        }
+        state["candidate_reviews"] = reviews
+        with _LOCK, _telegram_db() as db:
+            db.execute(
+                "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+                (json.dumps(state), now(), request_id),
+            )
         candidate = state["result"]["segments"][index]
         user_id = str(
             (state.get("candidate_reviews") or {}).get(str(index), {}).get("user_id", "")
