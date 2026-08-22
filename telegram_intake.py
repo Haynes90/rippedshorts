@@ -30,9 +30,10 @@ YOUTUBE_RE = re.compile(r"https?://(?:www\.)?(?:youtube\.com/(?:watch\?[^\s]*v=|
 DRIVE_RE = re.compile(r"https?://drive\.google\.com/(?:file/d/|open\?id=|uc\?(?:[^\s]*&)?id=)([A-Za-z0-9_-]+)", re.I)
 _LOCK = threading.RLock()
 logger = logging.getLogger("ripped-shorts.telegram")
-RENDER_EXECUTOR = ThreadPoolExecutor(
-    max_workers=max(1, int(os.getenv("RIPPED_SHORTS_RENDER_WORKERS", "3")))
+RIPPED_SHORTS_RENDER_WORKERS = max(
+    1, int(os.getenv("RIPPED_SHORTS_RENDER_WORKERS", "3"))
 )
+RENDER_EXECUTOR = ThreadPoolExecutor(max_workers=RIPPED_SHORTS_RENDER_WORKERS)
 RIPPED_LOG_SHEET_ID = (
     os.getenv("RIPPED_SHORTS_LOG_SHEET_ID")
     or os.getenv("PODCAST_SHEET_ID")
@@ -522,7 +523,7 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
             send(
                 chat_id,
                 f"Candidate {index + 1} approved and queued for rendering. "
-                f"Up to {RENDER_EXECUTOR._max_workers} clips render at once; the rest wait.",
+                f"Up to {RIPPED_SHORTS_RENDER_WORKERS} clips render at once; the rest wait.",
             )
         else:
             _safe_log_candidate(
