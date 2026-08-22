@@ -548,6 +548,246 @@ def _transcribe(video_path: Path) -> list[dict]:
     return result
 
 
+def _topic_break_suggestions(transcript_segments: list[dict]) -> list[dict]:
+    """Ask OpenAI for semantic chapter boundaries; the local planner enforces coverage."""
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return []
+    lines = []
+    for item in transcript_segments:
+        start = float(item.get("start", 0))
+        end = float(item.get("end", start + float(item.get("duration", 0))))
+        text = str(item.get("text", "")).replace("\n", " ").strip()
+        lines.append(f"[{start:.2f}-{end:.2f}] {text}")
+    prompt = (
+        "Divide this full transcript into coherent horizontal-video sections for "
+        "YouTube and Facebook. Identify changes in point, subject, story, or tangent. "
+        "Aim near 8 minutes per section. Every boundary must be between complete "
+        "sentences or thoughts. Do not omit any part of the eligible timeline and do "
+        "not overlap sections. Return strict JSON only as "
+        '{"segments":[{"start":0,"end":480,"title":"...","summary":"..."}]}. '
+        "Use only exact transcript timestamps.\n\n"
+        + "\n".join(lines)
+    )
+    payload = {
+        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "messages": [
+            {"role": "system", "content": "Return strict JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    timeout = max(180, int(os.getenv("OPENAI_TOPIC_TIMEOUT_SECONDS", "600")))
+    last_error = None
+    for attempt in range(1, 3):
+        try:
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=(15, timeout),
+            )
+            if response.status_code == 200:
+                data = response.json()["choices"][0]["message"]["content"].strip()
+                if data.startswith("```"):
+                    data = "\n".join(data.splitlines()[1:-1]).strip()
+                parsed = json.loads(data)
+                return parsed.get("segments", []) if isinstance(parsed, dict) else []
+            last_error = f"HTTP {response.status_code}: {response.text[:500]}"
+        except Exception as exc:
+            last_error = str(exc)
+        if attempt < 2:
+            import time
+            time.sleep(3)
+    logger.warning("Semantic 16:9 boundary selection failed; using transcript fallback: %s", last_error)
+    return []
+
+
+def _build_contiguous_topic_segments(
+    transcript_segments: list[dict], suggestions: list[dict]
+) -> list[dict]:
+    """Create contiguous, non-overlapping >3 minute sections targeting eight minutes."""
+    ordered = sorted(transcript_segments, key=lambda item: float(item.get("start", 0)))
+    if not ordered:
+        return []
+    timeline_start = float(ordered[0].get("start", 0))
+    timeline_end = float(
+        ordered[-1].get(
+            "end",
+            float(ordered[-1].get("start", 0))
+            + float(ordered[-1].get("duration", 0)),
+        )
+    )
+    total = timeline_end - timeline_start
+    minimum = max(181.0, float(os.getenv("TOPIC_SEGMENT_MIN_SECONDS", "181")))
+    target = max(minimum, float(os.getenv("TOPIC_SEGMENT_TARGET_SECONDS", "480")))
+    maximum = max(target, float(os.getenv("TOPIC_SEGMENT_MAX_SECONDS", "720")))
+    if total < minimum:
+        return []
+
+    segment_count = max(1, round(total / target))
+    while segment_count > 1 and total / segment_count < minimum:
+        segment_count -= 1
+    while total / segment_count > maximum:
+        segment_count += 1
+
+    transcript_ends = [
+        float(
+            item.get(
+                "end",
+                float(item.get("start", 0)) + float(item.get("duration", 0)),
+            )
+        )
+        for item in ordered[:-1]
+    ]
+    suggested_ends = []
+    for item in suggestions:
+        try:
+            value = float(item.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if timeline_start < value < timeline_end:
+            suggested_ends.append(value)
+
+    boundaries = [timeline_start]
+    for index in range(1, segment_count):
+        desired = timeline_start + total * index / segment_count
+        low = boundaries[-1] + minimum
+        high = timeline_end - minimum * (segment_count - index)
+        semantic = [value for value in suggested_ends if low <= value <= high]
+        if semantic:
+            boundary = min(semantic, key=lambda value: abs(value - desired))
+        else:
+            valid_ends = [value for value in transcript_ends if low <= value <= high]
+            if not valid_ends:
+                boundary = desired
+            else:
+                boundary = min(valid_ends, key=lambda value: abs(value - desired))
+        boundaries.append(boundary)
+    boundaries.append(timeline_end)
+
+    results = []
+    for index in range(len(boundaries) - 1):
+        start, end = boundaries[index], boundaries[index + 1]
+        included = []
+        for item in ordered:
+            seg_start = float(item.get("start", 0))
+            seg_end = float(
+                item.get("end", seg_start + float(item.get("duration", 0)))
+            )
+            if seg_start >= start - 0.75 and seg_end <= end + 0.75:
+                included.append(str(item.get("text", "")).strip())
+        midpoint = (start + end) / 2
+        matching = []
+        for item in suggestions:
+            try:
+                item_start = float(item.get("start", start))
+                item_end = float(item.get("end", end))
+            except (TypeError, ValueError):
+                continue
+            if item_start <= midpoint <= item_end:
+                matching.append(item)
+        metadata = matching[0] if matching else {}
+        results.append(
+            {
+                "segment_number": index + 1,
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "duration": round(end - start, 3),
+                "title": str(metadata.get("title") or f"Part {index + 1}").strip(),
+                "summary": str(metadata.get("summary") or "").strip(),
+                "transcript": " ".join(included),
+                "aspect_ratio": "16:9",
+            }
+        )
+    return results
+
+
+def _send_topic_candidates(
+    chat_id: str, request_id: str, topic_result: dict
+) -> None:
+    topics = topic_result.get("segments", [])
+    send(
+        chat_id,
+        f"📺 16:9 section analysis complete\nJob ID: {request_id}\n"
+        f"Sections covering the eligible video: {len(topics)}\n\n"
+        "These sections do not overlap. Approve the horizontal videos you want rendered.",
+    )
+    for index, segment in enumerate(topics):
+        text = (
+            f"16:9 Segment {index + 1}: {segment.get('title', '')}\n\n"
+            f"Time: {_timecode(float(segment['start']))}–"
+            f"{_timecode(float(segment['end']))}\n"
+            f"Duration: {round(float(segment['duration']) / 60, 1)} minutes"
+            + (
+                f"\n\nSection summary:\n{segment.get('summary', '')}"
+                if segment.get("summary")
+                else ""
+            )
+        )
+        telegram(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": True,
+                "reply_markup": {
+                    "inline_keyboard": [[
+                        {
+                            "text": "✅ Approve 16:9",
+                            "callback_data": f"rs:topic_approve:{request_id}:{index}",
+                        },
+                        {
+                            "text": "❌ Skip",
+                            "callback_data": f"rs:topic_reject:{request_id}:{index}",
+                        },
+                    ]]
+                },
+            },
+        )
+
+
+def _process_topics(
+    request_id: str,
+    state: dict[str, Any],
+    chat_id: str,
+    video_id: str,
+    video: Path,
+    segments: list[dict],
+    reused: bool,
+) -> dict[str, Any]:
+    send(
+        chat_id,
+        "📺 Mapping the full eligible video into non-overlapping 16:9 sections "
+        "targeting about 8 minutes each.",
+    )
+    suggestions = _topic_break_suggestions(segments)
+    topics = _build_contiguous_topic_segments(segments, suggestions)
+    if not topics:
+        send(
+            chat_id,
+            "ℹ️ The eligible video is not longer than three minutes, so no 16:9 "
+            "topic segment was created.",
+        )
+    topic_result = {"segments": topics, "coverage": "full_eligible_timeline"}
+    state.update(
+        {
+            "video_path": str(video),
+            "source_reused": reused,
+            "topic_result": topic_result,
+            "topic_reviews": state.get("topic_reviews") or {},
+            "topic_stage": "awaiting_review" if topics else "not_eligible",
+        }
+    )
+    _save(request_id, "awaiting_review" if topics else "processing", state)
+    if topics:
+        _send_topic_candidates(chat_id, request_id, topic_result)
+    return state
+
+
 def _process(request_id: str) -> None:
     with _LOCK, _telegram_db() as db:
         row = db.execute("SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)).fetchone()
