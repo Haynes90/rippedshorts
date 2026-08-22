@@ -647,8 +647,10 @@ def _topic_break_suggestions(transcript_segments: list[dict]) -> list[dict]:
     prompt = (
         "Divide this full transcript into coherent horizontal-video sections for "
         "YouTube and Facebook. Identify changes in point, subject, story, or tangent. "
-        "Aim near 8 minutes per section. Every boundary must be between complete "
-        "sentences or thoughts. Do not omit any part of the eligible timeline and do "
+        "Use 8 minutes only as a loose reference, not a target. Preserve a coherent "
+        "subject, point, story, or tangent even when its natural section is shorter or "
+        "longer. Every section must exceed 3 minutes, and every boundary must be "
+        "between complete sentences or thoughts. Do not omit any part of the eligible timeline and do "
         "not overlap sections. Return strict JSON only as "
         '{"segments":[{"start":0,"end":480,"title":"...","summary":"..."}]}. '
         "Use only exact transcript timestamps.\n\n"
@@ -694,7 +696,7 @@ def _topic_break_suggestions(transcript_segments: list[dict]) -> list[dict]:
 def _build_contiguous_topic_segments(
     transcript_segments: list[dict], suggestions: list[dict]
 ) -> list[dict]:
-    """Create contiguous, non-overlapping >3 minute sections targeting eight minutes."""
+    """Build semantic, contiguous >3 minute sections; eight minutes is only a reference."""
     ordered = sorted(transcript_segments, key=lambda item: float(item.get("start", 0)))
     if not ordered:
         return []
@@ -708,16 +710,14 @@ def _build_contiguous_topic_segments(
     )
     total = timeline_end - timeline_start
     minimum = max(181.0, float(os.getenv("TOPIC_SEGMENT_MIN_SECONDS", "181")))
-    target = max(minimum, float(os.getenv("TOPIC_SEGMENT_TARGET_SECONDS", "480")))
-    maximum = max(target, float(os.getenv("TOPIC_SEGMENT_MAX_SECONDS", "720")))
+    reference = max(
+        minimum, float(os.getenv("TOPIC_SEGMENT_REFERENCE_SECONDS", "480"))
+    )
+    fallback_maximum = max(
+        reference, float(os.getenv("TOPIC_SEGMENT_FALLBACK_MAX_SECONDS", "900"))
+    )
     if total < minimum:
         return []
-
-    segment_count = max(1, round(total / target))
-    while segment_count > 1 and total / segment_count < minimum:
-        segment_count -= 1
-    while total / segment_count > maximum:
-        segment_count += 1
 
     transcript_ends = [
         float(
@@ -738,6 +738,7 @@ def _build_contiguous_topic_segments(
         for item in ordered[:-1]
         if re.search(r"[.!?][\"’']?$", str(item.get("text", "")).strip())
     ]
+
     suggested_ends = []
     for item in suggestions:
         try:
@@ -746,53 +747,83 @@ def _build_contiguous_topic_segments(
             continue
         if timeline_start < value < timeline_end:
             suggested_ends.append(value)
+    suggested_ends = sorted(set(suggested_ends))
 
+    # Semantic boundaries are authoritative. Snap each one to a completed sentence,
+    # skip boundaries that would make either adjoining section three minutes or less,
+    # and otherwise ignore the eight-minute reference entirely.
     boundaries = [timeline_start]
-    for index in range(1, segment_count):
-        desired = timeline_start + total * index / segment_count
+    for suggested in suggested_ends:
         low = boundaries[-1] + minimum
-        high = timeline_end - minimum * (segment_count - index)
-        semantic = [value for value in suggested_ends if low <= value <= high]
-        valid_sentence_ends = [
+        high = timeline_end - minimum
+        if low > high or not (low <= suggested <= high):
+            continue
+        sentence_choices = [
             value for value in sentence_ends if low <= value <= high
         ]
-        if semantic and valid_sentence_ends:
-            semantic_target = min(semantic, key=lambda value: abs(value - desired))
+        if sentence_choices:
             boundary = min(
-                valid_sentence_ends,
-                key=lambda value: abs(value - semantic_target),
-            )
-        elif valid_sentence_ends:
-            boundary = min(
-                valid_sentence_ends, key=lambda value: abs(value - desired)
+                sentence_choices, key=lambda value: abs(value - suggested)
             )
         else:
-            valid_ends = [value for value in transcript_ends if low <= value <= high]
+            transcript_choices = [
+                value for value in transcript_ends if low <= value <= high
+            ]
             boundary = (
-                min(valid_ends, key=lambda value: abs(value - desired))
-                if valid_ends
+                min(transcript_choices, key=lambda value: abs(value - suggested))
+                if transcript_choices
+                else suggested
+            )
+        if boundary - boundaries[-1] > 180 and timeline_end - boundary > 180:
+            boundaries.append(boundary)
+
+    # When semantic analysis produces no usable topic changes, fall back to balanced
+    # transcript chunks. This is the only place the eight-minute reference is used.
+    if len(boundaries) == 1 and total > fallback_maximum:
+        segment_count = max(2, round(total / reference))
+        while segment_count > 1 and total / segment_count < minimum:
+            segment_count -= 1
+        while total / segment_count > fallback_maximum:
+            segment_count += 1
+        for index in range(1, segment_count):
+            desired = timeline_start + total * index / segment_count
+            low = boundaries[-1] + minimum
+            high = timeline_end - minimum * (segment_count - index)
+            sentence_choices = [
+                value for value in sentence_ends if low <= value <= high
+            ]
+            transcript_choices = [
+                value for value in transcript_ends if low <= value <= high
+            ]
+            choices = sentence_choices or transcript_choices
+            boundary = (
+                min(choices, key=lambda value: abs(value - desired))
+                if choices
                 else desired
             )
-        boundaries.append(boundary)
+            boundaries.append(boundary)
     boundaries.append(timeline_end)
 
     results = []
     for index in range(len(boundaries) - 1):
-        start, end = boundaries[index], boundaries[index + 1]
+        section_start, section_end = boundaries[index], boundaries[index + 1]
         included = []
         for item in ordered:
             seg_start = float(item.get("start", 0))
             seg_end = float(
                 item.get("end", seg_start + float(item.get("duration", 0)))
             )
-            if seg_start >= start - 0.75 and seg_end <= end + 0.75:
+            if (
+                seg_start >= section_start - 0.75
+                and seg_end <= section_end + 0.75
+            ):
                 included.append(str(item.get("text", "")).strip())
-        midpoint = (start + end) / 2
+        midpoint = (section_start + section_end) / 2
         matching = []
         for item in suggestions:
             try:
-                item_start = float(item.get("start", start))
-                item_end = float(item.get("end", end))
+                item_start = float(item.get("start", section_start))
+                item_end = float(item.get("end", section_end))
             except (TypeError, ValueError):
                 continue
             if item_start <= midpoint <= item_end:
@@ -801,9 +832,9 @@ def _build_contiguous_topic_segments(
         results.append(
             {
                 "segment_number": index + 1,
-                "start": round(start, 3),
-                "end": round(end, 3),
-                "duration": round(end - start, 3),
+                "start": round(section_start, 3),
+                "end": round(section_end, 3),
+                "duration": round(section_end - section_start, 3),
                 "title": str(metadata.get("title") or f"Part {index + 1}").strip(),
                 "summary": str(metadata.get("summary") or "").strip(),
                 "transcript": " ".join(included),
