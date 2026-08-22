@@ -54,3 +54,13 @@ def test_telegram_reports_dynamic_aggregate_progress():
     assert "Progress: {processed}/{total} processed ({percent}%)" in source
     assert "{rendering} rendering | {queued} queued" in source
     assert "{rendered} rendered | {failed} failed" in source
+
+
+def test_restart_recovers_only_approved_unfinished_sheet_clips():
+    source = (ROOT / "telegram_intake.py").read_text()
+    assert "def _approved_clips_from_sheet" in source
+    assert 'str(padded[2]).strip() != video_id' in source
+    assert 'str(padded[15]).strip().lower() != "approved"' in source
+    assert 'render_status == "rendered" and clip_url' in source
+    assert "recovered_approvals_from_sheet" in source
+    assert "Rendering only those approved clips now" in source
