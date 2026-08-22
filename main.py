@@ -62,6 +62,10 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_CLIP_TIMEOUT_SECONDS = max(
+    180, int(os.getenv("OPENAI_CLIP_TIMEOUT_SECONDS", "600"))
+)
+OPENAI_CLIP_ATTEMPTS = max(1, int(os.getenv("OPENAI_CLIP_ATTEMPTS", "3")))
 
 if not RAPIDAPI_KEY:
     logger.warning("RAPIDAPI_KEY not set (discover will fail until configured).")
@@ -674,14 +678,50 @@ def call_openai_for_clips(transcript_segments: List[dict], prompt_override: Opti
         ],
         "response_format": {"type": "json_object"},
     }
-    resp = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=(10, 180),
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"OpenAI API error ({resp.status_code}): {resp.text}")
+    resp = None
+    last_error = None
+    for attempt in range(1, OPENAI_CLIP_ATTEMPTS + 1):
+        try:
+            logger.info(
+                "OpenAI clip selection attempt=%s/%s model=%s transcript_segments=%s read_timeout=%ss",
+                attempt,
+                OPENAI_CLIP_ATTEMPTS,
+                OPENAI_MODEL,
+                len(transcript_segments),
+                OPENAI_CLIP_TIMEOUT_SECONDS,
+            )
+            resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=(15, OPENAI_CLIP_TIMEOUT_SECONDS),
+            )
+            if resp.status_code == 200:
+                break
+            if resp.status_code not in {408, 409, 429} and resp.status_code < 500:
+                raise RuntimeError(f"OpenAI API error ({resp.status_code}): {resp.text}")
+            last_error = RuntimeError(
+                f"OpenAI retryable API error ({resp.status_code}): {resp.text[:1000]}"
+            )
+        except (requests.ReadTimeout, requests.ConnectionError) as exc:
+            last_error = exc
+            logger.warning(
+                "OpenAI clip selection attempt=%s/%s failed: %s",
+                attempt,
+                OPENAI_CLIP_ATTEMPTS,
+                exc,
+            )
+        if attempt < OPENAI_CLIP_ATTEMPTS:
+            time.sleep(min(10, 2 ** attempt))
+    if resp is None or resp.status_code != 200:
+        raise RuntimeError(
+            "OpenAI clip selection failed after "
+            f"{OPENAI_CLIP_ATTEMPTS} attempts with "
+            f"{OPENAI_CLIP_TIMEOUT_SECONDS}s read timeout: {last_error}"
+        )
     data = resp.json()
     content = data["choices"][0]["message"]["content"]
     raw_content = content.strip()
