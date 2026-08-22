@@ -641,7 +641,6 @@ def call_openai_for_clips(transcript_segments: List[dict], prompt_override: Opti
             {"role": "user", "content": prompt},
         ],
         "response_format": {"type": "json_object"},
-        "temperature": 0.2,
     }
     resp = requests.post(
         "https://api.openai.com/v1/chat/completions",
