@@ -175,7 +175,7 @@ def test_plain_link_starts_shorts_and_horizontal_topic_lanes():
 def test_horizontal_segments_cover_full_timeline_without_overlap():
     source = (ROOT / "telegram_intake.py").read_text()
     assert "def _build_contiguous_topic_segments" in source
-    assert 'TOPIC_SEGMENT_TARGET_SECONDS", "480"' in source
+    assert 'TOPIC_SEGMENT_REFERENCE_SECONDS", "480"' in source
     assert 'TOPIC_SEGMENT_MIN_SECONDS", "181"' in source
     assert 'boundaries = [timeline_start]' in source
     assert "boundaries.append(timeline_end)" in source
@@ -199,3 +199,11 @@ def test_shorts_expand_to_complete_sentence_boundaries():
     assert "Finish the current sentence" in source
     assert "complete sentence/thought boundary" in source
     assert "end - start <= 90" in source
+
+
+def test_topic_coherence_precedes_eight_minute_reference():
+    source = (ROOT / "telegram_intake.py").read_text()
+    assert "Semantic boundaries are authoritative" in source
+    assert "ignore the eight-minute reference entirely" in source
+    assert "This is the only place the eight-minute reference is used" in source
+    assert "TOPIC_SEGMENT_FALLBACK_MAX_SECONDS" in source
