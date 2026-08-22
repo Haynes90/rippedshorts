@@ -65,6 +65,9 @@ def parse_request(text: str) -> dict[str, Any]:
 
 def _authorized(chat_id: str, user_id: str) -> bool:
     chats, users = _csv_env("TELEGRAM_ALLOWED_CHAT_IDS"), _csv_env("TELEGRAM_ALLOWED_USER_IDS")
+    existing_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if existing_chat:
+        chats.add(existing_chat)
     # Fail closed: at least one allow-list must be configured.
     if not chats and not users:
         return False
@@ -110,6 +113,64 @@ def _reusable_youtube_job(video_id: str) -> dict | None:
 def _segments(path: Path) -> list[dict]:
     data = json.loads(path.read_text(encoding="utf-8"))
     return data.get("segments", data) if isinstance(data, dict) else data
+
+
+def validate_complete_candidates(payload: dict, transcript_segments: list[dict], tolerance: float = 0.75) -> dict:
+    """Reject invented text and clip boundaries that cut through transcript segments."""
+    boundaries = []
+    for item in transcript_segments:
+        start = float(item.get("start", 0))
+        end = float(item.get("end", start + float(item.get("duration", 0))))
+        boundaries.append((start, end, str(item.get("text", "")).strip()))
+    valid, rejected = [], []
+    for candidate in payload.get("segments", []):
+        start = float(candidate.get("start", -1))
+        end = float(candidate.get("end", start + float(candidate.get("duration", 0))))
+        begins_cleanly = any(abs(start - seg_start) <= tolerance for seg_start, _, _ in boundaries)
+        ends_cleanly = any(abs(end - seg_end) <= tolerance for _, seg_end, _ in boundaries)
+        included = [text for seg_start, seg_end, text in boundaries if seg_start >= start - tolerance and seg_end <= end + tolerance]
+        expected = " ".join(included).casefold()
+        quoted = str(candidate.get("transcript", "")).strip().casefold()
+        if begins_cleanly and ends_cleanly and quoted and expected and (quoted in expected or expected in quoted) and end > start:
+            candidate.update({"start": start, "end": end, "duration": round(end - start, 3)})
+            valid.append(candidate)
+        else:
+            rejected.append({"start": start, "end": end, "reason": "Unsupported text or incomplete transcript boundary"})
+    return {**payload, "segments": valid[:20], "validation_rejections": rejected}
+
+
+def _timecode(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _send_candidates(chat_id: str, request_id: str, result: dict) -> None:
+    clips = result.get("segments", [])
+    send(chat_id, f"✅ Analysis complete\nJob ID: {request_id}\nComplete-thought candidates: {len(clips)}\n\nNothing has been rendered yet. Approve only the clips you want created.")
+    for index, clip in enumerate(clips, 1):
+        transcript = str(clip.get("transcript", "")).strip()
+        if len(transcript) > 2600:
+            transcript = transcript[:2597] + "..."
+        text = (
+            f"Candidate {index} of {len(clips)}\n\n"
+            f"Time: {_timecode(float(clip['start']))}–{_timecode(float(clip['end']))}\n"
+            f"Duration: {round(float(clip['duration']))} seconds\n"
+            f"Category: {clip.get('category', 'social clip')}\n"
+            f"Score: {clip.get('score', '')}\n\n"
+            f"Why selected:\n{clip.get('reason', '')}\n\n"
+            f"Transcript:\n{transcript}"
+        )
+        telegram("sendMessage", {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+            "reply_markup": {"inline_keyboard": [[
+                {"text": "✅ Approve & Render", "callback_data": f"rs:approve:{request_id}:{index-1}"},
+                {"text": "❌ Reject", "callback_data": f"rs:reject:{request_id}:{index-1}"},
+            ]]},
+        })
 
 
 def _transcribe(video_path: Path) -> list[dict]:
@@ -186,36 +247,49 @@ def _process(request_id: str) -> None:
         import main
         enriched = [{**item, "video_id": state["parsed"].get("video_id", "drive-source")} for item in segments]
         result = main.call_openai_for_clips(enriched, None)
+        result = validate_complete_candidates(result, enriched)
         # Existing renderer is shorts-only. Topic requests are retained for the dual-lane selector.
         if row["mode"] == "topics":
             raise RuntimeError("Topic-only Telegram processing requires the dual-lane selector before rendering")
-        result = main.attach_clip_assets(result, state["parsed"].get("video_id", request_id), state["parsed"].get("source_value") if row["source_kind"] == "youtube" and not reused else None, video_path_override=video)
         clips = result.get("segments", [])
-        _save(request_id, "completed", {**state, "stage": "completed", "source_reused": reused, "result": result})
-        lines = [f"✅ Processing complete\nJob ID: {request_id}\nCandidates: {len(clips)}\nSource reused: {'Yes' if reused else 'No'}"]
-        for index, clip in enumerate(clips[:20], 1):
-            lines.append(f"{index}. {clip.get('category', 'clip')} — {clip.get('clip_url', '')}")
-        send(chat_id, "\n".join(lines))
+        _save(request_id, "awaiting_review", {**state, "stage": "awaiting_review", "video_path": str(video), "source_reused": reused, "result": result, "candidate_reviews": {}})
+        _send_candidates(chat_id, request_id, result)
     except Exception as exc:
         _save(request_id, "error", {**state, "stage": "error", "error_type": type(exc).__name__, "error": str(exc), "retryable": True})
         send(chat_id, f"❌ Processing failed\nJob ID: {request_id}\n{str(exc)[:1500]}\n\nSend /retry {request_id} to try again.")
 
 
-@router.post("/api/telegram/webhook")
-async def webhook(request: Request, background_tasks: BackgroundTasks, x_telegram_bot_api_secret_token: str | None = Header(None)):
-    expected = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
-    if not expected or x_telegram_bot_api_secret_token != expected:
-        raise HTTPException(status_code=401, detail="Invalid Telegram webhook secret")
-    update = await request.json()
-    message = update.get("message") or update.get("edited_message") or {}
+def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
+    callback = update.get("callback_query") or {}
+    message = callback.get("message") or update.get("message") or update.get("edited_message") or {}
     chat_id = str((message.get("chat") or {}).get("id", ""))
-    user_id = str((message.get("from") or {}).get("id", ""))
+    user_id = str((callback.get("from") or message.get("from") or {}).get("id", ""))
+    callback_data = str(callback.get("data") or "")
     text = str(message.get("text") or message.get("caption") or "").strip()
     if not chat_id or not user_id:
         return {"status": "ignored"}
     if not _authorized(chat_id, user_id):
-        send(chat_id, "This chat is not authorized to start Ripped Shorts jobs.")
         return {"status": "unauthorized"}
+    action = re.fullmatch(r"rs:(approve|reject):([A-Za-z0-9-]+):(\d+)", callback_data)
+    if action:
+        verb, request_id, index_text = action.groups()
+        index = int(index_text)
+        with _LOCK, _telegram_db() as db:
+            row = db.execute("SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)).fetchone()
+        if not row:
+            return {"status": "not_found"}
+        state = json.loads(row["state_json"])
+        reviews = dict(state.get("candidate_reviews") or {})
+        reviews[str(index)] = {"status": verb, "reviewed_at": now(), "user_id": user_id}
+        state["candidate_reviews"] = reviews
+        _save(request_id, "awaiting_review" if verb == "reject" else "approved", state)
+        # Rendering is deliberately queued only after approval; the candidate
+        # package remains durable even if the worker restarts.
+        if verb == "approve":
+            background_tasks.add_task(_render_approved, request_id, index, chat_id)
+        else:
+            send(chat_id, f"Candidate {index + 1} rejected.")
+        return {"status": verb, "request_id": request_id, "candidate_index": index}
     retry_match = re.fullmatch(r"/retry\s+([A-Za-z0-9-]+)", text, re.I)
     if retry_match:
         request_id = retry_match.group(1)
@@ -223,9 +297,8 @@ async def webhook(request: Request, background_tasks: BackgroundTasks, x_telegra
         return {"status": "retry_accepted", "request_id": request_id}
     try:
         parsed = parse_request(text)
-    except ValueError as exc:
-        send(chat_id, f"Send a YouTube or Google Drive video link.\n\nExamples:\nFind clips: https://youtu.be/...\nFind shorts only: https://drive.google.com/file/d/...\n\n{exc}")
-        return {"status": "help"}
+    except ValueError:
+        return {"status": "ignored_non_ripped_shorts_message"}
     request_id, update_id, stamp = str(uuid.uuid4()), str(update.get("update_id", "")), now()
     state = {"stage": "accepted", "parsed": parsed, "message_id": message.get("message_id")}
     try:
@@ -233,6 +306,53 @@ async def webhook(request: Request, background_tasks: BackgroundTasks, x_telegra
             db.execute("INSERT INTO telegram_requests VALUES (?,?,?,?,?,?,?,?,?,?,?)", (request_id, update_id, chat_id, user_id, "accepted", parsed["mode"], parsed["source_kind"], parsed["source_value"], json.dumps(state), stamp, stamp))
     except sqlite3.IntegrityError:
         return {"status": "duplicate_update"}
-    send(chat_id, f"✅ Processing request accepted\nSource: {parsed['source_kind'].title()}\nRequest: {parsed['mode'].title()}\nJob ID: {request_id}")
+    send(chat_id, f"✅ Ripped Shorts request accepted\nSource: {parsed['source_kind'].title()}\nJob ID: {request_id}")
     background_tasks.add_task(_process, request_id)
     return {"status": "accepted", "request_id": request_id}
+
+
+def _render_approved(request_id: str, index: int, chat_id: str) -> None:
+    try:
+        with _LOCK, _telegram_db() as db:
+            row = db.execute("SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)).fetchone()
+        state = json.loads(row["state_json"])
+        candidate = state["result"]["segments"][index]
+        video = Path(state["video_path"])
+        import main
+        payload = {"segments": [dict(candidate)]}
+        rendered = main.attach_clip_assets(payload, state["parsed"].get("video_id", request_id), None, video_path_override=video)
+        clip = rendered["segments"][0]
+        reviews = dict(state.get("candidate_reviews") or {})
+        reviews[str(index)] = {**reviews.get(str(index), {}), "status": "rendered", "clip_url": clip.get("clip_url"), "rendered_at": now()}
+        state["candidate_reviews"] = reviews
+        _save(request_id, "awaiting_review", state)
+        send(chat_id, f"✅ Candidate {index + 1} rendered and uploaded:\n{clip.get('clip_url', '')}")
+    except Exception as exc:
+        send(chat_id, f"❌ Candidate {index + 1} render failed:\n{str(exc)[:1500]}")
+
+
+@router.post("/api/telegram/webhook")
+async def telegram_gateway(request: Request, x_telegram_bot_api_secret_token: str | None = Header(None)):
+    """Clip Master owns Telegram and forwards only Ripped Shorts messages."""
+    if os.getenv("SERVICE_ROLE", "").strip().lower() != "clip_master":
+        raise HTTPException(status_code=404, detail="Telegram webhook is owned by Clip Master")
+    expected = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+    if not expected or x_telegram_bot_api_secret_token != expected:
+        raise HTTPException(status_code=401, detail="Invalid Telegram webhook secret")
+    update = await request.json()
+    target = os.getenv("RIPPED_SHORTS_INTERNAL_URL", "").rstrip("/")
+    secret = os.getenv("RIPPED_SHORTS_SHARED_SECRET", "").strip()
+    if not target or not secret:
+        raise HTTPException(status_code=503, detail="Ripped Shorts forwarding is not configured")
+    response = requests.post(f"{target}/api/ripped-shorts/intake", json=update, headers={"x-ripped-shorts-secret": secret}, timeout=(10, 60))
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Ripped Shorts intake failed: {response.text[:1000]}")
+    return response.json()
+
+
+@router.post("/api/ripped-shorts/intake")
+async def internal_intake(request: Request, background_tasks: BackgroundTasks, x_ripped_shorts_secret: str | None = Header(None)):
+    expected = os.getenv("RIPPED_SHORTS_SHARED_SECRET", "").strip()
+    if not expected or x_ripped_shorts_secret != expected:
+        raise HTTPException(status_code=401, detail="Invalid Ripped Shorts service secret")
+    return _accept_update(await request.json(), background_tasks)
