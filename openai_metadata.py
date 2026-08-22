@@ -56,7 +56,6 @@ TRANSCRIPT:
             {"role": "user", "content": user_prompt},
         ],
         "response_format": {"type": "json_object"},
-        "temperature": 0.2,
     }
     response = requests.post(
         "https://api.openai.com/v1/chat/completions",
