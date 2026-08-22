@@ -15,6 +15,13 @@ import requests
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
 
 from audio_master_handoff import DB_PATH, SOURCE_DIR, connect, download_drive, drive_metadata, get_job
+from source_ingestion import (
+    download_youtube_resilient,
+    persist_source_cache,
+    restrict_to_boundary,
+    reuse_from_drive,
+    select_non_overlapping,
+)
 
 router = APIRouter()
 
@@ -234,20 +241,55 @@ def _process(request_id: str) -> None:
             reused = True
         else:
             parsed = state["parsed"]
-            reusable = _reusable_youtube_job(parsed["video_id"])
+            video_id = parsed["video_id"]
+            boundary = None
+            cache = {"video_path": None, "segments": [], "sermon_boundary": None}
+            try:
+                send(chat_id, f"🔎 Checking Google Drive for existing files containing YouTube ID {video_id}.")
+                cache = reuse_from_drive(video_id, work)
+            except Exception as cache_error:
+                state.setdefault("warnings", []).append(f"Drive cache lookup failed: {cache_error}")
+
+            reusable = _reusable_youtube_job(video_id)
+            video = cache.get("video_path")
+            segments = cache.get("segments") or []
+            boundary = cache.get("sermon_boundary")
+            reused = bool(video or segments)
             if reusable:
-                video, segments, reused = reusable["video_path"], _segments(reusable["transcript_path"]), True
-            else:
-                import main
-                video = main.download_youtube_video(parsed["video_id"], parsed["source_value"], work)
-                segments = main.get_transcript(parsed["video_id"])
-                reused = False
+                video = video or reusable["video_path"]
+                segments = segments or _segments(reusable["transcript_path"])
+                reused = True
+            if not video:
+                send(chat_id, "⬇️ No reusable source video found; downloading with the Audio Master yt-dlp recovery path.")
+                video = download_youtube_resilient(video_id, parsed["source_value"], work)
+            if not segments:
+                send(chat_id, "📝 No reusable timed transcript found; extracting and transcribing the video audio.")
+                segments = _transcribe(video)
+            try:
+                cache_result = persist_source_cache(video_id, video, segments, work)
+                state["drive_cache"] = cache_result
+            except Exception as cache_error:
+                state.setdefault("warnings", []).append(f"Drive cache persistence failed: {cache_error}")
+
+            if boundary:
+                bounded = restrict_to_boundary(segments, boundary)
+                if bounded:
+                    segments = bounded
+                    state["sermon_boundary"] = boundary
+                    send(
+                        chat_id,
+                        f"✂️ Reusing approved sermon boundary: {_timecode(boundary['start'])}–{_timecode(boundary['end'])}.",
+                    )
+                else:
+                    state.setdefault("warnings", []).append("Approved sermon boundary did not contain reusable transcript segments.")
+
         _save(request_id, "selecting", {**state, "stage": "selection", "video_path": str(video), "source_reused": reused})
-        send(chat_id, "🧠 Selecting clip candidates.")
+        send(chat_id, "🧠 Reviewing the full eligible transcript and selecting up to 20 distinct, non-overlapping complete thoughts.")
         import main
         enriched = [{**item, "video_id": state["parsed"].get("video_id", "drive-source")} for item in segments]
         result = main.call_openai_for_clips(enriched, None)
         result = validate_complete_candidates(result, enriched)
+        result["segments"] = select_non_overlapping(result.get("segments", []), limit=20)
         # Existing renderer is shorts-only. Topic requests are retained for the dual-lane selector.
         if row["mode"] == "topics":
             raise RuntimeError("Topic-only Telegram processing requires the dual-lane selector before rendering")
