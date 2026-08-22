@@ -113,3 +113,29 @@ def test_opencv_speaker_tracking_and_center_fallback():
     assert "Dead zone and exponential smoothing" in source
     assert "target_center = previous_center" in source
     assert "def _piecewise_crop_expression" in source
+
+
+def test_repeat_video_prompts_for_rerip_choice():
+    source = (ROOT / "telegram_intake.py").read_text()
+    assert "awaiting_rerip_choice" in source
+    assert "Do you want to re-rip the Shorts" in source
+    assert "rs:rerip:{request_id}" in source
+    assert "rs:reuse:{request_id}" in source
+
+
+def test_short_selection_uses_sheet_approval_learning():
+    source = (ROOT / "telegram_intake.py").read_text()
+    assert "def _short_learning_prompt" in source
+    assert "LEARNING FROM DEREK'S SHORT REVIEWS" in source
+    assert "APPROVED SHORTS" in source
+    assert "REJECTED SHORTS" in source
+    assert "Reject scripture-only readings" in source
+    assert "generic blurbs without a payoff" in source
+
+
+def test_rerip_is_fresh_but_may_reselect_strong_approvals():
+    source = (ROOT / "telegram_intake.py").read_text()
+    assert "needed = 20 if force_rerip" in source
+    assert "old approvals are learning" in source
+    assert "Previously approved Shorts may be selected again" in source
+    assert 'item.get("decision") == "rejected"' in source
