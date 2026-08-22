@@ -661,7 +661,7 @@ def attach_clip_assets(
 
 
 def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optional[str]) -> str:
-    base_prompt = prompt_override or (
+    base_prompt = (
         "TASK\n"
         "You are a highlight editor for ANY type of content. Review the ENTIRE transcript in chronological order "
         "and select the best short-form clips.\n"
@@ -757,6 +757,12 @@ def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optiona
         "{ \"analysis\": {\"content_type\": \"other\", \"main_theme\": \"\", "
         "\"key_ideas\": [], \"keywords\": []}, \"segments\": [] }\n"
     )
+    if prompt_override:
+        base_prompt += (
+            "\n\nADDITIONAL DISCOVERY REQUIREMENTS\n"
+            + str(prompt_override).strip()
+            + "\n"
+        )
 
     def _mmss(seconds: float) -> str:
         minutes = int(seconds // 60)
