@@ -907,6 +907,7 @@ def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optiona
         "- Each clip MUST be a complete, standalone thought (no cut-off setup, mid-sentence starts, "
         "or missing payoff).\n"
         "- Every clip MUST represent a complete sentence or complete thought.\n"
+        "- Finish the selected sentence/payoff where possible. End before the opening words of a new sentence, topic, or tangent.\n"
         "- Each clip MUST deliver at least one of: an impactful lesson, a strong insight, or a quotable line.\n"
         "- Do NOT paraphrase, rewrite, infer missing context, or fabricate.\n"
         "- Do NOT return duplicate or near-duplicate complete clips; each clip must be materially distinct.\n"
