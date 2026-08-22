@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import re
@@ -187,15 +189,28 @@ def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -
     workdir.mkdir(parents=True, exist_ok=True)
     destination = workdir / f"{video_id}-source.mp4"
     cookie_file = (
-        os.getenv("YOUTUBE_COOKIE_FILE")
-        or os.getenv("YTDLP_COOKIE_FILE")
+        os.getenv("YTDLP_COOKIE_FILE")
+        or os.getenv("YTDLP_COOKIES_FILE")
+        or os.getenv("YOUTUBE_COOKIES_FILE")
+        or os.getenv("YOUTUBE_COOKIE_FILE")
         or os.getenv("YT_DLP_COOKIE_FILE")
         or ""
     ).strip()
+    generated_cookie_file = workdir / "youtube-cookies.txt"
+    cookies_base64 = (os.getenv("YOUTUBE_COOKIES_BASE64") or "").strip()
     cookie_text = (os.getenv("YOUTUBE_COOKIES") or "").strip()
-    if cookie_text and not cookie_file:
-        generated_cookie_file = workdir / "youtube-cookies.txt"
-        generated_cookie_file.write_text(cookie_text.replace("\\n", "\n") + "\n", encoding="utf-8")
+
+    # Railway variables cannot create a filesystem path by themselves. Prefer
+    # the portable base64 secret whenever the configured path is unavailable.
+    if cookies_base64 and (not cookie_file or not Path(cookie_file).is_file()):
+        try:
+            decoded = base64.b64decode(cookies_base64, validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError) as exc:
+            raise RuntimeError("YOUTUBE_COOKIES_BASE64 is not valid base64-encoded UTF-8 cookie text") from exc
+        generated_cookie_file.write_text(decoded.rstrip() + "\n", encoding="utf-8")
+        cookie_file = str(generated_cookie_file)
+    elif cookie_text and (not cookie_file or not Path(cookie_file).is_file()):
+        generated_cookie_file.write_text(cookie_text.replace("\\n", "\n").rstrip() + "\n", encoding="utf-8")
         cookie_file = str(generated_cookie_file)
     options: dict[str, Any] = {
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
