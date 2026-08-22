@@ -110,9 +110,10 @@ def test_opencv_speaker_tracking_and_center_fallback():
     assert "opencv-data" in docker
     assert "def _estimate_speaker_track" in source
     assert "motion_score * 3.0" in source
-    assert "Dead zone and exponential smoothing" in source
+    assert "smooths noisy analysis samples only" in source
     assert "target_center = previous_center" in source
-    assert "def _piecewise_crop_expression" in source
+    assert "SPEAKER_SWITCH_CONFIRMATIONS" in source
+    assert "def _stepped_crop_expression" in source
 
 
 def test_repeat_video_prompts_for_rerip_choice():
@@ -139,3 +140,26 @@ def test_rerip_is_fresh_but_may_reselect_strong_approvals():
     assert "old approvals are learning" in source
     assert "Previously approved Shorts may be selected again" in source
     assert 'item.get("decision") == "rejected"' in source
+
+
+def test_opus_style_framing_holds_then_snaps_at_natural_boundaries():
+    source = (ROOT / "main.py").read_text()
+    assert "def _detect_audio_pause_boundaries" in source
+    assert "silencedetect=noise=-35dB:d=0.18" in source
+    assert "def _plan_framing_sections" in source
+    assert 'SPEAKER_REFRAME_SECONDS", "4.0"' in source
+    assert 'SPEAKER_REFRAME_MIN_SECONDS", "3.0"' in source
+    assert 'SPEAKER_REFRAME_MAX_SECONDS", "7.0"' in source
+    assert "from statistics import median" in source
+    assert "SPEAKER_REFRAME_THRESHOLD" in source
+    assert "interpolated =" not in source
+    assert 'expression = (' in source
+    assert 'f"if(lt(t,{next_timestamp:.3f})' in source
+
+
+def test_tracker_holds_on_loss_and_requires_consistent_speaker_switch():
+    source = (ROOT / "main.py").read_text()
+    assert "if lost_samples <= 2:" in source
+    assert "pending_switch_count >= switch_confirmations" in source
+    assert 'SPEAKER_SWITCH_DISTANCE", "0.18"' in source
+    assert 'SPEAKER_SWITCH_CONFIRMATIONS", "3"' in source
