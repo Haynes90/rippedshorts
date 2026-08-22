@@ -57,15 +57,35 @@ def _folder_query(video_id: str) -> str:
 
 
 def find_drive_assets(video_id: str) -> list[dict[str, Any]]:
-    result = drive_service().files().list(
+    """Search the configured folder, then all Drive files visible to the service account."""
+    service = drive_service()
+    fields = "files(id,name,mimeType,size,webViewLink,webContentLink,modifiedTime)"
+    result = service.files().list(
         q=_folder_query(video_id),
-        fields="files(id,name,mimeType,size,webViewLink,webContentLink,modifiedTime)",
+        fields=fields,
         orderBy="modifiedTime desc",
         pageSize=100,
         supportsAllDrives=True,
         includeItemsFromAllDrives=True,
     ).execute()
-    return result.get("files", [])
+    files = list(result.get("files", []))
+
+    # Audio Master and Ripped Shorts may be configured with different destination
+    # folders while sharing the same service account. Do a global ID lookup too.
+    folder = (os.getenv("DRIVE_FOLDER_ID") or os.getenv("Drive_Folder_ID") or "").strip()
+    if folder:
+        safe = video_id.replace("'", "\\'")
+        global_result = service.files().list(
+            q=f"name contains '{safe}' and trashed = false",
+            fields=fields,
+            orderBy="modifiedTime desc",
+            pageSize=100,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        seen = {item.get("id") for item in files}
+        files.extend(item for item in global_result.get("files", []) if item.get("id") not in seen)
+    return files
 
 
 def _read_doc(file_id: str) -> str:
@@ -190,6 +210,12 @@ def reuse_from_drive(video_id: str, workdir: Path) -> dict[str, Any]:
 def ingest_with_audio_master(video_id: str, youtube_url: str) -> dict[str, Any]:
     """Run Audio Master's cache/download/transcription path and wait for Drive assets."""
     base = (os.getenv("AUDIO_MASTER_INTERNAL_URL") or "").strip().rstrip("/")
+    if base and "://" not in base:
+        base = f"https://{base}"
+    for suffix in ("/api/ripped-shorts/ingest", "/api/ripped-shorts"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)].rstrip("/")
+            break
     secret = (
         os.getenv("AUDIO_MASTER_INGEST_SECRET")
         or os.getenv("AUDIO_MASTER_WEBHOOK_SECRET")
@@ -234,8 +260,14 @@ def ingest_with_audio_master(video_id: str, youtube_url: str) -> dict[str, Any]:
             raise RuntimeError(f"Audio Master ingestion failed: {last.get('error') or last}")
         transcript = last.get("transcript") or {}
         source_video = last.get("source_video") or {}
+        source_status = str(source_video.get("status") or "").lower()
+        if source_status in {"failed", "awaiting_route_rerun"}:
+            raise RuntimeError(
+                "Audio Master's retained source-video path failed: "
+                + str(last.get("error") or source_video)
+            )
         transcript_ready = bool(transcript.get("drive_files"))
-        source_ready = bool(source_video.get("drive_file_id")) or source_video.get("status") == "ready"
+        source_ready = bool(source_video.get("drive_file_id")) or source_status == "ready"
         if transcript_ready and source_ready:
             return last
         time.sleep(poll_seconds)
