@@ -728,6 +728,16 @@ def _build_contiguous_topic_segments(
         )
         for item in ordered[:-1]
     ]
+    sentence_ends = [
+        float(
+            item.get(
+                "end",
+                float(item.get("start", 0)) + float(item.get("duration", 0)),
+            )
+        )
+        for item in ordered[:-1]
+        if re.search(r"[.!?][\"’']?$", str(item.get("text", "")).strip())
+    ]
     suggested_ends = []
     for item in suggestions:
         try:
@@ -743,14 +753,26 @@ def _build_contiguous_topic_segments(
         low = boundaries[-1] + minimum
         high = timeline_end - minimum * (segment_count - index)
         semantic = [value for value in suggested_ends if low <= value <= high]
-        if semantic:
-            boundary = min(semantic, key=lambda value: abs(value - desired))
+        valid_sentence_ends = [
+            value for value in sentence_ends if low <= value <= high
+        ]
+        if semantic and valid_sentence_ends:
+            semantic_target = min(semantic, key=lambda value: abs(value - desired))
+            boundary = min(
+                valid_sentence_ends,
+                key=lambda value: abs(value - semantic_target),
+            )
+        elif valid_sentence_ends:
+            boundary = min(
+                valid_sentence_ends, key=lambda value: abs(value - desired)
+            )
         else:
             valid_ends = [value for value in transcript_ends if low <= value <= high]
-            if not valid_ends:
-                boundary = desired
-            else:
-                boundary = min(valid_ends, key=lambda value: abs(value - desired))
+            boundary = (
+                min(valid_ends, key=lambda value: abs(value - desired))
+                if valid_ends
+                else desired
+            )
         boundaries.append(boundary)
     boundaries.append(timeline_end)
 
