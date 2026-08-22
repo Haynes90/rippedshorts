@@ -4,11 +4,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_clip_output_names_include_candidate_time_range():
+def test_clip_output_names_use_file_id_and_candidate_number():
     source = (ROOT / "main.py").read_text()
-    assert 'clip_name = f"{video_id}_{clip_key}.mp4"' in source
-    assert 'int(round(start * 1000))' in source
-    assert 'int(round(end_seconds * 1000))' in source
+    telegram_source = (ROOT / "telegram_intake.py").read_text()
+    assert 'clip_name = f"{video_id}_Clip_{candidate_number}.mp4"' in source
+    assert 'f".render-{uuid.uuid4().hex}-{clip_name}"' in source
+    assert 'payload_candidate["candidate_number"] = index + 1' in telegram_source
 
 
 def test_render_failure_includes_ffmpeg_diagnostics():
