@@ -528,7 +528,9 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         video = Path(state["video_path"])
         import main
 
-        payload = {"segments": [dict(candidate)]}
+        payload_candidate = dict(candidate)
+        payload_candidate["candidate_number"] = index + 1
+        payload = {"segments": [payload_candidate]}
         rendered = main.attach_clip_assets(
             payload,
             state["parsed"].get("video_id", request_id),
