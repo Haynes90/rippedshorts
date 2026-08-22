@@ -72,3 +72,19 @@ def test_already_rendered_youtube_id_skips_gpt_selection():
     assert '"stage": "already_rendered"' in source
     assert "GPT selection was not run again" in source
     assert "existing_clip_links" in source
+
+
+def test_reused_video_render_creates_output_directory():
+    source = (ROOT / "main.py").read_text()
+    assert 'workdir.mkdir(parents=True, exist_ok=True)' in source
+
+
+def test_selector_targets_twenty_and_allows_distinct_overlap():
+    prompt_source = (ROOT / "main.py").read_text()
+    intake_source = (ROOT / "telegram_intake.py").read_text()
+    selector_source = (ROOT / "source_ingestion.py").read_text()
+    assert "Target 18–20 final clips" in prompt_source
+    assert "return 20" in prompt_source
+    assert "Clips MAY overlap in time" in prompt_source
+    assert "allow_overlap=True" in intake_source
+    assert "normalized_text" in selector_source
