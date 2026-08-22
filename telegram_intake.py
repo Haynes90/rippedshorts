@@ -260,19 +260,21 @@ def _log_candidate_decision(
     import main
 
     candidate = state["result"]["segments"][index]
+    log_request_id = candidate.get("_sheet_request_id") or request_id
+    candidate_number = int(candidate.get("candidate_number") or index + 1)
     analysis = state["result"].get("analysis") or {}
     parsed = state.get("parsed") or {}
     reviewed = (state.get("candidate_reviews") or {}).get(str(index), {})
     row_values = [
         now(),
-        request_id,
+        log_request_id,
         parsed.get("video_id", ""),
         parsed.get("source_value", ""),
         analysis.get("content_type", ""),
         analysis.get("main_theme", ""),
         ", ".join(str(value) for value in analysis.get("key_ideas", [])),
         ", ".join(str(value) for value in analysis.get("keywords", [])),
-        index + 1,
+        candidate_number,
         float(candidate.get("start", 0)),
         float(candidate.get("end", 0)),
         float(candidate.get("duration", 0)),
@@ -296,8 +298,8 @@ def _log_candidate_decision(
     for row_number, values in enumerate(rows[1:], start=2):
         if (
             len(values) > 8
-            and str(values[1]) == request_id
-            and str(values[8]) == str(index + 1)
+            and str(values[1]) == str(log_request_id)
+            and str(values[8]) == str(candidate_number)
         ):
             target_row = row_number
             break
@@ -316,6 +318,50 @@ def _log_candidate_decision(
             valueInputOption="RAW",
             body={"values": [row_values]},
         ).execute()
+
+
+def _approved_clips_from_sheet(video_id: str) -> list[dict[str, Any]]:
+    """Recover approved, unfinished clips by exact YouTube ID after a restart."""
+    import main
+
+    _, _, sheets = main.get_google_services()
+    response = sheets.spreadsheets().values().get(
+        spreadsheetId=RIPPED_LOG_SHEET_ID,
+        range=f"'{RIPPED_LOG_SHEET_TAB}'!A:U",
+    ).execute()
+    rows = response.get("values", [])
+    recovered: dict[tuple[float, float], dict[str, Any]] = {}
+    for values in rows[1:]:
+        padded = list(values) + [""] * (21 - len(values))
+        if str(padded[2]).strip() != video_id:
+            continue
+        if str(padded[15]).strip().lower() != "approved":
+            continue
+        render_status = str(padded[19]).strip().lower()
+        clip_url = str(padded[18]).strip()
+        if render_status == "rendered" and clip_url:
+            continue
+        try:
+            start = float(padded[9])
+            end = float(padded[10])
+            duration = float(padded[11]) if str(padded[11]).strip() else end - start
+            candidate_number = int(float(padded[8]))
+        except (TypeError, ValueError):
+            logger.warning("Skipping malformed approved Ripped Shorts row for %s", video_id)
+            continue
+        recovered[(start, end)] = {
+            "start": start,
+            "end": end,
+            "duration": duration,
+            "category": padded[12],
+            "transcript": padded[13],
+            "reason": padded[14],
+            "candidate_number": candidate_number,
+            "_sheet_request_id": str(padded[1]).strip(),
+            "_reviewed_at": str(padded[16]).strip(),
+            "_reviewer_user_id": str(padded[20]).strip(),
+        }
+    return sorted(recovered.values(), key=lambda item: item["candidate_number"])
 
 
 def _safe_log_candidate(*args, **kwargs) -> None:
@@ -472,6 +518,42 @@ def _process(request_id: str) -> None:
                 else:
                     state.setdefault("warnings", []).append("Approved sermon boundary did not contain reusable transcript segments.")
 
+        if row["source_kind"] == "youtube":
+            approved_clips = _approved_clips_from_sheet(video_id)
+            if approved_clips:
+                reviews = {
+                    str(index): {
+                        "status": "queued",
+                        "reviewed_at": clip.get("_reviewed_at") or now(),
+                        "user_id": clip.get("_reviewer_user_id", ""),
+                        "recovered_from_sheet": True,
+                    }
+                    for index, clip in enumerate(approved_clips)
+                }
+                recovered_result = {
+                    "analysis": {"content_type": "", "main_theme": "", "key_ideas": [], "keywords": []},
+                    "segments": approved_clips,
+                }
+                recovered_state = {
+                    **state,
+                    "stage": "awaiting_review",
+                    "video_path": str(video),
+                    "source_reused": reused,
+                    "result": recovered_result,
+                    "candidate_reviews": reviews,
+                    "recovered_approvals_from_sheet": True,
+                }
+                _save(request_id, "awaiting_review", recovered_state)
+                send(
+                    chat_id,
+                    f"♻️ Recovered {len(approved_clips)} approved unfinished clip(s) "
+                    f"for YouTube ID {video_id} from the Ripped Shorts sheet. "
+                    "Rendering only those approved clips now.",
+                )
+                for index in range(len(approved_clips)):
+                    RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
+                return
+
         _save(request_id, "selecting", {**state, "stage": "selection", "video_path": str(video), "source_reused": reused})
         send(chat_id, "🧠 Reviewing the full eligible transcript and selecting up to 20 distinct, non-overlapping complete thoughts.")
         import main
@@ -622,7 +704,9 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         import main
 
         payload_candidate = dict(candidate)
-        payload_candidate["candidate_number"] = index + 1
+        payload_candidate["candidate_number"] = int(
+            candidate.get("candidate_number") or index + 1
+        )
         payload = {"segments": [payload_candidate]}
         rendered = main.attach_clip_assets(
             payload,
