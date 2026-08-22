@@ -405,9 +405,15 @@ def _estimate_speaker_center_x(video_path: Path, start: float, duration: float) 
             "MediaPipe face detection unavailable; using OpenCV/center crop: %s", exc
         )
 
-    cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+    cascade = (
+        cv2.CascadeClassifier(str(cascade_path))
+        if cascade_path.is_file()
+        else None
     )
+    if cascade is None or cascade.empty():
+        cascade = None
+        logger.info("OpenCV face cascade unavailable; using safe center crop fallback")
     frame_index = 0
     while len(centers) < total_samples:
         ok, frame = cap.read()
@@ -425,7 +431,7 @@ def _estimate_speaker_center_x(video_path: Path, start: float, duration: float) 
                     logger.warning("MediaPipe frame detection failed; falling back: %s", exc)
                     detector.close()
                     detector = None
-            if center is None and not cascade.empty():
+            if center is None and cascade is not None:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 faces = cascade.detectMultiScale(
                     gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40)
@@ -653,7 +659,8 @@ def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optiona
         "  ]\n"
         "}\n\n"
         "If nothing qualifies:\n"
-        "{ \"analysis\": {\"main_theme\": \"\", \"key_ideas\": []}, \"segments\": [] }\n"
+        "{ \"analysis\": {\"content_type\": \"other\", \"main_theme\": \"\", "
+        "\"key_ideas\": [], \"keywords\": []}, \"segments\": [] }\n"
     )
 
     def _mmss(seconds: float) -> str:
