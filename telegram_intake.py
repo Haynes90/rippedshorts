@@ -1223,7 +1223,7 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
         return {"status": choice, "request_id": request_id}
 
     topic_action = re.fullmatch(
-        r"rs:topic_(approve|reject):([A-Za-z0-9-]+):(\\d+)", callback_data
+        r"rs:topic_(approve|reject):([A-Za-z0-9-]+):(\d+)", callback_data
     )
     if topic_action:
         verb, request_id, index_text = topic_action.groups()
