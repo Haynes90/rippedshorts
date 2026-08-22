@@ -1137,6 +1137,55 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
         background_tasks.add_task(_process, request_id)
         return {"status": choice, "request_id": request_id}
 
+    topic_action = re.fullmatch(
+        r"rs:topic_(approve|reject):([A-Za-z0-9-]+):(\\d+)", callback_data
+    )
+    if topic_action:
+        verb, request_id, index_text = topic_action.groups()
+        index = int(index_text)
+        with _LOCK, _telegram_db() as db:
+            row = db.execute(
+                "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+            if not row:
+                return {"status": "not_found"}
+            state = json.loads(row["state_json"])
+            topics = (state.get("topic_result") or {}).get("segments", [])
+            if index >= len(topics):
+                return {"status": "topic_not_found"}
+            reviews = dict(state.get("topic_reviews") or {})
+            existing = (reviews.get(str(index)) or {}).get("status")
+            if verb == "approve" and existing in {"queued", "rendering", "rendered"}:
+                return {
+                    "status": f"already_{existing}",
+                    "request_id": request_id,
+                    "topic_index": index,
+                }
+            reviews[str(index)] = {
+                "status": "queued" if verb == "approve" else "rejected",
+                "reviewed_at": now(),
+                "user_id": user_id,
+            }
+            state["topic_reviews"] = reviews
+            db.execute(
+                "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+                (json.dumps(state), now(), request_id),
+            )
+        if verb == "approve":
+            RENDER_EXECUTOR.submit(_render_topic_approved, request_id, index, chat_id)
+            send(
+                chat_id,
+                f"16:9 Segment {index + 1} approved and queued. "
+                f"Up to {RIPPED_SHORTS_RENDER_WORKERS} total videos render at once.",
+            )
+        else:
+            send(chat_id, f"16:9 Segment {index + 1} skipped.")
+        return {
+            "status": f"topic_{verb}",
+            "request_id": request_id,
+            "topic_index": index,
+        }
+
     action = re.fullmatch(r"rs:(approve|reject):([A-Za-z0-9-]+):(\d+)", callback_data)
     if action:
         verb, request_id, index_text = action.groups()
@@ -1264,6 +1313,87 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
     )
     background_tasks.add_task(_process, request_id)
     return {"status": "accepted", "request_id": request_id}
+
+
+def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
+    try:
+        with _LOCK, _telegram_db() as db:
+            row = db.execute(
+                "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+            if not row:
+                raise RuntimeError(f"Ripped Shorts request not found: {request_id}")
+            state = json.loads(row["state_json"])
+            reviews = dict(state.get("topic_reviews") or {})
+            reviews[str(index)] = {
+                **reviews.get(str(index), {}),
+                "status": "rendering",
+                "render_started_at": now(),
+            }
+            state["topic_reviews"] = reviews
+            db.execute(
+                "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+                (json.dumps(state), now(), request_id),
+            )
+        send(chat_id, f"🎬 16:9 Segment {index + 1} is now rendering.")
+        segment = state["topic_result"]["segments"][index]
+        video = Path(state["video_path"])
+        video_id = state["parsed"].get("video_id", request_id)
+        import main
+
+        rendered = main.attach_topic_segment_asset(
+            dict(segment), video_id, video, index + 1
+        )
+        with _LOCK, _telegram_db() as db:
+            latest = db.execute(
+                "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+            latest_state = json.loads(latest["state_json"])
+            reviews = dict(latest_state.get("topic_reviews") or {})
+            reviews[str(index)] = {
+                **reviews.get(str(index), {}),
+                "status": "rendered",
+                "segment_url": rendered.get("segment_url"),
+                "rendered_at": now(),
+            }
+            latest_state["topic_reviews"] = reviews
+            db.execute(
+                "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+                (json.dumps(latest_state), now(), request_id),
+            )
+        send(
+            chat_id,
+            f"✅ 16:9 Segment {index + 1} rendered and uploaded to DRIVE_FOLDER_ID:\n"
+            f"{rendered.get('segment_url', '')}",
+        )
+    except Exception as exc:
+        logger.exception(
+            "16:9 render failed request_id=%s segment=%s", request_id, index + 1
+        )
+        try:
+            with _LOCK, _telegram_db() as db:
+                latest = db.execute(
+                    "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+                ).fetchone()
+                latest_state = json.loads(latest["state_json"])
+                reviews = dict(latest_state.get("topic_reviews") or {})
+                reviews[str(index)] = {
+                    **reviews.get(str(index), {}),
+                    "status": "render_failed",
+                    "render_error": str(exc),
+                    "rendered_at": now(),
+                }
+                latest_state["topic_reviews"] = reviews
+                db.execute(
+                    "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(latest_state), now(), request_id),
+                )
+        except Exception:
+            logger.exception("Could not persist 16:9 render failure")
+        send(
+            chat_id,
+            f"❌ 16:9 Segment {index + 1} render failed:\n{str(exc)[:1500]}",
+        )
 
 
 def _render_approved(request_id: str, index: int, chat_id: str) -> None:
