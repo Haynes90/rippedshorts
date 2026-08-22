@@ -430,7 +430,7 @@ def _motion_center(previous_gray, gray) -> Optional[float]:
 def _estimate_speaker_track(
     video_path: Path, start: float, duration: float
 ) -> list[tuple[float, float]]:
-    """Track the foreground/active face and return smoothed time/center samples."""
+    """Track the active foreground face without chasing brief background detections."""
     import cv2
     import numpy as np
 
@@ -446,6 +446,15 @@ def _estimate_speaker_track(
     previous_center = 0.5
     previous_box = None
     smoothed_center = 0.5
+    pending_switch_center: Optional[float] = None
+    pending_switch_count = 0
+    lost_samples = 0
+    switch_distance = max(
+        0.08, float(os.getenv("SPEAKER_SWITCH_DISTANCE", "0.18"))
+    )
+    switch_confirmations = max(
+        2, int(os.getenv("SPEAKER_SWITCH_CONFIRMATIONS", "3"))
+    )
     frame_number = 0
 
     while frame_number <= total_frames:
@@ -487,22 +496,54 @@ def _estimate_speaker_track(
                     ) / 255.0
             foreground = min(1.0, area_score * 30.0)
             score = foreground * 2.5 + motion_score * 3.0 + continuity * 1.5
-            if previous_box is not None:
-                px, py, pw, ph = previous_box
-                if abs(center - previous_center) < 0.12:
-                    score += 0.75
+            if previous_box is not None and abs(center - previous_center) < 0.12:
+                score += 0.75
             if score > selected_score:
                 selected_score = score
                 selected = (center, (x, y, width, height))
 
-        if selected is not None:
-            target_center, previous_box = selected
-        else:
-            target_center = _motion_center(previous_gray, gray)
-            if target_center is None:
+        if selected is None:
+            lost_samples += 1
+            pending_switch_center = None
+            pending_switch_count = 0
+            # A short detection loss must not make the crop chase motion or another face.
+            if lost_samples <= 2:
                 target_center = previous_center
+            else:
+                target_center = _motion_center(previous_gray, gray)
+                if target_center is None:
+                    target_center = previous_center
+        else:
+            lost_samples = 0
+            detected_center, detected_box = selected
+            if abs(detected_center - previous_center) >= switch_distance:
+                if (
+                    pending_switch_center is not None
+                    and abs(detected_center - pending_switch_center) < 0.08
+                ):
+                    pending_switch_count += 1
+                    pending_switch_center = (
+                        pending_switch_center * (pending_switch_count - 1)
+                        + detected_center
+                    ) / pending_switch_count
+                else:
+                    pending_switch_center = detected_center
+                    pending_switch_count = 1
+                if pending_switch_count >= switch_confirmations:
+                    target_center = pending_switch_center
+                    previous_box = detected_box
+                    pending_switch_center = None
+                    pending_switch_count = 0
+                else:
+                    target_center = previous_center
+            else:
+                pending_switch_center = None
+                pending_switch_count = 0
+                target_center = detected_center
+                previous_box = detected_box
 
-        # Dead zone and exponential smoothing prevent jitter and abrupt face switches.
+        # This smooths noisy analysis samples only. The rendered crop is stationary
+        # inside each framing section and never exposes this interpolation.
         if abs(target_center - smoothed_center) < 0.025:
             target_center = smoothed_center
         smoothed_center = 0.72 * smoothed_center + 0.28 * target_center
@@ -520,9 +561,121 @@ def _estimate_speaker_track(
     return samples
 
 
-def _piecewise_crop_expression(
-    samples: list[tuple[float, float]], width: int, target_width: int
+def _detect_audio_pause_boundaries(
+    video_path: Path, start: float, duration: float
+) -> list[float]:
+    """Return clip-relative pause endpoints that can hide a deliberate reframe."""
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostats",
+        "-ss",
+        f"{start:.3f}",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        str(video_path),
+        "-af",
+        "silencedetect=noise=-35dB:d=0.18",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, timeout=max(30, int(duration) + 15)
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("Pause detection unavailable: %s", exc)
+        return []
+    output = completed.stderr or ""
+    return [
+        value
+        for value in (
+            float(match)
+            for match in re.findall(r"silence_end:\\s*([0-9.]+)", output)
+        )
+        if 0.0 < value < duration
+    ]
+
+
+def _plan_framing_sections(
+    samples: list[tuple[float, float]],
+    duration: float,
+    preferred_boundaries: Optional[list[float]] = None,
+) -> list[tuple[float, float]]:
+    """Plan stationary 3–7 second crops, preferring pauses and tracking cuts."""
+    from statistics import median
+
+    if not samples:
+        return [(0.0, 0.5)]
+    target_seconds = min(
+        7.0, max(3.0, float(os.getenv("SPEAKER_REFRAME_SECONDS", "4.0")))
+    )
+    minimum_seconds = min(
+        target_seconds,
+        max(3.0, float(os.getenv("SPEAKER_REFRAME_MIN_SECONDS", "3.0"))),
+    )
+    maximum_seconds = max(
+        target_seconds,
+        min(7.0, float(os.getenv("SPEAKER_REFRAME_MAX_SECONDS", "7.0"))),
+    )
+    movement_threshold = max(
+        0.02, float(os.getenv("SPEAKER_REFRAME_THRESHOLD", "0.07"))
+    )
+
+    preferred = list(preferred_boundaries or [])
+    # Abrupt, persistent position changes are useful proxies for a camera cut or
+    # speaker change. Slow movement is intentionally not turned into crop motion.
+    for index in range(1, len(samples)):
+        if abs(samples[index][1] - samples[index - 1][1]) >= movement_threshold * 1.5:
+            preferred.append(samples[index][0])
+    preferred = sorted(set(round(value, 3) for value in preferred if 0 < value < duration))
+
+    boundaries = [0.0]
+    cursor = 0.0
+    while duration - cursor > maximum_seconds:
+        low = cursor + minimum_seconds
+        # Leave at least the minimum hold for the final section too.
+        high = min(cursor + maximum_seconds, duration - minimum_seconds)
+        ideal = min(cursor + target_seconds, high)
+        choices = [value for value in preferred if low <= value <= high]
+        boundary = min(choices, key=lambda value: abs(value - ideal)) if choices else ideal
+        boundaries.append(boundary)
+        cursor = boundary
+    if boundaries[-1] < duration:
+        boundaries.append(duration)
+
+    sections: list[tuple[float, float]] = []
+    previous_center: Optional[float] = None
+    for index in range(len(boundaries) - 1):
+        section_start = boundaries[index]
+        section_end = boundaries[index + 1]
+        centers = [
+            center
+            for timestamp, center in samples
+            if section_start <= timestamp < section_end
+        ]
+        proposed_center = median(centers) if centers else (
+            previous_center if previous_center is not None else 0.5
+        )
+        proposed_center = max(0.0, min(1.0, float(proposed_center)))
+        if (
+            previous_center is not None
+            and abs(proposed_center - previous_center) < movement_threshold
+        ):
+            proposed_center = previous_center
+        if previous_center is None or proposed_center != previous_center:
+            sections.append((section_start, proposed_center))
+            previous_center = proposed_center
+
+    return sections or [(0.0, 0.5)]
+
+
+def _stepped_crop_expression(
+    sections: list[tuple[float, float]], width: int, target_width: int
 ) -> str:
+    """Build an FFmpeg crop expression with hard holds and intentional snaps."""
     positions = [
         (
             timestamp,
@@ -534,15 +687,14 @@ def _piecewise_crop_expression(
                 ),
             ),
         )
-        for timestamp, center in samples
+        for timestamp, center in sections
     ]
     expression = str(positions[-1][1])
     for index in range(len(positions) - 2, -1, -1):
-        t0, x0 = positions[index]
-        t1, x1 = positions[index + 1]
-        span = max(0.001, t1 - t0)
-        interpolated = f"{x0}+({x1 - x0})*(t-{t0:.3f})/{span:.3f}"
-        expression = f"if(lt(t,{t1:.3f}),{interpolated},{expression})"
+        next_timestamp = positions[index + 1][0]
+        expression = (
+            f"if(lt(t,{next_timestamp:.3f}),{positions[index][1]},{expression})"
+        )
     return expression
 
 
@@ -551,8 +703,17 @@ def _build_crop_filter(video_path: Path, start: float, duration: float) -> str:
     target_width = min(width, int(height * 9 / 16))
     target_width = max(2, target_width - (target_width % 2))
     samples = _estimate_speaker_track(video_path, start, duration)
-    crop_expression = _piecewise_crop_expression(samples, width, target_width)
+    pause_boundaries = _detect_audio_pause_boundaries(video_path, start, duration)
+    sections = _plan_framing_sections(samples, duration, pause_boundaries)
+    crop_expression = _stepped_crop_expression(sections, width, target_width)
+    logger.info(
+        "Speaker reframing duration=%.2fs sections=%s pauses=%s",
+        duration,
+        len(sections),
+        len(pause_boundaries),
+    )
     return f"crop={target_width}:{height}:x='{crop_expression}':y=0"
+
 
 def create_clip_file(video_path: Path, start: float, duration: float, output_path: Path) -> None:
     crop_filter = _build_crop_filter(video_path, start, duration)
