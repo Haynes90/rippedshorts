@@ -346,69 +346,11 @@ def create_transcript_doc(video_id: str, segments: List[dict]) -> Dict[str, str]
 
 
 def download_youtube_video(video_id: str, youtube_url: Optional[str], workdir: Path) -> Path:
-    workdir.mkdir(parents=True, exist_ok=True)
-    headers = {
-        "x-rapidapi-key": RAPIDAPI_KEY,
-        "x-rapidapi-host": YOUTUBE_DL_HOST,
-    }
-    endpoint = f"https://{YOUTUBE_DL_HOST}{YOUTUBE_DL_PATH_TEMPLATE.format(video_id=video_id)}"
+    """Use the same resilient yt-dlp source recovery pattern as Audio Master."""
+    from source_ingestion import download_youtube_resilient
 
-    def _extract_download_url(payload: dict) -> Optional[str]:
-        download_url = (
-            payload.get("url")
-            or payload.get("download")
-            or payload.get("download_url")
-            or payload.get("downloadUrl")
-            or payload.get("videoUrl")
-            or payload.get("mainDownloadUrl")
-        )
-        if download_url:
-            return download_url
-        formats = payload.get("formats")
-        if isinstance(formats, list):
-            best: Optional[str] = None
-            for item in formats:
-                if not isinstance(item, dict):
-                    continue
-                candidate = item.get("downloadUrl") or item.get("download_url") or item.get("url")
-                if not candidate:
-                    continue
-                mime = str(item.get("mimeType", "")).lower()
-                has_video = bool(item.get("hasVideo"))
-                has_audio = bool(item.get("hasAudio"))
-                if has_video and "video/mp4" in mime and has_audio:
-                    return candidate
-                if has_video and "video/mp4" in mime and not best:
-                    best = candidate
-            if best:
-                return best
-        return None
-
-    def _request_download() -> tuple[dict, Optional[str]]:
-        resp = requests.get(
-            endpoint,
-            headers=headers,
-            params={"quality": "247"},
-            timeout=(10, 60),
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"Youtube download API error ({resp.status_code}): {resp.text}")
-        payload = resp.json()
-        return payload, _extract_download_url(payload)
-
-    payload, download_url = _request_download()
-    if not download_url:
-        time.sleep(420)
-        payload, download_url = _request_download()
-    if not download_url:
-        time.sleep(120)
-        payload, download_url = _request_download()
-    if not download_url:
-        raise RuntimeError(f"Unable to extract download URL from API response: {payload}")
-    output_path = workdir / f"{video_id}.mp4"
-    download_video_asset(download_url, output_path)
-    return output_path
-
+    source_url = youtube_url or f"https://www.youtube.com/watch?v={video_id}"
+    return download_youtube_resilient(video_id, source_url, workdir)
 
 def cleanup_old_temp_downloads(max_age_hours: int = 24) -> None:
     cutoff = time.time() - (max_age_hours * 3600)
@@ -598,11 +540,16 @@ def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optiona
         "- Each clip MUST deliver at least one of: an impactful lesson, a strong insight, or a quotable line.\n"
         "- Do NOT paraphrase, rewrite, infer missing context, or fabricate.\n"
         "- Do NOT return duplicate or near-duplicate clips; each clip must be materially distinct.\n"
-        "- Avoid duplicates/near-duplicates; maximize variety.\n\n"
+        "- Clips MUST NOT overlap in time. A transcript line may belong to at most one selected clip.\n"
+        "- Spread selections across the full eligible timeline instead of clustering around one section.\n"
+        "- Prefer fewer excellent complete thoughts over padding the result to 20.\n"
+        "- Avoid repeated lessons, examples, stories, claims, setups, and payoffs; maximize topical variety.\n\n"
         "PROCESS\n"
         "1) First pass: determine main_theme + 3–8 key ideas.\n"
-        "2) Second pass: pick clips that best support those ideas AND will perform on social.\n"
-        "3) Categorize each clip using the MASTER CATEGORY LIST.\n\n"
+        "2) Second pass: build a larger candidate pool across the beginning, middle, and end.\n"
+        "3) Remove clips that overlap, repeat a point, lack their setup/payoff, or cut a sentence.\n"
+        "4) Rank the remaining distinct candidates and return no more than 20.\n"
+        "5) Categorize each clip using the MASTER CATEGORY LIST.\n\n"
         "MASTER CATEGORY LIST (choose ONE per clip)\n"
         "- inspiration\n"
         "- education\n"
