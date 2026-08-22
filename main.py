@@ -748,6 +748,66 @@ def create_clip_file(video_path: Path, start: float, duration: float, output_pat
         raise RuntimeError(f"FFmpeg render produced no usable clip: {output_path}")
 
 
+def create_topic_segment_file(
+    video_path: Path, start: float, duration: float, output_path: Path
+) -> None:
+    """Render a horizontal topic segment without applying the Shorts crop."""
+    command = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start:.2f}",
+        "-t",
+        f"{duration:.2f}",
+        "-i",
+        str(video_path),
+        "-vf",
+        "scale=1920:1080:force_original_aspect_ratio=decrease,"
+        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=7200)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"FFmpeg 16:9 render failed with code {completed.returncode}: "
+            f"{(completed.stderr or completed.stdout)[-3000:]}"
+        )
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError(f"FFmpeg 16:9 render produced no usable segment: {output_path}")
+
+
+def attach_topic_segment_asset(
+    segment: dict,
+    video_id: str,
+    video_path: Path,
+    segment_number: int,
+) -> dict:
+    workdir = Path("/tmp") / f"topics_{video_id}"
+    workdir.mkdir(parents=True, exist_ok=True)
+    segment_name = f"{video_id}_Segment_{segment_number}.mp4"
+    output_path = workdir / f".render-{uuid.uuid4().hex}-{segment_name}"
+    start = float(segment.get("start", 0.0))
+    duration = float(segment.get("duration", 0.0))
+    if duration <= 0:
+        raise RuntimeError("16:9 segment duration must be positive")
+    create_topic_segment_file(video_path, start, duration, output_path)
+    uploaded = upload_clip_to_drive(output_path, segment_name)
+    return {
+        **segment,
+        "segment_number": segment_number,
+        "segment_name": segment_name,
+        "segment_url": uploaded["clip_url"],
+    }
+
+
 def upload_clip_to_drive(clip_path: Path, clip_name: str) -> dict:
     if not DRIVE_FOLDER_ID:
         raise RuntimeError("Drive folder id not configured (Drive_Folder_ID/DRIVE_FOLDER_ID)")
