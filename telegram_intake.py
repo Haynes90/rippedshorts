@@ -899,8 +899,8 @@ def _process_topics(
 ) -> dict[str, Any]:
     send(
         chat_id,
-        "📺 Mapping the full eligible video into non-overlapping 16:9 sections "
-        "targeting about 8 minutes each.",
+        "📺 Mapping the full eligible video into non-overlapping 16:9 sections. "
+        "Topic completeness controls the cuts; 8 minutes is only a reference.",
     )
     suggestions = _topic_break_suggestions(segments)
     topics = _build_contiguous_topic_segments(segments, suggestions)
