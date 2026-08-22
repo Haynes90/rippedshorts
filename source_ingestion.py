@@ -192,6 +192,11 @@ def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -
         or os.getenv("YT_DLP_COOKIE_FILE")
         or ""
     ).strip()
+    cookie_text = (os.getenv("YOUTUBE_COOKIES") or "").strip()
+    if cookie_text and not cookie_file:
+        generated_cookie_file = workdir / "youtube-cookies.txt"
+        generated_cookie_file.write_text(cookie_text.replace("\\n", "\n") + "\n", encoding="utf-8")
+        cookie_file = str(generated_cookie_file)
     options: dict[str, Any] = {
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
         "outtmpl": str(destination),
