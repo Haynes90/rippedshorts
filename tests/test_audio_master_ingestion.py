@@ -8,7 +8,8 @@ TELEGRAM = (Path(__file__).resolve().parents[1] / "telegram_intake.py").read_tex
 def test_missing_assets_are_delegated_to_audio_master():
     assert "ingest_with_audio_master(video_id, parsed[\"source_value\"])" in TELEGRAM
     assert "download_youtube_resilient(video_id" not in TELEGRAM
-    assert "Metadata and Podhome publishing are disabled" in TELEGRAM
+    assert "Preparing the reusable video and transcript now." in TELEGRAM
+    assert "Podhome" not in TELEGRAM
 
 
 def test_audio_master_client_uses_protected_dedicated_routes():
