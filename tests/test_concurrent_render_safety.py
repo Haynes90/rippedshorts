@@ -163,3 +163,39 @@ def test_tracker_holds_on_loss_and_requires_consistent_speaker_switch():
     assert "pending_switch_count >= switch_confirmations" in source
     assert 'SPEAKER_SWITCH_DISTANCE", "0.18"' in source
     assert 'SPEAKER_SWITCH_CONFIRMATIONS", "3"' in source
+
+
+def test_plain_link_starts_shorts_and_horizontal_topic_lanes():
+    source = (ROOT / "telegram_intake.py").read_text()
+    assert 'mode = "both"' in source
+    assert 'if row["mode"] in {"topics", "both"}:' in source
+    assert "state = _process_topics(" in source
+
+
+def test_horizontal_segments_cover_full_timeline_without_overlap():
+    source = (ROOT / "telegram_intake.py").read_text()
+    assert "def _build_contiguous_topic_segments" in source
+    assert 'TOPIC_SEGMENT_TARGET_SECONDS", "480"' in source
+    assert 'TOPIC_SEGMENT_MIN_SECONDS", "181"' in source
+    assert 'boundaries = [timeline_start]' in source
+    assert "boundaries.append(timeline_end)" in source
+    assert '"coverage": "full_eligible_timeline"' in source
+
+
+def test_horizontal_segments_have_separate_review_and_renderer():
+    intake = (ROOT / "telegram_intake.py").read_text()
+    main = (ROOT / "main.py").read_text()
+    assert "Approve 16:9" in intake
+    assert "rs:topic_approve:" in intake
+    assert "def _render_topic_approved" in intake
+    assert "def create_topic_segment_file" in main
+    assert 'f"{video_id}_Segment_{segment_number}.mp4"' in main
+    assert "attach_topic_segment_asset" in main
+
+
+def test_shorts_expand_to_complete_sentence_boundaries():
+    source = (ROOT / "telegram_intake.py").read_text()
+    assert "def _sentence_complete_candidate" in source
+    assert "Finish the current sentence" in source
+    assert "complete sentence/thought boundary" in source
+    assert "end - start <= 90" in source
