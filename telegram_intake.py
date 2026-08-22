@@ -320,8 +320,8 @@ def _log_candidate_decision(
         ).execute()
 
 
-def _approved_clips_from_sheet(video_id: str) -> list[dict[str, Any]]:
-    """Recover approved, unfinished clips by exact YouTube ID after a restart."""
+def _approved_clip_history_from_sheet(video_id: str) -> dict[str, list[dict[str, Any]]]:
+    """Return approved rendered and unfinished clips for an exact YouTube ID."""
     import main
 
     _, _, sheets = main.get_google_services()
@@ -339,8 +339,7 @@ def _approved_clips_from_sheet(video_id: str) -> list[dict[str, Any]]:
             continue
         render_status = str(padded[19]).strip().lower()
         clip_url = str(padded[18]).strip()
-        if render_status == "rendered" and clip_url:
-            continue
+        is_rendered = render_status == "rendered" and bool(clip_url)
         try:
             start = float(padded[9])
             end = float(padded[10])
@@ -360,8 +359,15 @@ def _approved_clips_from_sheet(video_id: str) -> list[dict[str, Any]]:
             "_sheet_request_id": str(padded[1]).strip(),
             "_reviewed_at": str(padded[16]).strip(),
             "_reviewer_user_id": str(padded[20]).strip(),
+            "_render_status": render_status,
+            "_clip_url": clip_url,
+            "_is_rendered": is_rendered,
         }
-    return sorted(recovered.values(), key=lambda item: item["candidate_number"])
+    ordered = sorted(recovered.values(), key=lambda item: item["candidate_number"])
+    return {
+        "rendered": [item for item in ordered if item["_is_rendered"]],
+        "unfinished": [item for item in ordered if not item["_is_rendered"]],
+    }
 
 
 def _safe_log_candidate(*args, **kwargs) -> None:
@@ -519,7 +525,9 @@ def _process(request_id: str) -> None:
                     state.setdefault("warnings", []).append("Approved sermon boundary did not contain reusable transcript segments.")
 
         if row["source_kind"] == "youtube":
-            approved_clips = _approved_clips_from_sheet(video_id)
+            approval_history = _approved_clip_history_from_sheet(video_id)
+            approved_clips = approval_history["unfinished"]
+            rendered_clips = approval_history["rendered"]
             if approved_clips:
                 reviews = {
                     str(index): {
@@ -548,10 +556,41 @@ def _process(request_id: str) -> None:
                     chat_id,
                     f"♻️ Recovered {len(approved_clips)} approved unfinished clip(s) "
                     f"for YouTube ID {video_id} from the Ripped Shorts sheet. "
-                    "Rendering only those approved clips now.",
+                    "Rendering only those approved clips now."
+                    + (
+                        f" {len(rendered_clips)} previously rendered clip(s) were skipped."
+                        if rendered_clips
+                        else ""
+                    ),
                 )
                 for index in range(len(approved_clips)):
                     RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
+                return
+            if rendered_clips:
+                existing_links = [
+                    str(clip.get("_clip_url") or "")
+                    for clip in rendered_clips
+                    if clip.get("_clip_url")
+                ]
+                _save(
+                    request_id,
+                    "already_rendered",
+                    {
+                        **state,
+                        "stage": "already_rendered",
+                        "video_path": str(video),
+                        "source_reused": reused,
+                        "existing_clip_links": existing_links,
+                    },
+                )
+                links_text = "\n".join(existing_links[:20])
+                send(
+                    chat_id,
+                    f"✅ YouTube ID {video_id} has already been clipped. "
+                    f"Found {len(rendered_clips)} rendered approved clip(s) in the "
+                    "Ripped Shorts sheet, so GPT selection was not run again."
+                    + (f"\n\n{links_text}" if links_text else ""),
+                )
                 return
 
         _save(request_id, "selecting", {**state, "stage": "selection", "video_path": str(video), "source_reused": reused})
