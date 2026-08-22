@@ -545,6 +545,7 @@ def attach_clip_assets(
         return clips_payload
 
     workdir = Path("/tmp") / f"clips_{video_id}"
+    workdir.mkdir(parents=True, exist_ok=True)
     video_path = video_path_override or download_youtube_video(video_id, youtube_url, workdir)
     for idx, segment in enumerate(segments, start=1):
         start = float(segment.get("start", 0.0))
@@ -571,7 +572,9 @@ def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optiona
         "TASK\n"
         "You are a highlight editor for ANY type of content. Review the ENTIRE transcript in chronological order "
         "and select the best short-form clips.\n"
-        "Return a MAX of 20 clips, each 10–90 seconds, prioritized by engagement and standalone clarity.\n"
+        "Target 18–20 final clips, each 10–90 seconds, prioritized by engagement and standalone clarity. "
+        "When the transcript contains at least 20 qualified complete thoughts, return 20. "
+        "Build up to 24 candidates internally so validation can retain close to 20.\n"
         "You MUST scan the full transcript before selecting any clips.\n\n"
         "TRANSCRIPT FORMAT (YOU MUST FOLLOW THIS)\n"
         "- Each transcript line is already time-aligned and looks like:\n"
@@ -592,16 +595,17 @@ def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optiona
         "- Every clip MUST represent a complete sentence or complete thought.\n"
         "- Each clip MUST deliver at least one of: an impactful lesson, a strong insight, or a quotable line.\n"
         "- Do NOT paraphrase, rewrite, infer missing context, or fabricate.\n"
-        "- Do NOT return duplicate or near-duplicate clips; each clip must be materially distinct.\n"
-        "- Clips MUST NOT overlap in time. A transcript line may belong to at most one selected clip.\n"
+        "- Do NOT return duplicate or near-duplicate complete clips; each clip must be materially distinct.\n"
+        "- Clips MAY overlap in time when overlap is needed to preserve two different complete thoughts.\n"
+        "- Reusing a short setup is allowed, but do not return the same lesson, payoff, or complete clip twice.\n"
         "- Spread selections across the full eligible timeline instead of clustering around one section.\n"
         "- Prefer fewer excellent complete thoughts over padding the result to 20.\n"
         "- Avoid repeated lessons, examples, stories, claims, setups, and payoffs; maximize topical variety.\n\n"
         "PROCESS\n"
         "1) First pass: classify content_type, determine main_theme, 3–8 key ideas, and useful topic keywords.\n"
         "2) Second pass: build a larger candidate pool across the beginning, middle, and end.\n"
-        "3) Remove clips that overlap, repeat a point, lack their setup/payoff, or cut a sentence.\n"
-        "4) Rank the remaining distinct candidates and return no more than 20.\n"
+        "3) Remove clips that duplicate a complete thought, lack their setup/payoff, or cut a sentence.\n"
+        "4) Rank the remaining distinct candidates and return as close to 20 as quality allows.\n"
         "5) Categorize each clip using the MASTER CATEGORY LIST.\n\n"
         "MASTER CATEGORY LIST (choose ONE per clip)\n"
         "- inspiration\n"
