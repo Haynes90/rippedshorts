@@ -268,8 +268,7 @@ def _process(request_id: str) -> None:
                     chat_id,
                     "🎧 Drive cache is missing "
                     + " and ".join(missing)
-                    + ". Sending this YouTube ID through Audio Master's existing cache/download/transcription pipeline. "
-                    "Metadata and Podhome publishing are disabled for this job.",
+                    + ". Preparing the reusable video and transcript now.",
                 )
                 audio_master_result = ingest_with_audio_master(video_id, parsed["source_value"])
                 state["audio_master_ingest"] = {
