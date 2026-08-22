@@ -231,12 +231,97 @@ def _sentence_complete_candidate(
     end = float(candidate.get("end", start + float(candidate.get("duration", 0))))
     start_index = min(range(len(ordered)), key=lambda i: abs(ordered[i][0] - start))
     end_index = min(range(len(ordered)), key=lambda i: abs(ordered[i][1] - end))
+    sentence_end = r"[.!?][\"’']?$"
 
     # If the previous transcript line did not finish a sentence, this candidate
     # began mid-thought. Walk backward to the prior completed sentence.
     while (
         start_index > 0
-        and not re.search(r'[.!?]["’\']?
+        and not re.search(sentence_end, ordered[start_index - 1][2])
+        and ordered[end_index][1] - ordered[start_index - 1][0] <= 90
+    ):
+        start_index -= 1
+
+    # Finish the current sentence, but never grow beyond the Shorts maximum.
+    while (
+        end_index + 1 < len(ordered)
+        and not re.search(sentence_end, ordered[end_index][2])
+        and ordered[end_index + 1][1] - ordered[start_index][0] <= 90
+    ):
+        end_index += 1
+
+    selected = ordered[start_index : end_index + 1]
+    completed_start, completed_end = selected[0][0], selected[-1][1]
+    return {
+        **candidate,
+        "start": completed_start,
+        "end": completed_end,
+        "duration": round(completed_end - completed_start, 3),
+        "transcript": " ".join(text for _, _, text in selected),
+    }
+
+
+def validate_complete_candidates(
+    payload: dict, transcript_segments: list[dict], tolerance: float = 0.75
+) -> dict:
+    """Reject invented text and enforce complete sentence/thought boundaries."""
+    boundaries = []
+    for item in transcript_segments:
+        start = float(item.get("start", 0))
+        end = float(item.get("end", start + float(item.get("duration", 0))))
+        boundaries.append((start, end, str(item.get("text", "")).strip()))
+    valid, rejected = [], []
+    sentence_end = r"[.!?][\"’']?$"
+    for original in payload.get("segments", []):
+        candidate = _sentence_complete_candidate(
+            dict(original), transcript_segments, tolerance
+        )
+        start = float(candidate.get("start", -1))
+        end = float(candidate.get("end", start + float(candidate.get("duration", 0))))
+        begins_cleanly = any(
+            abs(start - seg_start) <= tolerance for seg_start, _, _ in boundaries
+        )
+        ends_cleanly = any(
+            abs(end - seg_end) <= tolerance for _, seg_end, _ in boundaries
+        )
+        included = [
+            text
+            for seg_start, seg_end, text in boundaries
+            if seg_start >= start - tolerance and seg_end <= end + tolerance
+        ]
+        expected = " ".join(included).casefold()
+        quoted = str(candidate.get("transcript", "")).strip().casefold()
+        complete_end = bool(
+            re.search(sentence_end, str(candidate.get("transcript", "")).strip())
+        )
+        if (
+            begins_cleanly
+            and ends_cleanly
+            and quoted
+            and expected
+            and (quoted in expected or expected in quoted)
+            and end > start
+            and end - start <= 90
+            and complete_end
+        ):
+            candidate.update(
+                {"start": start, "end": end, "duration": round(end - start, 3)}
+            )
+            valid.append(candidate)
+        else:
+            rejected.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "reason": "Unsupported text or incomplete sentence/thought boundary",
+                }
+            )
+    return {
+        **payload,
+        "segments": valid[:20],
+        "validation_rejections": rejected,
+    }
+
 
 def _timecode(seconds: float) -> str:
     total = max(0, int(seconds))
