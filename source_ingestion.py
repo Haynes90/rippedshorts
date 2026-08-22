@@ -372,7 +372,12 @@ def restrict_to_boundary(segments: list[dict[str, Any]], boundary: dict[str, flo
     ]
 
 
-def select_non_overlapping(clips: list[dict[str, Any]], limit: int = 20) -> list[dict[str, Any]]:
+def select_non_overlapping(
+    clips: list[dict[str, Any]],
+    limit: int = 20,
+    *,
+    allow_overlap: bool = False,
+) -> list[dict[str, Any]]:
     ranked = sorted(clips, key=lambda item: float(item.get("score", 0)), reverse=True)
     chosen: list[dict[str, Any]] = []
     for clip in ranked:
@@ -380,7 +385,19 @@ def select_non_overlapping(clips: list[dict[str, Any]], limit: int = 20) -> list
         end = float(clip.get("end", start + float(clip.get("duration", 0))))
         if end <= start:
             continue
-        if any(start < float(item["end"]) and end > float(item["start"]) for item in chosen):
+        normalized_text = " ".join(
+            str(clip.get("transcript", "")).lower().split()
+        )
+        if normalized_text and any(
+            normalized_text
+            == " ".join(str(item.get("transcript", "")).lower().split())
+            for item in chosen
+        ):
+            continue
+        if not allow_overlap and any(
+            start < float(item["end"]) and end > float(item["start"])
+            for item in chosen
+        ):
             continue
         clip["start"], clip["end"], clip["duration"] = start, end, end - start
         chosen.append(clip)
