@@ -4,7 +4,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_clip_output_names_use_file_id_and_candidate_number():
+def test_clip_output_names_use_youtube_id_and_candidate_number():
     source = (ROOT / "main.py").read_text()
     telegram_source = (ROOT / "telegram_intake.py").read_text()
     assert 'clip_name = f"{video_id}_Clip_{candidate_number}.mp4"' in source
