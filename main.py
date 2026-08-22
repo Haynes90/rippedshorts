@@ -379,35 +379,67 @@ def _probe_video_dimensions(video_path: Path) -> tuple[int, int]:
 
 
 def _estimate_speaker_center_x(video_path: Path, start: float, duration: float) -> float:
+    """Estimate the speaker position without making face detection a render gate."""
     import cv2
-    import mediapipe as mp
 
-    mp_face = mp.solutions.face_detection
-    detector = mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.5)
     cap = cv2.VideoCapture(str(video_path))
     cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
     centers = []
-    total_frames = int(min(duration, 30) * 2)
+    total_samples = max(1, int(min(duration, 30) * 2))
     step = max(1, int(cap.get(cv2.CAP_PROP_FPS) // 2 or 1))
-    frame_idx = 0
-    while len(centers) < total_frames:
+
+    detector = None
+    try:
+        # Some MediaPipe wheels no longer export solutions at package level.
+        from mediapipe.python.solutions import face_detection
+
+        detector = face_detection.FaceDetection(
+            model_selection=0, min_detection_confidence=0.5
+        )
+    except (ImportError, AttributeError, RuntimeError) as exc:
+        logger.warning(
+            "MediaPipe face detection unavailable; using OpenCV/center crop: %s", exc
+        )
+
+    cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+    frame_index = 0
+    while len(centers) < total_samples:
         ok, frame = cap.read()
         if not ok:
             break
-        if frame_idx % step == 0:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = detector.process(rgb)
-            if results.detections:
-                bbox = results.detections[0].location_data.relative_bounding_box
-                center_x = bbox.xmin + bbox.width / 2
-                centers.append(center_x)
-        frame_idx += 1
+        if frame_index % step == 0:
+            center = None
+            if detector is not None:
+                try:
+                    results = detector.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    if results.detections:
+                        box = results.detections[0].location_data.relative_bounding_box
+                        center = box.xmin + box.width / 2
+                except Exception as exc:
+                    logger.warning("MediaPipe frame detection failed; falling back: %s", exc)
+                    detector.close()
+                    detector = None
+            if center is None and not cascade.empty():
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = cascade.detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40)
+                )
+                if len(faces):
+                    x, _, width, _ = max(faces, key=lambda face: face[2] * face[3])
+                    center = (x + width / 2) / frame.shape[1]
+            if center is not None:
+                centers.append(max(0.0, min(1.0, float(center))))
+        frame_index += 1
+
     cap.release()
-    detector.close()
+    if detector is not None:
+        detector.close()
     if centers:
         return sum(centers) / len(centers)
+    logger.info("No face detected for clip; using safe center crop")
     return 0.5
-
 
 def _build_crop_filter(video_path: Path, start: float, duration: float) -> str:
     width, height = _probe_video_dimensions(video_path)
