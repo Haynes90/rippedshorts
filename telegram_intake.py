@@ -400,6 +400,78 @@ def _reviewed_short_history_from_sheet(video_id: str) -> list[dict[str, Any]]:
     return sorted(found.values(), key=lambda item: item["candidate_number"])
 
 
+def _short_learning_prompt(video_id: str) -> str:
+    """Build balanced approval/rejection examples from the durable Shorts ledger."""
+    import main
+
+    _, _, sheets = main.get_google_services()
+    response = sheets.spreadsheets().values().get(
+        spreadsheetId=RIPPED_LOG_SHEET_ID,
+        range=f"'{RIPPED_LOG_SHEET_TAB}'!A:U",
+    ).execute()
+    rows = response.get("values", [])[1:]
+    same_video_types = {
+        str((list(values) + [""] * 21)[4]).strip().lower()
+        for values in rows
+        if str((list(values) + [""] * 21)[2]).strip() == video_id
+        and str((list(values) + [""] * 21)[4]).strip()
+    }
+    examples = []
+    for recency, values in enumerate(rows):
+        padded = list(values) + [""] * (21 - len(values))
+        decision = str(padded[15]).strip().lower()
+        if decision not in {"approved", "rejected"}:
+            continue
+        transcript = str(padded[13]).strip()
+        if not transcript:
+            continue
+        content_type = str(padded[4]).strip().lower()
+        priority = (
+            2 if str(padded[2]).strip() == video_id else
+            1 if content_type and content_type in same_video_types else
+            0
+        )
+        examples.append({
+            "decision": decision,
+            "priority": priority,
+            "recency": recency,
+            "content_type": content_type or "unknown",
+            "category": str(padded[12]).strip() or "unknown",
+            "transcript": transcript[:700],
+            "reason": str(padded[14]).strip()[:300],
+        })
+
+    examples.sort(
+        key=lambda item: (item["priority"], item["recency"]), reverse=True
+    )
+    approved = [item for item in examples if item["decision"] == "approved"][:10]
+    rejected = [item for item in examples if item["decision"] == "rejected"][:10]
+
+    def format_examples(label: str, selected: list[dict[str, Any]]) -> str:
+        if not selected:
+            return f"{label}: none recorded yet"
+        lines = [label + ":"]
+        for item in selected:
+            lines.append(
+                f"- type={item['content_type']} category={item['category']} | "
+                f"{item['transcript']}"
+                + (f" | prior reason={item['reason']}" if item["reason"] else "")
+            )
+        return "\n".join(lines)
+
+    return (
+        "LEARNING FROM DEREK'S SHORT REVIEWS\n"
+        "Treat approvals as positive structural examples and rejections as negative "
+        "examples. Learn the qualities, not their exact wording or timestamps. "
+        "Reject scripture-only readings without interpretation/application, generic "
+        "blurbs without a payoff, incomplete setups, and context-dependent fragments. "
+        "Require a standalone hook, developed point, and payoff.\n"
+        + format_examples("APPROVED SHORTS", approved)
+        + "\n"
+        + format_examples("REJECTED SHORTS", rejected)
+    )
+
+
 def _safe_log_candidate(*args, **kwargs) -> None:
     try:
         _log_candidate_decision(*args, **kwargs)
@@ -564,6 +636,8 @@ def _process(request_id: str) -> None:
                 else:
                     state.setdefault("warnings", []).append("Approved sermon boundary did not contain reusable transcript segments.")
 
+        force_rerip = bool(state.get("force_rerip"))
+        reuse_existing = bool(state.get("reuse_existing"))
         approved_clips: list[dict[str, Any]] = []
         rendered_clips: list[dict[str, Any]] = []
         prior_shorts: list[dict[str, Any]] = []
@@ -575,7 +649,7 @@ def _process(request_id: str) -> None:
 
             # Ten reviewed shorts is enough history to treat this ID as already
             # discovered. Below ten, search again for additional distinct shorts.
-            if len(prior_shorts) >= 10:
+            if reuse_existing or (len(prior_shorts) >= 10 and not force_rerip):
                 if approved_clips:
                     reviews = {
                         str(index): {
@@ -641,7 +715,7 @@ def _process(request_id: str) -> None:
                     return
 
         prior_count = len(prior_shorts)
-        needed = max(1, 20 - prior_count)
+        needed = 20 if force_rerip else max(1, 20 - prior_count)
         _save(
             request_id,
             "selecting",
@@ -669,23 +743,41 @@ def _process(request_id: str) -> None:
             {**item, "video_id": state["parsed"].get("video_id", "drive-source")}
             for item in segments
         ]
+        learning_prompt = _short_learning_prompt(
+            video_id if row["source_kind"] == "youtube" else ""
+        )
         prior_summary = "\n".join(
             f"- {item['start']:.2f}-{item['end']:.2f}: {item.get('transcript', '')}"
             for item in prior_shorts
         )
-        supplemental = (
-            f"Find up to {needed} ADDITIONAL distinct shorts. Do not repeat any "
-            "complete thought, lesson, payoff, or transcript below. Time overlap is "
-            "allowed only when the new short is materially different.\n"
-            f"PREVIOUSLY REVIEWED SHORTS:\n{prior_summary[:12000]}"
-            if prior_shorts
-            else None
-        )
+        if force_rerip:
+            supplemental = (
+                "Perform a fresh re-rip and select up to 20 of the strongest Shorts. "
+                "Previously approved Shorts may be selected again if they remain among "
+                "the best. Never select a previously rejected complete Short again.\n"
+                + learning_prompt
+                + (f"\nSAME-VIDEO REVIEW HISTORY:\n{prior_summary[:12000]}" if prior_summary else "")
+            )
+        elif prior_shorts:
+            supplemental = (
+                f"Find up to {needed} ADDITIONAL distinct Shorts. Do not repeat any "
+                "previous complete thought, lesson, payoff, or transcript. Time overlap "
+                "is allowed only when the new Short is materially different.\n"
+                + learning_prompt
+                + f"\nPREVIOUSLY REVIEWED SHORTS:\n{prior_summary[:12000]}"
+            )
+        else:
+            supplemental = learning_prompt
         result = main.call_openai_for_clips(enriched, supplemental)
         result = validate_complete_candidates(result, enriched)
+        excluded_history = (
+            [item for item in prior_shorts if item.get("decision") == "rejected"]
+            if force_rerip
+            else prior_shorts
+        )
         prior_texts = {
             " ".join(str(item.get("transcript", "")).lower().split())
-            for item in prior_shorts
+            for item in excluded_history
             if item.get("transcript")
         }
         new_segments = [
@@ -755,6 +847,38 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
         return {"status": "ignored"}
     if not _authorized(chat_id, user_id):
         return {"status": "unauthorized"}
+    rerip_choice = re.fullmatch(
+        r"rs:(rerip|reuse):([A-Za-z0-9-]+)", callback_data
+    )
+    if rerip_choice:
+        choice, request_id = rerip_choice.groups()
+        with _LOCK, _telegram_db() as db:
+            row = db.execute(
+                "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+            if not row:
+                return {"status": "not_found"}
+            state = json.loads(row["state_json"])
+            state["force_rerip"] = choice == "rerip"
+            state["reuse_existing"] = choice == "reuse"
+            state["stage"] = "accepted"
+            db.execute(
+                "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? "
+                "WHERE request_id=?",
+                ("accepted", json.dumps(state), now(), request_id),
+            )
+        send(
+            chat_id,
+            (
+                "♻️ Re-ripping this video's Shorts with your approval/rejection "
+                "learning."
+                if choice == "rerip"
+                else "▶️ Reusing the existing reviewed Shorts and approved renders."
+            ),
+        )
+        background_tasks.add_task(_process, request_id)
+        return {"status": choice, "request_id": request_id}
+
     action = re.fullmatch(r"rs:(approve|reject):([A-Za-z0-9-]+):(\d+)", callback_data)
     if action:
         verb, request_id, index_text = action.groups()
@@ -836,7 +960,50 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
             db.execute("INSERT INTO telegram_requests VALUES (?,?,?,?,?,?,?,?,?,?,?)", (request_id, update_id, chat_id, user_id, "accepted", parsed["mode"], parsed["source_kind"], parsed["source_value"], json.dumps(state), stamp, stamp))
     except sqlite3.IntegrityError:
         return {"status": "duplicate_update"}
-    send(chat_id, f"✅ Ripped Shorts request accepted\nSource: {parsed['source_kind'].title()}\nJob ID: {request_id}")
+    if parsed["source_kind"] == "youtube":
+        try:
+            prior_shorts = _reviewed_short_history_from_sheet(parsed["video_id"])
+        except Exception:
+            logger.exception("Could not check prior Shorts history before intake")
+            prior_shorts = []
+        if prior_shorts:
+            state["stage"] = "awaiting_rerip_choice"
+            state["prior_reviewed_short_count"] = len(prior_shorts)
+            _save(request_id, "awaiting_rerip_choice", state)
+            telegram(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": (
+                        f"♻️ YouTube ID {parsed['video_id']} already has "
+                        f"{len(prior_shorts)} reviewed Short(s).\n\n"
+                        "Do you want to re-rip the Shorts using everything learned "
+                        "from your approvals and rejections?"
+                    ),
+                    "reply_markup": {
+                        "inline_keyboard": [[
+                            {
+                                "text": "♻️ Re-rip Shorts",
+                                "callback_data": f"rs:rerip:{request_id}",
+                            },
+                            {
+                                "text": "▶️ Use Existing",
+                                "callback_data": f"rs:reuse:{request_id}",
+                            },
+                        ]]
+                    },
+                },
+            )
+            return {
+                "status": "awaiting_rerip_choice",
+                "request_id": request_id,
+                "reviewed_shorts": len(prior_shorts),
+            }
+    send(
+        chat_id,
+        f"✅ Ripped Shorts request accepted\n"
+        f"Source: {parsed['source_kind'].title()}\nJob ID: {request_id}",
+    )
     background_tasks.add_task(_process, request_id)
     return {"status": "accepted", "request_id": request_id}
 
