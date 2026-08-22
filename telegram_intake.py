@@ -17,7 +17,6 @@ from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
 from audio_master_handoff import DB_PATH, SOURCE_DIR, connect, download_drive, drive_metadata, get_job
 from source_ingestion import (
     ingest_with_audio_master,
-    persist_source_cache,
     restrict_to_boundary,
     reuse_from_drive,
     select_non_overlapping,
