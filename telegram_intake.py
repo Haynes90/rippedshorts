@@ -23,6 +23,7 @@ from source_ingestion import (
     reuse_from_drive,
     select_non_overlapping,
 )
+from telegram_quick_edits import apply_quick_command, is_quick_command
 
 router = APIRouter()
 
@@ -655,6 +656,7 @@ def _topic_break_suggestions(transcript_segments: list[dict]) -> list[dict]:
         '{"segments":[{"start":0,"end":480,"title":"...","summary":"..."}]}. '
         "Use only exact transcript timestamps.\n\n"
         + "\n".join(lines)
+        + _boundary_learning_prompt()
     )
     payload = {
         "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
@@ -1232,6 +1234,118 @@ def _process(request_id: str) -> None:
         send(chat_id, f"❌ Processing failed\nJob ID: {request_id}\n{str(exc)[:1500]}\n\nSend /retry {request_id} to try again.")
 
 
+
+
+def _latest_editable_request(chat_id: str, user_id: str) -> sqlite3.Row | None:
+    """Return the newest request that currently has reviewable sections."""
+    with _LOCK, _telegram_db() as db:
+        rows = db.execute(
+            "SELECT * FROM telegram_requests WHERE chat_id=? AND user_id=? "
+            "ORDER BY updated_at DESC LIMIT 25",
+            (chat_id, user_id),
+        ).fetchall()
+    for row in rows:
+        state = json.loads(row["state_json"])
+        if (
+            isinstance(state.get("service_segments"), list)
+            or isinstance((state.get("topic_result") or {}).get("segments"), list)
+            or isinstance((state.get("result") or {}).get("segments"), list)
+        ):
+            return row
+    return None
+
+
+def _log_quick_edit(
+    row: sqlite3.Row,
+    result: dict[str, Any],
+    instruction: str,
+    user_id: str,
+) -> None:
+    """Append an applied Telegram edit to Podcast / Decision Log."""
+    try:
+        import main
+
+        state = result["state"]
+        parsed = state.get("parsed") or {}
+        before = result.get("before") or []
+        after = result.get("after") or []
+        first_before = before[0] if before else {}
+        last_before = before[-1] if before else {}
+        first_after = after[0] if after else {}
+        last_after = after[-1] if after else {}
+        values = [
+            row["request_id"],
+            parsed.get("video_id", ""),
+            "",
+            result.get("lane", "service"),
+            first_before.get("start", first_before.get("start_seconds", "")),
+            last_before.get("end", last_before.get("end_seconds", "")),
+            first_after.get("start", first_after.get("start_seconds", "")),
+            last_after.get("end", last_after.get("end_seconds", "")),
+            "", "", "", "", "", "",
+            "Telegram Edited",
+            "", "", "", "", "",
+            result.get("action", ""),
+            instruction,
+            json.dumps(before, separators=(",", ":"))[:20000],
+            json.dumps(after, separators=(",", ":"))[:20000],
+            now(),
+            user_id,
+            "telegram",
+            "yes",
+            "yes",
+            "v1",
+        ]
+        _, _, sheets = main.get_google_services()
+        sheets.spreadsheets().values().append(
+            spreadsheetId=RIPPED_LOG_SHEET_ID,
+            range="'Decision Log'!A:AD",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [values]},
+        ).execute()
+    except Exception:
+        logger.exception("Could not write Telegram edit learning to Podcast / Decision Log")
+
+
+def _boundary_learning_prompt(limit: int = 50) -> str:
+    """Summarize recent applied boundary edits for later section selection."""
+    try:
+        import main
+
+        _, _, sheets = main.get_google_services()
+        response = sheets.spreadsheets().values().get(
+            spreadsheetId=RIPPED_LOG_SHEET_ID,
+            range="'Decision Log'!A:AD",
+        ).execute()
+        rows = response.get("values", [])[1:]
+        examples = []
+        for values in reversed(rows):
+            padded = list(values) + [""] * (30 - len(values))
+            if str(padded[28]).strip().lower() != "yes":
+                continue
+            instruction = str(padded[21]).strip()
+            action = str(padded[20]).strip()
+            section_type = str(padded[3]).strip()
+            if instruction or action:
+                examples.append(
+                    f"- {section_type}: {instruction or action} (action={action})"
+                )
+            if len(examples) >= limit:
+                break
+        if not examples:
+            return ""
+        return (
+            "\n\nDEREK'S PRIOR BOUNDARY EDITS\n"
+            "Use these as preferences, not absolute timestamp rules. Favor the kinds "
+            "of complete openings, endings, additions, and removals Derek previously "
+            "requested:\n" + "\n".join(examples)
+        )
+    except Exception:
+        logger.exception("Could not read boundary learning from Podcast / Decision Log")
+        return ""
+
+
 def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
     callback = update.get("callback_query") or {}
     message = callback.get("message") or update.get("message") or update.get("edited_message") or {}
@@ -1394,6 +1508,26 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
         request_id = retry_match.group(1)
         background_tasks.add_task(_process, request_id)
         return {"status": "retry_accepted", "request_id": request_id}
+    if is_quick_command(text):
+        row = _latest_editable_request(chat_id, user_id)
+        if not row:
+            send(chat_id, "There are no sections ready to edit yet.")
+            return {"status": "no_editable_sections"}
+        state = json.loads(row["state_json"])
+        try:
+            result = apply_quick_command(state, text)
+        except ValueError as exc:
+            send(chat_id, str(exc))
+            return {"status": "quick_edit_invalid", "detail": str(exc)}
+        if result.get("changed"):
+            _save(row["request_id"], row["status"], result["state"])
+            _log_quick_edit(row, result, text, user_id)
+        send(chat_id, result["message"])
+        return {
+            "status": "quick_edit_applied" if result.get("changed") else "quick_edit_help",
+            "request_id": row["request_id"],
+            "action": result.get("action"),
+        }
     try:
         parsed = parse_request(text)
     except ValueError:
