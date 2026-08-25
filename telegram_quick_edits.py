@@ -28,8 +28,6 @@ def clock_seconds(value: str) -> float:
     hours = int(match.group(1) or 0)
     minutes = int(match.group(2))
     seconds = int(match.group(3))
-    if minutes > 59 when hours else False:
-        raise ValueError("Invalid time.")
     if seconds > 59:
         raise ValueError("Invalid time.")
     return float(hours * 3600 + minutes * 60 + seconds)
