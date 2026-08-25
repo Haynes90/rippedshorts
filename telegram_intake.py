@@ -23,7 +23,7 @@ from source_ingestion import (
     reuse_from_drive,
     select_non_overlapping,
 )
-from telegram_quick_edits import apply_quick_command, is_quick_command
+from telegram_quick_edits import OPTIONS_TEXT, apply_quick_command, is_quick_command
 
 router = APIRouter()
 
@@ -595,10 +595,15 @@ def _send_candidates(
             "chat_id": chat_id,
             "text": text,
             "disable_web_page_preview": True,
-            "reply_markup": {"inline_keyboard": [[
-                {"text": "✅ Approve & Render", "callback_data": f"rs:approve:{request_id}:{zero_index}"},
-                {"text": "❌ Reject", "callback_data": f"rs:reject:{request_id}:{zero_index}"},
-            ]]},
+            "reply_markup": {"inline_keyboard": [
+                [
+                    {"text": "✅ Approve & Render", "callback_data": f"rs:approve:{request_id}:{zero_index}"},
+                    {"text": "❌ Reject", "callback_data": f"rs:reject:{request_id}:{zero_index}"},
+                ],
+                [
+                    {"text": "✏️ Change / Add / Options", "callback_data": f"rs:options:{request_id}"}
+                ],
+            ]},
         })
 
 
@@ -875,16 +880,24 @@ def _send_topic_candidates(
                 "text": text,
                 "disable_web_page_preview": True,
                 "reply_markup": {
-                    "inline_keyboard": [[
-                        {
-                            "text": "✅ Approve 16:9",
-                            "callback_data": f"rs:topic_approve:{request_id}:{index}",
-                        },
-                        {
-                            "text": "❌ Skip",
-                            "callback_data": f"rs:topic_reject:{request_id}:{index}",
-                        },
-                    ]]
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "✅ Approve 16:9",
+                                "callback_data": f"rs:topic_approve:{request_id}:{index}",
+                            },
+                            {
+                                "text": "❌ Skip",
+                                "callback_data": f"rs:topic_reject:{request_id}:{index}",
+                            },
+                        ],
+                        [
+                            {
+                                "text": "✏️ Change / Add / Options",
+                                "callback_data": f"rs:options:{request_id}",
+                            }
+                        ],
+                    ]
                 },
             },
         )
@@ -1368,6 +1381,15 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
         return {"status": "ignored"}
     if not _authorized(chat_id, user_id):
         return {"status": "unauthorized"}
+    options_choice = re.fullmatch(
+        r"rs:options:([A-Za-z0-9-]+)", callback_data
+    )
+    if options_choice:
+        send(chat_id, OPTIONS_TEXT)
+        return {
+            "status": "quick_edit_help",
+            "request_id": options_choice.group(1),
+        }
     rerip_choice = re.fullmatch(
         r"rs:(rerip|reuse):([A-Za-z0-9-]+)", callback_data
     )
@@ -1531,8 +1553,39 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
             send(chat_id, str(exc))
             return {"status": "quick_edit_invalid", "detail": str(exc)}
         if result.get("changed"):
+            if result.get("action") == "approve_all":
+                lane = result.get("lane")
+                if lane == "short":
+                    reviews = dict(result["state"].get("candidate_reviews") or {})
+                    for index in range(len(result.get("after") or [])):
+                        reviews[str(index)] = {
+                            "status": "queued",
+                            "reviewed_at": now(),
+                            "user_id": user_id,
+                        }
+                    result["state"]["candidate_reviews"] = reviews
+                elif lane == "topic":
+                    reviews = dict(result["state"].get("topic_reviews") or {})
+                    for index in range(len(result.get("after") or [])):
+                        reviews[str(index)] = {
+                            "status": "queued",
+                            "reviewed_at": now(),
+                            "user_id": user_id,
+                        }
+                    result["state"]["topic_reviews"] = reviews
             _save(row["request_id"], row["status"], result["state"])
             _log_quick_edit(row, result, text, user_id)
+            if result.get("action") == "approve_all":
+                if result.get("lane") == "short":
+                    for index in range(len(result.get("after") or [])):
+                        RENDER_EXECUTOR.submit(
+                            _render_approved, row["request_id"], index, chat_id
+                        )
+                elif result.get("lane") == "topic":
+                    for index in range(len(result.get("after") or [])):
+                        RENDER_EXECUTOR.submit(
+                            _render_topic_approved, row["request_id"], index, chat_id
+                        )
         send(chat_id, result["message"])
         return {
             "status": "quick_edit_applied" if result.get("changed") else "quick_edit_help",
