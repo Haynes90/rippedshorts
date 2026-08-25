@@ -1273,23 +1273,34 @@ def _log_quick_edit(
         last_before = before[-1] if before else {}
         first_after = after[0] if after else {}
         last_after = after[-1] if after else {}
+        decision_time = now()
+        ai_start = first_before.get("start", first_before.get("start_seconds", ""))
+        ai_end = last_before.get("end", last_before.get("end_seconds", ""))
+        final_start = first_after.get("start", first_after.get("start_seconds", ""))
+        final_end = last_after.get("end", last_after.get("end_seconds", ""))
         values = [
+            f"{row['request_id']}:{decision_time}",
             row["request_id"],
             parsed.get("video_id", ""),
-            "",
             result.get("lane", "service"),
-            first_before.get("start", first_before.get("start_seconds", "")),
-            last_before.get("end", last_before.get("end_seconds", "")),
-            first_after.get("start", first_after.get("start_seconds", "")),
-            last_after.get("end", last_after.get("end_seconds", "")),
-            "", "", "", "", "", "",
-            "Telegram Edited",
-            "", "", "", "", "",
+            ai_start,
+            ai_end,
+            final_start,
+            final_end,
+            (float(final_start) - float(ai_start)) if ai_start != "" and final_start != "" else "",
+            (float(final_end) - float(ai_end)) if ai_end != "" and final_end != "" else "",
+            "",
+            "",
+            instruction,
+            decision_time,
+            user_id,
+            "yes",
+            "", "", "", "",
             result.get("action", ""),
             instruction,
             json.dumps(before, separators=(",", ":"))[:20000],
             json.dumps(after, separators=(",", ":"))[:20000],
-            now(),
+            decision_time,
             user_id,
             "telegram",
             "yes",
