@@ -49,3 +49,17 @@ def test_approval_delivery_is_idempotent():
 def test_learning_uses_podcast_decision_log():
     assert '"\'Decision Log\'!A:AD"' in REVIEW_SOURCE
     assert '"yes"' in REVIEW_SOURCE
+
+
+def test_callback_cannot_point_back_to_intake_or_review():
+    for path in (
+        "/api/telegram/webhook",
+        "/api/ripped-shorts/intake",
+        "/api/clip-master/reviews",
+    ):
+        assert path in REVIEW_SOURCE
+    assert "callback_url must be a completion endpoint" in REVIEW_SOURCE
+
+
+def test_last_section_cannot_be_removed():
+    assert "At least one section must remain" in REVIEW_SOURCE
