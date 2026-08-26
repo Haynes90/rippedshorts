@@ -351,6 +351,9 @@ def handle_update(update: dict[str, Any]) -> dict[str, Any]:
             state["service_segments"][index]["review_status"] = "approved"
             instruction = f"Keep {index + 1}"
         else:
+            if len(state["service_segments"]) <= 1:
+                _send(chat_id, "At least one section must remain. Add another section first.")
+                return {"status": "last_section_required", "review_id": state["review_id"]}
             state["service_segments"].pop(index)
             instruction = f"Remove {index + 1}"
         state.setdefault("quick_edit_history", []).append(
@@ -405,6 +408,17 @@ async def create_review(
         payload.get("origin_job_id") or payload.get("job_id") or ""
     ).strip()
     source_service = str(payload.get("source_service") or "unknown").strip()
+    callback_url = str(payload.get("callback_url") or "").strip()
+    forbidden_callback_paths = (
+        "/api/telegram/webhook",
+        "/api/ripped-shorts/intake",
+        "/api/clip-master/reviews",
+    )
+    if callback_url and any(path in callback_url for path in forbidden_callback_paths):
+        raise HTTPException(
+            status_code=422,
+            detail="callback_url must be a completion endpoint, not an intake or review endpoint",
+        )
     if not origin_job_id:
         raise HTTPException(status_code=422, detail="origin_job_id is required")
     try:
@@ -438,7 +452,7 @@ async def create_review(
             "origin_job_id": origin_job_id,
             "source_service": source_service,
             "video_id": str(payload.get("video_id") or ""),
-            "callback_url": str(payload.get("callback_url") or ""),
+            "callback_url": callback_url,
             "callback_secret": str(payload.get("callback_secret") or ""),
             "chat_id": chat_id,
             "user_id": str(payload.get("user_id") or ""),
