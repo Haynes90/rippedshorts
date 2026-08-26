@@ -24,8 +24,14 @@ from source_ingestion import (
     select_non_overlapping,
 )
 from telegram_quick_edits import OPTIONS_TEXT, apply_quick_command, is_quick_command
+from clipmaster_review import (
+    claims_update as clipmaster_claims_update,
+    handle_update as handle_clipmaster_update,
+    router as clipmaster_review_router,
+)
 
 router = APIRouter()
+router.include_router(clipmaster_review_router)
 
 YOUTUBE_RE = re.compile(r"https?://(?:www\.)?(?:youtube\.com/(?:watch\?[^\s]*v=|shorts/)|youtu\.be/)([A-Za-z0-9_-]{6,20})", re.I)
 DRIVE_RE = re.compile(r"https?://drive\.google\.com/(?:file/d/|open\?id=|uc\?(?:[^\s]*&)?id=)([A-Za-z0-9_-]+)", re.I)
@@ -1892,6 +1898,10 @@ async def telegram_gateway(request: Request, x_telegram_bot_api_secret_token: st
     if not expected or x_telegram_bot_api_secret_token != expected:
         raise HTTPException(status_code=401, detail="Invalid Telegram webhook secret")
     update = await request.json()
+    # Clip Master owns universal chapter reviews. Handle those locally before
+    # forwarding new links and rs:* callbacks to Ripped Shorts.
+    if clipmaster_claims_update(update):
+        return handle_clipmaster_update(update)
     target = os.getenv("RIPPED_SHORTS_INTERNAL_URL", "").rstrip("/")
     secret = os.getenv("RIPPED_SHORTS_SHARED_SECRET", "").strip()
     if not target or not secret:
