@@ -789,6 +789,7 @@ def attach_topic_segment_asset(
     video_id: str,
     video_path: Path,
     segment_number: int,
+    vid_title: Optional[str] = None,
 ) -> dict:
     workdir = Path("/tmp") / f"topics_{video_id}"
     workdir.mkdir(parents=True, exist_ok=True)
@@ -799,7 +800,7 @@ def attach_topic_segment_asset(
     if duration <= 0:
         raise RuntimeError("16:9 segment duration must be positive")
     create_topic_segment_file(video_path, start, duration, output_path)
-    uploaded = upload_clip_to_drive(output_path, segment_name)
+    uploaded = upload_clip_to_drive(output_path, segment_name, vid_title=vid_title)
     return {
         **segment,
         "segment_number": segment_number,
@@ -808,13 +809,50 @@ def attach_topic_segment_asset(
     }
 
 
-def upload_clip_to_drive(clip_path: Path, clip_name: str) -> dict:
+def _drive_title_folder(vid_title: Optional[str]) -> str:
+    """Return the reusable Vid Title folder inside the configured output folder."""
     if not DRIVE_FOLDER_ID:
         raise RuntimeError("Drive folder id not configured (Drive_Folder_ID/DRIVE_FOLDER_ID)")
+    folder_name = str(vid_title or "").strip()
+    if not folder_name:
+        raise RuntimeError("Vid Title is required before approved Ripped Shorts can be uploaded")
+
     drive_service, _, _ = get_google_services()
+    safe_name = folder_name.replace("\\", "\\\\").replace("'", "\\'")
+    query = (
+        "mimeType = 'application/vnd.google-apps.folder' "
+        f"and name = '{safe_name}' and '{DRIVE_FOLDER_ID}' in parents and trashed = false"
+    )
+    existing = drive_service.files().list(
+        q=query,
+        fields="files(id,name)",
+        pageSize=1,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute().get("files", [])
+    if existing:
+        return existing[0]["id"]
+
+    created = drive_service.files().create(
+        body={
+            "name": folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [DRIVE_FOLDER_ID],
+        },
+        fields="id,name",
+        supportsAllDrives=True,
+    ).execute()
+    return created["id"]
+
+
+def upload_clip_to_drive(
+    clip_path: Path, clip_name: str, *, vid_title: Optional[str] = None
+) -> dict:
+    drive_service, _, _ = get_google_services()
+    output_folder_id = _drive_title_folder(vid_title)
     file_metadata = {
         "name": clip_name,
-        "parents": [DRIVE_FOLDER_ID],
+        "parents": [output_folder_id],
     }
     media = MediaFileUpload(str(clip_path), mimetype="video/mp4", resumable=True)
     uploaded = drive_service.files().create(
@@ -852,6 +890,7 @@ def attach_clip_assets(
     video_id: str,
     youtube_url: Optional[str],
     video_path_override: Optional[Path] = None,
+    vid_title: Optional[str] = None,
 ) -> dict:
     cleanup_old_temp_downloads(max_age_hours=24)
     segments = clips_payload.get("segments", [])
@@ -875,7 +914,7 @@ def attach_clip_assets(
         # simultaneous FFmpeg processes never write to the same local path.
         output_path = workdir / f".render-{uuid.uuid4().hex}-{clip_name}"
         create_clip_file(video_path, start, duration, output_path)
-        clip_info = upload_clip_to_drive(output_path, clip_name)
+        clip_info = upload_clip_to_drive(output_path, clip_name, vid_title=vid_title)
         segment["clip_name"] = clip_name
         segment["clip_url"] = clip_info["clip_url"]
     return clips_payload
