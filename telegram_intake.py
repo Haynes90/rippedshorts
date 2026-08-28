@@ -937,8 +937,8 @@ def _process_topics(
     if not topics:
         send(
             chat_id,
-            "ℹ️ The eligible video is not longer than three minutes, so no 16:9 "
-            "topic segment was created.",
+            "ℹ️ No standalone 16:9 highlight of at least three minutes met "
+            "the quality and completeness requirements.",
         )
     topic_result = {"segments": topics, "selection": "best_standalone_highlights"}
     state.update(
