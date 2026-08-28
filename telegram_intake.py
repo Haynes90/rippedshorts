@@ -648,6 +648,39 @@ def _send_candidates(
                 ],
             ]},
         })
+    _send_short_confirmation(chat_id, request_id)
+
+
+def _send_short_confirmation(chat_id: str, request_id: str) -> None:
+    with _LOCK, _telegram_db() as db:
+        row = db.execute(
+            "SELECT mode, state_json FROM telegram_requests WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+    if not row or row["mode"] != "both":
+        return
+    state = json.loads(row["state_json"])
+    if state.get("shorts_confirmed_at") or state.get("topic_stage"):
+        return
+    telegram(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": (
+                "When you have approved or rejected every 9:16 Short, confirm the "
+                "Shorts review. The 16:9 highlight analysis will begin only after "
+                "this confirmation."
+            ),
+            "reply_markup": {
+                "inline_keyboard": [[
+                    {
+                        "text": "✅ Confirm 9:16 Review",
+                        "callback_data": f"rs:shorts_confirm:{request_id}",
+                    }
+                ]]
+            },
+        },
+    )
 
 
 def _transcribe(video_path: Path) -> list[dict]:
@@ -895,8 +928,9 @@ def _process_topics(
 ) -> dict[str, Any]:
     send(
         chat_id,
-        "📺 Mapping the full eligible video into non-overlapping 16:9 sections. "
-        "Topic completeness controls the cuts; 8 minutes is only a reference.",
+        "📺 The 9:16 Shorts review is confirmed. Selecting the strongest standalone "
+        "16:9 highlights now. Gaps are allowed; every highlight must be at least "
+        "three minutes and contain a complete point, discussion, or story.",
     )
     suggestions = _topic_break_suggestions(segments)
     topics = _build_contiguous_topic_segments(segments, suggestions)
@@ -906,7 +940,7 @@ def _process_topics(
             "ℹ️ The eligible video is not longer than three minutes, so no 16:9 "
             "topic segment was created.",
         )
-    topic_result = {"segments": topics, "coverage": "full_eligible_timeline"}
+    topic_result = {"segments": topics, "selection": "best_standalone_highlights"}
     state.update(
         {
             "video_path": str(video),
@@ -1012,8 +1046,8 @@ def _process(request_id: str) -> None:
                 else:
                     state.setdefault("warnings", []).append("Approved sermon boundary did not contain reusable transcript segments.")
 
-        if row["mode"] in {"topics", "both"}:
-            state = _process_topics(
+        if row["mode"] == "topics":
+            _process_topics(
                 request_id,
                 state,
                 chat_id,
@@ -1022,8 +1056,16 @@ def _process(request_id: str) -> None:
                 segments,
                 reused,
             )
-            if row["mode"] == "topics":
-                return
+            return
+        if row["mode"] == "both":
+            state.update(
+                {
+                    "video_path": str(video),
+                    "source_reused": reused,
+                    "topic_source_segments": segments,
+                    "topic_stage": None,
+                }
+            )
 
         force_rerip = bool(state.get("force_rerip"))
         reuse_existing = bool(state.get("reuse_existing"))
