@@ -15,7 +15,12 @@ FUNCTIONS = {
         "_build_contiguous_topic_segments",
     }
 }
-namespace = {"re": __import__("re"), "Any": object, "Literal": __import__("typing").Literal}
+namespace = {
+    "re": __import__("re"),
+    "os": __import__("os"),
+    "Any": object,
+    "Literal": __import__("typing").Literal,
+}
 exec("YOUTUBE_RE = re.compile(r'https?://(?:www\\.)?(?:youtube\\.com/(?:watch\\?[^\\s]*v=|shorts/)|youtu\\.be/)([A-Za-z0-9_-]{6,20})', re.I)\nDRIVE_RE = re.compile(r'https?://drive\\.google\\.com/(?:file/d/|open\\?id=|uc\\?(?:[^\\s]*&)?id=)([A-Za-z0-9_-]+)', re.I)", namespace)
 exec(compile(ast.Module(body=[FUNCTIONS["parse_request"]], type_ignores=[]), "telegram-functions", "exec"), namespace)
 parse_request = namespace["parse_request"]
