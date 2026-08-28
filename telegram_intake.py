@@ -171,6 +171,29 @@ def parse_request(text: str) -> dict[str, Any]:
     raise ValueError("Send a YouTube link or a Google Drive video link.")
 
 
+def _youtube_vid_title(youtube_url: str) -> str:
+    """Resolve the source YouTube title used as the Drive grouping folder."""
+    response = requests.get(
+        "https://www.youtube.com/oembed",
+        params={"url": youtube_url, "format": "json"},
+        timeout=(10, 30),
+    )
+    response.raise_for_status()
+    title = str(response.json().get("title") or "").strip()
+    if not title:
+        raise RuntimeError("YouTube returned no Vid Title for the Ripped Shorts folder")
+    return title
+
+
+def _drive_vid_title(metadata: dict[str, Any]) -> str:
+    """Use the source Drive video's filename as Vid Title, without its video extension."""
+    title = str(metadata.get("name") or "").strip()
+    title = re.sub(r"\.(mp4|mov|m4v|webm|mkv|avi)$", "", title, flags=re.I).strip()
+    if not title:
+        raise RuntimeError("The source Drive video has no Vid Title for the Ripped Shorts folder")
+    return title
+
+
 def _authorized(chat_id: str, user_id: str) -> bool:
     chats, users = _csv_env("TELEGRAM_ALLOWED_CHAT_IDS"), _csv_env("TELEGRAM_ALLOWED_USER_IDS")
     existing_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -962,6 +985,7 @@ def _process(request_id: str) -> None:
             ids = state["parsed"]["drive_ids"]
             video_id = ids[0]
             meta = drive_metadata(video_id)
+            state["vid_title"] = _drive_vid_title(meta)
             video = download_drive(video_id, work / "source-video.mp4", meta)
             if len(ids) > 1:
                 transcript_meta = drive_metadata(ids[1])
@@ -977,6 +1001,7 @@ def _process(request_id: str) -> None:
         else:
             parsed = state["parsed"]
             video_id = parsed["video_id"]
+            state["vid_title"] = _youtube_vid_title(parsed["source_value"])
             boundary = None
             cache = {"video_path": None, "segments": [], "sermon_boundary": None}
             try:
@@ -1684,7 +1709,11 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
         import main
 
         rendered = main.attach_topic_segment_asset(
-            dict(segment), video_id, video, index + 1
+            dict(segment),
+            video_id,
+            video,
+            index + 1,
+            vid_title=state.get("vid_title"),
         )
         with _LOCK, _telegram_db() as db:
             latest = db.execute(
@@ -1696,6 +1725,7 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
                 **reviews.get(str(index), {}),
                 "status": "rendered",
                 "segment_url": rendered.get("segment_url"),
+                "folder_id": rendered.get("folder_id"),
                 "rendered_at": now(),
             }
             latest_state["topic_reviews"] = reviews
@@ -1705,7 +1735,7 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
             )
         send(
             chat_id,
-            f"✅ 16:9 Segment {index + 1} rendered and uploaded to DRIVE_FOLDER_ID:\n"
+            f"✅ 16:9 Segment {index + 1} rendered and uploaded to the Vid Title folder ({state.get('vid_title', '')}):\n"
             f"{rendered.get('segment_url', '')}",
         )
     except Exception as exc:
@@ -1782,6 +1812,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             state["parsed"].get("video_id", request_id),
             None,
             video_path_override=video,
+            vid_title=state.get("vid_title"),
         )
         clip = rendered["segments"][0]
         rendered_at = now()
@@ -1795,6 +1826,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
                 **reviews.get(str(index), {}),
                 "status": "rendered",
                 "clip_url": clip.get("clip_url"),
+                "folder_id": clip.get("folder_id"),
                 "rendered_at": rendered_at,
             }
             latest_state["candidate_reviews"] = reviews
@@ -1814,7 +1846,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         )
         send(
             chat_id,
-            f"✅ Short {index + 1} rendered and uploaded to DRIVE_FOLDER_ID:\n"
+            f"✅ Short {index + 1} rendered and uploaded to the Vid Title folder ({state.get('vid_title', '')}):\n"
             f"{clip.get('clip_url', '')}\n"
             f"{_render_progress_text(request_id)}",
         )
