@@ -810,6 +810,19 @@ def attach_topic_segment_asset(
     }
 
 
+def _youtube_vid_title(youtube_url: str) -> str:
+    response = requests.get(
+        "https://www.youtube.com/oembed",
+        params={"url": youtube_url, "format": "json"},
+        timeout=(10, 30),
+    )
+    response.raise_for_status()
+    title = str(response.json().get("title") or "").strip()
+    if not title:
+        raise RuntimeError("YouTube returned no Vid Title for the Ripped Shorts folder")
+    return title
+
+
 def _drive_title_folder(vid_title: Optional[str]) -> str:
     """Return the reusable Vid Title folder inside the configured output folder."""
     if not DRIVE_FOLDER_ID:
@@ -901,6 +914,11 @@ def attach_clip_assets(
 
     workdir = Path("/tmp") / f"clips_{video_id}"
     workdir.mkdir(parents=True, exist_ok=True)
+    resolved_vid_title = str(vid_title or "").strip()
+    if not resolved_vid_title:
+        resolved_vid_title = _youtube_vid_title(
+            youtube_url or f"https://www.youtube.com/watch?v={video_id}"
+        )
     video_path = video_path_override or download_youtube_video(video_id, youtube_url, workdir)
     for idx, segment in enumerate(segments, start=1):
         start = float(segment.get("start", 0.0))
@@ -916,7 +934,9 @@ def attach_clip_assets(
         # simultaneous FFmpeg processes never write to the same local path.
         output_path = workdir / f".render-{uuid.uuid4().hex}-{clip_name}"
         create_clip_file(video_path, start, duration, output_path)
-        clip_info = upload_clip_to_drive(output_path, clip_name, vid_title=vid_title)
+        clip_info = upload_clip_to_drive(
+            output_path, clip_name, vid_title=resolved_vid_title
+        )
         segment["clip_name"] = clip_name
         segment["clip_url"] = clip_info["clip_url"]
         segment["folder_id"] = clip_info["folder_id"]
