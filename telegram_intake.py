@@ -683,7 +683,7 @@ def _transcribe(video_path: Path) -> list[dict]:
 
 
 def _topic_break_suggestions(transcript_segments: list[dict]) -> list[dict]:
-    """Ask OpenAI for semantic chapter boundaries; the local planner enforces coverage."""
+    """Select the strongest standalone 16:9 highlights from the full transcript."""
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         return []
@@ -694,15 +694,29 @@ def _topic_break_suggestions(transcript_segments: list[dict]) -> list[dict]:
         text = str(item.get("text", "")).replace("\n", " ").strip()
         lines.append(f"[{start:.2f}-{end:.2f}] {text}")
     prompt = (
-        "Divide this full transcript into coherent horizontal-video sections for "
-        "YouTube and Facebook. Identify changes in point, subject, story, or tangent. "
-        "Use 8 minutes only as a loose reference, not a target. Preserve a coherent "
-        "subject, point, story, or tangent even when its natural section is shorter or "
-        "longer. Every section must exceed 3 minutes, and every boundary must be "
-        "between complete sentences or thoughts. Do not omit any part of the eligible timeline and do "
-        "not overlap sections. Return strict JSON only as "
-        '{"segments":[{"start":0,"end":480,"title":"...","summary":"..."}]}. '
-        "Use only exact transcript timestamps.\n\n"
+        "You are the 16:9 Highlight Editor for Ripped Shorts. Review the ENTIRE "
+        "timestamped transcript before selecting anything. Select only the strongest "
+        "standalone portions for YouTube and Facebook: a complete point or lesson, "
+        "meaningful discussion, compelling story, useful explanation, strong argument "
+        "or opinion, memorable exchange, focused tangent, or connected sequence of ideas.\n\n"
+        "Do NOT divide the video into arbitrary blocks and do NOT try to cover the full "
+        "timeline. Gaps are allowed. Each highlight must contain its central point plus "
+        "the adjoining setup, supporting explanation, examples, questions and responses, "
+        "story details, conclusion, lesson, or payoff needed to understand it. Do not add "
+        "unrelated material merely to make it longer.\n\n"
+        "Every highlight must be at least 180 seconds. Eight minutes is only a loose "
+        "reference, never a target or maximum. Start at the natural beginning of the "
+        "subject or setup, end after the point or payoff is complete, and use only exact "
+        "transcript boundaries. Never cut a sentence, speaker, example, prayer, "
+        "declaration, or conclusion. Highlights must be distinct, non-overlapping, "
+        "chronological, understandable without the full source, and strong enough to "
+        "publish separately. Select quality over quantity and return an empty segments "
+        "array if nothing qualifies.\n\n"
+        "Return strict JSON only as "
+        '{"analysis":{"content_type":"other","main_theme":"","major_points":[]},'
+        '"segments":[{"start":0,"end":180,"duration":180,"title":"...",'
+        '"summary":"...","highlight_type":"point","reason":"..."}]}. '
+        "Do not include Markdown or commentary.\n\nTRANSCRIPT:\n"
         + "\n".join(lines)
         + _boundary_learning_prompt()
     )
@@ -739,159 +753,91 @@ def _topic_break_suggestions(transcript_segments: list[dict]) -> list[dict]:
         if attempt < 2:
             import time
             time.sleep(3)
-    logger.warning("Semantic 16:9 boundary selection failed; using transcript fallback: %s", last_error)
+    logger.warning("16:9 highlight selection failed: %s", last_error)
     return []
 
 
 def _build_contiguous_topic_segments(
     transcript_segments: list[dict], suggestions: list[dict]
 ) -> list[dict]:
-    """Build semantic, contiguous >3 minute sections; eight minutes is only a reference."""
+    """Validate selected standalone highlights without forcing full-timeline coverage."""
     ordered = sorted(transcript_segments, key=lambda item: float(item.get("start", 0)))
     if not ordered:
         return []
-    timeline_start = float(ordered[0].get("start", 0))
-    timeline_end = float(
-        ordered[-1].get(
-            "end",
-            float(ordered[-1].get("start", 0))
-            + float(ordered[-1].get("duration", 0)),
-        )
-    )
-    total = timeline_end - timeline_start
-    minimum = max(181.0, float(os.getenv("TOPIC_SEGMENT_MIN_SECONDS", "181")))
-    reference = max(
-        minimum, float(os.getenv("TOPIC_SEGMENT_REFERENCE_SECONDS", "480"))
-    )
-    fallback_maximum = max(
-        reference, float(os.getenv("TOPIC_SEGMENT_FALLBACK_MAX_SECONDS", "900"))
-    )
-    if total < minimum:
-        return []
-
+    minimum = max(180.0, float(os.getenv("TOPIC_SEGMENT_MIN_SECONDS", "180")))
+    tolerance = 0.75
+    transcript_starts = [float(item.get("start", 0)) for item in ordered]
     transcript_ends = [
-        float(
-            item.get(
-                "end",
-                float(item.get("start", 0)) + float(item.get("duration", 0)),
-            )
-        )
-        for item in ordered[:-1]
-    ]
-    sentence_ends = [
-        float(
-            item.get(
-                "end",
-                float(item.get("start", 0)) + float(item.get("duration", 0)),
-            )
-        )
-        for item in ordered[:-1]
-        if re.search(r"[.!?][\"’']?$", str(item.get("text", "")).strip())
+        float(item.get("end", float(item.get("start", 0)) + float(item.get("duration", 0))))
+        for item in ordered
     ]
 
-    suggested_ends = []
-    for item in suggestions:
+    candidates = []
+    for suggestion in suggestions:
         try:
-            value = float(item.get("end"))
+            proposed_start = float(suggestion.get("start"))
+            proposed_end = float(suggestion.get("end"))
         except (TypeError, ValueError):
             continue
-        if timeline_start < value < timeline_end:
-            suggested_ends.append(value)
-    suggested_ends = sorted(set(suggested_ends))
-
-    # Semantic boundaries are authoritative. Snap each one to a completed sentence,
-    # skip boundaries that would make either adjoining section three minutes or less,
-    # and otherwise ignore the eight-minute reference entirely.
-    boundaries = [timeline_start]
-    for suggested in suggested_ends:
-        low = boundaries[-1] + minimum
-        high = timeline_end - minimum
-        if low > high or not (low <= suggested <= high):
+        start = min(transcript_starts, key=lambda value: abs(value - proposed_start))
+        end = min(transcript_ends, key=lambda value: abs(value - proposed_end))
+        if end - start < minimum:
             continue
-        sentence_choices = [
-            value for value in sentence_ends if low <= value <= high
-        ]
-        if sentence_choices:
-            boundary = min(
-                sentence_choices, key=lambda value: abs(value - suggested)
-            )
-        else:
-            transcript_choices = [
-                value for value in transcript_ends if low <= value <= high
-            ]
-            boundary = (
-                min(transcript_choices, key=lambda value: abs(value - suggested))
-                if transcript_choices
-                else suggested
-            )
-        if boundary - boundaries[-1] > 180 and timeline_end - boundary > 180:
-            boundaries.append(boundary)
-
-    # When semantic analysis produces no usable topic changes, fall back to balanced
-    # transcript chunks. This is the only place the eight-minute reference is used.
-    if len(boundaries) == 1 and total > fallback_maximum:
-        segment_count = max(2, round(total / reference))
-        while segment_count > 1 and total / segment_count < minimum:
-            segment_count -= 1
-        while total / segment_count > fallback_maximum:
-            segment_count += 1
-        for index in range(1, segment_count):
-            desired = timeline_start + total * index / segment_count
-            low = boundaries[-1] + minimum
-            high = timeline_end - minimum * (segment_count - index)
-            sentence_choices = [
-                value for value in sentence_ends if low <= value <= high
-            ]
-            transcript_choices = [
-                value for value in transcript_ends if low <= value <= high
-            ]
-            choices = sentence_choices or transcript_choices
-            boundary = (
-                min(choices, key=lambda value: abs(value - desired))
-                if choices
-                else desired
-            )
-            boundaries.append(boundary)
-    boundaries.append(timeline_end)
-
-    results = []
-    for index in range(len(boundaries) - 1):
-        section_start, section_end = boundaries[index], boundaries[index + 1]
         included = []
         for item in ordered:
             seg_start = float(item.get("start", 0))
             seg_end = float(
                 item.get("end", seg_start + float(item.get("duration", 0)))
             )
-            if (
-                seg_start >= section_start - 0.75
-                and seg_end <= section_end + 0.75
-            ):
+            if seg_start >= start - tolerance and seg_end <= end + tolerance:
                 included.append(str(item.get("text", "")).strip())
-        midpoint = (section_start + section_end) / 2
-        matching = []
-        for item in suggestions:
-            try:
-                item_start = float(item.get("start", section_start))
-                item_end = float(item.get("end", section_end))
-            except (TypeError, ValueError):
-                continue
-            if item_start <= midpoint <= item_end:
-                matching.append(item)
-        metadata = matching[0] if matching else {}
-        results.append(
+        if not included:
+            continue
+        candidates.append(
             {
-                "segment_number": index + 1,
-                "start": round(section_start, 3),
-                "end": round(section_end, 3),
-                "duration": round(section_end - section_start, 3),
-                "title": str(metadata.get("title") or f"Part {index + 1}").strip(),
-                "summary": str(metadata.get("summary") or "").strip(),
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "duration": round(end - start, 3),
+                "title": str(suggestion.get("title") or "16:9 Highlight").strip(),
+                "summary": str(suggestion.get("summary") or "").strip(),
+                "highlight_type": str(
+                    suggestion.get("highlight_type") or "other"
+                ).strip(),
+                "reason": str(suggestion.get("reason") or "").strip(),
                 "transcript": " ".join(included),
                 "aspect_ratio": "16:9",
             }
         )
-    return results
+
+    # Prefer the strongest non-overlapping candidates, then restore chronology.
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            float(next(
+                (
+                    suggestion.get("score", 0)
+                    for suggestion in suggestions
+                    if abs(float(suggestion.get("start", -1)) - item["start"]) <= tolerance
+                ),
+                0,
+            ) or 0),
+            item["duration"],
+        ),
+        reverse=True,
+    )
+    selected = []
+    for candidate in ranked:
+        if any(
+            candidate["start"] < existing["end"]
+            and candidate["end"] > existing["start"]
+            for existing in selected
+        ):
+            continue
+        selected.append(candidate)
+    selected.sort(key=lambda item: item["start"])
+    for index, item in enumerate(selected, 1):
+        item["segment_number"] = index
+    return selected
 
 
 def _send_topic_candidates(
