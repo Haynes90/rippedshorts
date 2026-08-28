@@ -194,6 +194,20 @@ def _drive_vid_title(metadata: dict[str, Any]) -> str:
     return title
 
 
+def _state_vid_title(state: dict[str, Any]) -> str:
+    """Resolve Vid Title for new and already-pending review state."""
+    existing = str(state.get("vid_title") or "").strip()
+    if existing:
+        return existing
+    parsed = state.get("parsed") or {}
+    if parsed.get("source_kind") == "youtube":
+        return _youtube_vid_title(str(parsed.get("source_value") or ""))
+    drive_ids = parsed.get("drive_ids") or []
+    if drive_ids:
+        return _drive_vid_title(drive_metadata(str(drive_ids[0])))
+    raise RuntimeError("Vid Title could not be resolved for the approved Ripped Shorts output")
+
+
 def _authorized(chat_id: str, user_id: str) -> bool:
     chats, users = _csv_env("TELEGRAM_ALLOWED_CHAT_IDS"), _csv_env("TELEGRAM_ALLOWED_USER_IDS")
     existing_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -1706,6 +1720,7 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
         segment = state["topic_result"]["segments"][index]
         video = Path(state["video_path"])
         video_id = state["parsed"].get("video_id", request_id)
+        vid_title = _state_vid_title(state)
         import main
 
         rendered = main.attach_topic_segment_asset(
@@ -1713,7 +1728,7 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
             video_id,
             video,
             index + 1,
-            vid_title=state.get("vid_title"),
+            vid_title=vid_title,
         )
         with _LOCK, _telegram_db() as db:
             latest = db.execute(
@@ -1735,7 +1750,7 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
             )
         send(
             chat_id,
-            f"✅ 16:9 Segment {index + 1} rendered and uploaded to the Vid Title folder ({state.get('vid_title', '')}):\n"
+            f"✅ 16:9 Segment {index + 1} rendered and uploaded to the Vid Title folder ({vid_title}):\n"
             f"{rendered.get('segment_url', '')}",
         )
     except Exception as exc:
@@ -1800,6 +1815,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             (state.get("candidate_reviews") or {}).get(str(index), {}).get("user_id", "")
         )
         video = Path(state["video_path"])
+        vid_title = _state_vid_title(state)
         import main
 
         payload_candidate = dict(candidate)
@@ -1812,7 +1828,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             state["parsed"].get("video_id", request_id),
             None,
             video_path_override=video,
-            vid_title=state.get("vid_title"),
+            vid_title=vid_title,
         )
         clip = rendered["segments"][0]
         rendered_at = now()
@@ -1846,7 +1862,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         )
         send(
             chat_id,
-            f"✅ Short {index + 1} rendered and uploaded to the Vid Title folder ({state.get('vid_title', '')}):\n"
+            f"✅ Short {index + 1} rendered and uploaded to the Vid Title folder ({vid_title}):\n"
             f"{clip.get('clip_url', '')}\n"
             f"{_render_progress_text(request_id)}",
         )
