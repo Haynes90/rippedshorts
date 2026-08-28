@@ -806,6 +806,7 @@ def attach_topic_segment_asset(
         "segment_number": segment_number,
         "segment_name": segment_name,
         "segment_url": uploaded["clip_url"],
+        "folder_id": uploaded["folder_id"],
     }
 
 
@@ -864,6 +865,7 @@ def upload_clip_to_drive(
     return {
         "clip_id": uploaded["id"],
         "clip_url": uploaded.get("webViewLink") or f"https://drive.google.com/file/d/{uploaded['id']}/view",
+        "folder_id": output_folder_id,
     }
 
 
@@ -917,6 +919,7 @@ def attach_clip_assets(
         clip_info = upload_clip_to_drive(output_path, clip_name, vid_title=vid_title)
         segment["clip_name"] = clip_name
         segment["clip_url"] = clip_info["clip_url"]
+        segment["folder_id"] = clip_info["folder_id"]
     return clips_payload
 
 
