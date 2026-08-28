@@ -806,23 +806,14 @@ def _build_contiguous_topic_segments(
                 "reason": str(suggestion.get("reason") or "").strip(),
                 "transcript": " ".join(included),
                 "aspect_ratio": "16:9",
+                "_selection_score": float(suggestion.get("score", 0) or 0),
             }
         )
 
     # Prefer the strongest non-overlapping candidates, then restore chronology.
     ranked = sorted(
         candidates,
-        key=lambda item: (
-            float(next(
-                (
-                    suggestion.get("score", 0)
-                    for suggestion in suggestions
-                    if abs(float(suggestion.get("start", -1)) - item["start"]) <= tolerance
-                ),
-                0,
-            ) or 0),
-            item["duration"],
-        ),
+        key=lambda item: (item["_selection_score"], item["duration"]),
         reverse=True,
     )
     selected = []
@@ -836,6 +827,7 @@ def _build_contiguous_topic_segments(
         selected.append(candidate)
     selected.sort(key=lambda item: item["start"])
     for index, item in enumerate(selected, 1):
+        item.pop("_selection_score", None)
         item["segment_number"] = index
     return selected
 
