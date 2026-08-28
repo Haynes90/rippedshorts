@@ -956,6 +956,54 @@ def _process_topics(
     return state
 
 
+def _start_16_9_after_confirmation(request_id: str, chat_id: str) -> None:
+    try:
+        with _LOCK, _telegram_db() as db:
+            row = db.execute(
+                "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+        if not row:
+            raise RuntimeError(f"Ripped Shorts request not found: {request_id}")
+        state = json.loads(row["state_json"])
+        transcript_segments = state.get("topic_source_segments") or []
+        video_path = Path(str(state.get("video_path") or ""))
+        if not transcript_segments or not video_path.is_file():
+            raise RuntimeError(
+                "The saved source for 16:9 highlights is unavailable. Send /retry "
+                f"{request_id} to restore the source."
+            )
+        parsed = state.get("parsed") or {}
+        video_id = str(parsed.get("video_id") or parsed.get("drive_ids", [request_id])[0])
+        _process_topics(
+            request_id,
+            state,
+            chat_id,
+            video_id,
+            video_path,
+            transcript_segments,
+            bool(state.get("source_reused")),
+        )
+    except Exception as exc:
+        logger.exception("16:9 highlight analysis failed after Shorts confirmation")
+        with _LOCK, _telegram_db() as db:
+            row = db.execute(
+                "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+            if row:
+                state = json.loads(row["state_json"])
+                state["topic_stage"] = "failed"
+                state["topic_error"] = str(exc)
+                db.execute(
+                    "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(state), now(), request_id),
+                )
+        send(
+            chat_id,
+            f"❌ 16:9 highlight analysis failed\nJob ID: {request_id}\n"
+            f"{str(exc)[:1200]}",
+        )
+
+
 def _process(request_id: str) -> None:
     with _LOCK, _telegram_db() as db:
         row = db.execute("SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)).fetchone()
@@ -1121,6 +1169,7 @@ def _process(request_id: str) -> None:
                     )
                     for index in range(len(approved_clips)):
                         RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
+                    _send_short_confirmation(chat_id, request_id)
                     return
                 if rendered_clips:
                     existing_links = [
@@ -1147,6 +1196,7 @@ def _process(request_id: str) -> None:
                         "selection was not run again."
                         + (f"\n\n{links_text}" if links_text else ""),
                     )
+                    _send_short_confirmation(chat_id, request_id)
                     return
 
         prior_count = len(prior_shorts)
@@ -1446,6 +1496,64 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
         )
         background_tasks.add_task(_process, request_id)
         return {"status": choice, "request_id": request_id}
+
+    shorts_confirm = re.fullmatch(
+        r"rs:shorts_confirm:([A-Za-z0-9-]+)", callback_data
+    )
+    if shorts_confirm:
+        request_id = shorts_confirm.group(1)
+        with _LOCK, _telegram_db() as db:
+            row = db.execute(
+                "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+            if not row:
+                return {"status": "not_found"}
+            state = json.loads(row["state_json"])
+            if row["mode"] != "both":
+                return {"status": "highlights_not_requested"}
+            if state.get("shorts_confirmed_at"):
+                return {"status": "already_confirmed", "request_id": request_id}
+            clips = (state.get("result") or {}).get("segments", [])
+            reviews = dict(state.get("candidate_reviews") or {})
+            decided_statuses = {
+                "queued", "rendering", "rendered", "render_failed", "reject", "rejected"
+            }
+            pending = [
+                index + 1
+                for index in range(len(clips))
+                if str((reviews.get(str(index)) or {}).get("status") or "")
+                not in decided_statuses
+            ]
+            if pending:
+                send(
+                    chat_id,
+                    "Please approve or reject every 9:16 Short before confirming. "
+                    f"Still awaiting a decision: {', '.join(map(str, pending))}",
+                )
+                return {
+                    "status": "shorts_review_incomplete",
+                    "request_id": request_id,
+                    "pending": pending,
+                }
+            state["shorts_confirmed_at"] = now()
+            state["topic_stage"] = "queued"
+            db.execute(
+                "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? "
+                "WHERE request_id=?",
+                ("processing_16_9", json.dumps(state), now(), request_id),
+            )
+        send(
+            chat_id,
+            "✅ 9:16 Shorts review confirmed. Starting the 16:9 highlight analysis.",
+        )
+        RENDER_EXECUTOR.submit(
+            _start_16_9_after_confirmation, request_id, chat_id
+        )
+        return {
+            "status": "shorts_confirmed",
+            "request_id": request_id,
+            "next_stage": "16_9_highlights",
+        }
 
     topic_action = re.fullmatch(
         r"rs:topic_(approve|reject):([A-Za-z0-9-]+):(\d+)", callback_data
