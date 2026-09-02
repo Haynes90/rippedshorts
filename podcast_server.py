@@ -8,6 +8,12 @@ from pydantic import BaseModel, Field
 
 from main import app, get_transcript, create_transcript_doc, resolve_video_id, JOBS, executor, logger
 from podcast_pipeline import run_podcast_metadata_queue
+from schedule_route_gate import install_route_gate
+
+# Ripped Shorts owns Telegram intake. Install the route gate after main/telegram_intake
+# are loaded so only YouTube route resolution is wrapped; all existing review/render
+# commands continue to use the original handler.
+install_route_gate()
 
 
 class PodcastMetadataRequest(BaseModel):
