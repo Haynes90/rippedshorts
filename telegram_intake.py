@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import requests
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request, Response
 
 from audio_master_handoff import DB_PATH, SOURCE_DIR, connect, download_drive, drive_metadata, get_job
 from source_ingestion import (
@@ -1005,9 +1005,11 @@ def _start_16_9_after_confirmation(request_id: str, chat_id: str) -> None:
 
 
 def _process(request_id: str) -> None:
+    logger.info("Ripped Shorts job starting request_id=%s", request_id)
     with _LOCK, _telegram_db() as db:
         row = db.execute("SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)).fetchone()
     if not row:
+        logger.error("Ripped Shorts job missing from database request_id=%s", request_id)
         return
     state, chat_id = json.loads(row["state_json"]), row["chat_id"]
     try:
@@ -1318,6 +1320,7 @@ def _process(request_id: str) -> None:
             chat_id, request_id, result, start_index=len(approved_clips)
         )
     except Exception as exc:
+        logger.exception("Ripped Shorts processing failed request_id=%s", request_id)
         _save(request_id, "error", {**state, "stage": "error", "error_type": type(exc).__name__, "error": str(exc), "retryable": True})
         send(chat_id, f"❌ Processing failed\nJob ID: {request_id}\n{str(exc)[:1500]}\n\nSend /retry {request_id} to try again.")
 
@@ -1445,7 +1448,12 @@ def _boundary_learning_prompt(limit: int = 50) -> str:
         return ""
 
 
-def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
+def _accept_update(
+    update: dict,
+    background_tasks: BackgroundTasks,
+    *,
+    trusted_source: bool = False,
+) -> dict:
     callback = update.get("callback_query") or {}
     message = callback.get("message") or update.get("message") or update.get("edited_message") or {}
     chat_id = str((message.get("chat") or {}).get("id", ""))
@@ -1454,7 +1462,7 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
     text = str(message.get("text") or message.get("caption") or "").strip()
     if not chat_id or not user_id:
         return {"status": "ignored"}
-    if not _authorized(chat_id, user_id):
+    if not trusted_source and not _authorized(chat_id, user_id):
         return {"status": "unauthorized"}
     options_choice = re.fullmatch(
         r"rs:options:([A-Za-z0-9-]+)", callback_data
@@ -1781,6 +1789,13 @@ def _accept_update(update: dict, background_tasks: BackgroundTasks) -> dict:
         f"Source: {parsed['source_kind'].title()}\nJob ID: {request_id}",
     )
     background_tasks.add_task(_process, request_id)
+    logger.info(
+        "Ripped Shorts job queued request_id=%s update_id=%s source_kind=%s mode=%s",
+        request_id,
+        update_id,
+        parsed["source_kind"],
+        parsed["mode"],
+    )
     return {"status": "accepted", "request_id": request_id}
 
 
@@ -2038,6 +2053,14 @@ async def telegram_gateway(request: Request, x_telegram_bot_api_secret_token: st
     # forwarding new links and rs:* callbacks to Ripped Shorts.
     if clipmaster_claims_update(update):
         return handle_clipmaster_update(update)
+    callback = update.get("callback_query") or {}
+    message = callback.get("message") or update.get("message") or update.get("edited_message") or {}
+    chat_id = str((message.get("chat") or {}).get("id", ""))
+    user_id = str((callback.get("from") or message.get("from") or {}).get("id", ""))
+    if not chat_id or not user_id:
+        raise HTTPException(status_code=422, detail="Telegram update is missing chat or user identity")
+    if not _authorized(chat_id, user_id):
+        raise HTTPException(status_code=403, detail="Telegram chat or user is not authorized")
     target = os.getenv("RIPPED_SHORTS_INTERNAL_URL", "").rstrip("/")
     secret = os.getenv("RIPPED_SHORTS_SHARED_SECRET", "").strip()
     if not target or not secret:
@@ -2049,8 +2072,28 @@ async def telegram_gateway(request: Request, x_telegram_bot_api_secret_token: st
 
 
 @router.post("/api/ripped-shorts/intake")
-async def internal_intake(request: Request, background_tasks: BackgroundTasks, x_ripped_shorts_secret: str | None = Header(None)):
+async def internal_intake(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    response: Response,
+    x_ripped_shorts_secret: str | None = Header(None),
+):
     expected = os.getenv("RIPPED_SHORTS_SHARED_SECRET", "").strip()
     if not expected or x_ripped_shorts_secret != expected:
         raise HTTPException(status_code=401, detail="Invalid Ripped Shorts service secret")
-    return _accept_update(await request.json(), background_tasks)
+    update = await request.json()
+    result = _accept_update(update, background_tasks, trusted_source=True)
+    status = str(result.get("status") or "unknown")
+    logger.info(
+        "Ripped Shorts intake result update_id=%s status=%s request_id=%s",
+        update.get("update_id", ""),
+        status,
+        result.get("request_id", ""),
+    )
+    if status == "ignored":
+        raise HTTPException(status_code=422, detail="Telegram update is missing chat or user identity")
+    if status == "unauthorized":
+        raise HTTPException(status_code=403, detail="Telegram chat or user is not authorized")
+    if status in {"accepted", "retry_accepted"}:
+        response.status_code = 202
+    return result

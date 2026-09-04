@@ -166,7 +166,9 @@ def _resume_after_route(request_id: str, chat_id: str, state: dict[str, Any], ba
     }
 
 
-def _handle_route_callback(update: dict[str, Any], background_tasks) -> dict[str, Any] | None:
+def _handle_route_callback(
+    update: dict[str, Any], background_tasks, *, trusted_source: bool = False
+) -> dict[str, Any] | None:
     callback = update.get("callback_query") or {}
     match = _ROUTE_CALLBACK_RE.fullmatch(str(callback.get("data") or ""))
     if not match:
@@ -175,7 +177,9 @@ def _handle_route_callback(update: dict[str, Any], background_tasks) -> dict[str
     message = callback.get("message") or {}
     chat_id = str((message.get("chat") or {}).get("id", ""))
     user_id = str((callback.get("from") or {}).get("id", ""))
-    if not chat_id or not user_id or not ti._authorized(chat_id, user_id):
+    if not chat_id or not user_id or (
+        not trusted_source and not ti._authorized(chat_id, user_id)
+    ):
         return {"status": "unauthorized"}
 
     request_id, show_id = match.groups()
@@ -214,7 +218,9 @@ def _handle_route_callback(update: dict[str, Any], background_tasks) -> dict[str
     return _resume_after_route(request_id, chat_id, state, background_tasks)
 
 
-def _handle_new_youtube(update: dict[str, Any], background_tasks) -> dict[str, Any] | None:
+def _handle_new_youtube(
+    update: dict[str, Any], background_tasks, *, trusted_source: bool = False
+) -> dict[str, Any] | None:
     callback = update.get("callback_query") or {}
     if callback:
         return None
@@ -233,7 +239,7 @@ def _handle_new_youtube(update: dict[str, Any], background_tasks) -> dict[str, A
     user_id = str((message.get("from") or {}).get("id", ""))
     if not chat_id or not user_id:
         return {"status": "ignored"}
-    if not ti._authorized(chat_id, user_id):
+    if not trusted_source and not ti._authorized(chat_id, user_id):
         return {"status": "unauthorized"}
 
     request_id = str(uuid.uuid4())
@@ -296,14 +302,22 @@ def _handle_new_youtube(update: dict[str, Any], background_tasks) -> dict[str, A
     return _resume_after_route(request_id, chat_id, state, background_tasks)
 
 
-def gated_accept_update(update: dict[str, Any], background_tasks):
-    routed = _handle_route_callback(update, background_tasks)
+def gated_accept_update(
+    update: dict[str, Any], background_tasks, *, trusted_source: bool = False
+):
+    routed = _handle_route_callback(
+        update, background_tasks, trusted_source=trusted_source
+    )
     if routed is not None:
         return routed
-    youtube = _handle_new_youtube(update, background_tasks)
+    youtube = _handle_new_youtube(
+        update, background_tasks, trusted_source=trusted_source
+    )
     if youtube is not None:
         return youtube
-    return _ORIGINAL_ACCEPT_UPDATE(update, background_tasks)
+    return _ORIGINAL_ACCEPT_UPDATE(
+        update, background_tasks, trusted_source=trusted_source
+    )
 
 
 def install_route_gate() -> None:
