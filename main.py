@@ -146,10 +146,9 @@ def extract_video_id(youtube_url: str) -> Optional[str]:
         query = parse_qs(parsed.query)
         if "v" in query and query["v"]:
             return query["v"][0]
-        if parsed.path.startswith("/shorts/"):
-            return parsed.path.split("/shorts/")[-1].split("/")[0]
-        if parsed.path.startswith("/embed/"):
-            return parsed.path.split("/embed/")[-1].split("/")[0]
+        for prefix in ("/shorts/", "/live/", "/embed/"):
+            if parsed.path.startswith(prefix):
+                return parsed.path.split(prefix, 1)[-1].split("/")[0]
     if "youtu.be" in host:
         return parsed.path.lstrip("/").split("/")[0]
     return None
