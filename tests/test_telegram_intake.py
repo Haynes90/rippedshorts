@@ -71,6 +71,24 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("RIPPED_SHORTS_SHARED_SECRET", SOURCE)
         self.assertIn('/api/ripped-shorts/intake', SOURCE)
 
+    def test_internal_intake_is_observable_and_trusts_authenticated_gateway(self):
+        self.assertIn("trusted_source=True", SOURCE)
+        self.assertIn("Ripped Shorts intake result", SOURCE)
+        self.assertIn("Ripped Shorts job queued", SOURCE)
+        self.assertIn("response.status_code = 202", SOURCE)
+
+    def test_processing_failures_are_written_to_railway_logs(self):
+        process_source = ast.get_source_segment(
+            SOURCE,
+            next(
+                node
+                for node in TREE.body
+                if isinstance(node, ast.FunctionDef) and node.name == "_process"
+            ),
+        )
+        self.assertIn("Ripped Shorts job starting", process_source)
+        self.assertIn("logger.exception", process_source)
+
     def test_analysis_does_not_render_before_approval(self):
         process_source = ast.get_source_segment(SOURCE, next(node for node in TREE.body if isinstance(node, ast.FunctionDef) and node.name == "_process"))
         self.assertIn('"awaiting_review"', process_source)
