@@ -21,7 +21,7 @@ namespace = {
     "Any": object,
     "Literal": __import__("typing").Literal,
 }
-exec("YOUTUBE_RE = re.compile(r'https?://(?:www\\.)?(?:youtube\\.com/(?:watch\\?[^\\s]*v=|shorts/)|youtu\\.be/)([A-Za-z0-9_-]{6,20})', re.I)\nDRIVE_RE = re.compile(r'https?://drive\\.google\\.com/(?:file/d/|open\\?id=|uc\\?(?:[^\\s]*&)?id=)([A-Za-z0-9_-]+)', re.I)", namespace)
+exec("YOUTUBE_RE = re.compile(r'https?://(?:(?:www\\.|m\\.)?youtube\\.com/(?:watch\\?[^\\s]*v=|shorts/|live/|embed/)|youtu\\.be/)([A-Za-z0-9_-]{6,20})', re.I)\nDRIVE_RE = re.compile(r'https?://drive\\.google\\.com/(?:file/d/|open\\?id=|uc\\?(?:[^\\s]*&)?id=)([A-Za-z0-9_-]+)', re.I)", namespace)
 exec(compile(ast.Module(body=[FUNCTIONS["parse_request"]], type_ignores=[]), "telegram-functions", "exec"), namespace)
 parse_request = namespace["parse_request"]
 exec(compile(ast.Module(body=[FUNCTIONS["validate_complete_candidates"]], type_ignores=[]), "candidate-functions", "exec"), namespace)
@@ -45,6 +45,15 @@ class TelegramParsingTests(unittest.TestCase):
         result = parse_request("https://youtu.be/abcdefghijk")
         self.assertEqual(result["source_kind"], "youtube")
         self.assertEqual(result["mode"], "both")
+
+    def test_youtube_live_link_is_accepted(self):
+        result = parse_request("https://www.youtube.com/live/abcdefghijk?si=share")
+        self.assertEqual(result["source_kind"], "youtube")
+        self.assertEqual(result["video_id"], "abcdefghijk")
+
+    def test_mobile_youtube_link_is_accepted(self):
+        result = parse_request("https://m.youtube.com/watch?v=abcdefghijk")
+        self.assertEqual(result["video_id"], "abcdefghijk")
 
     def test_drive_short_request(self):
         result = parse_request("Find short highlights https://drive.google.com/file/d/abc_DEF-123/view")

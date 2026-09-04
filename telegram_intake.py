@@ -33,7 +33,12 @@ from clipmaster_review import (
 router = APIRouter()
 router.include_router(clipmaster_review_router)
 
-YOUTUBE_RE = re.compile(r"https?://(?:www\.)?(?:youtube\.com/(?:watch\?[^\s]*v=|shorts/)|youtu\.be/)([A-Za-z0-9_-]{6,20})", re.I)
+YOUTUBE_RE = re.compile(
+    r"https?://(?:(?:www\.|m\.)?youtube\.com/"
+    r"(?:watch\?[^\s]*v=|shorts/|live/|embed/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{6,20})",
+    re.I,
+)
 DRIVE_RE = re.compile(r"https?://drive\.google\.com/(?:file/d/|open\?id=|uc\?(?:[^\s]*&)?id=)([A-Za-z0-9_-]+)", re.I)
 _LOCK = threading.RLock()
 logger = logging.getLogger("ripped-shorts.telegram")
