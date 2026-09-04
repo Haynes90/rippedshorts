@@ -829,7 +829,7 @@ def _send_short_confirmation(chat_id: str, request_id: str) -> None:
             "reply_markup": {
                 "inline_keyboard": [[
                     {
-                        "text": "✅ I’ve Picked My Shorts — Continue",
+                        "text": "✅ These Shorts Been Ripped — Continue",
                         "callback_data": f"rs:shorts_confirm:{request_id}",
                     }
                 ]]
