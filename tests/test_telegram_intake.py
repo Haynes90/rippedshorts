@@ -156,7 +156,15 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertNotIn('row["mode"] in {"topics", "both"}', process_source)
         self.assertIn("rs:shorts_confirm:", SOURCE)
         self.assertIn("shorts_confirmed_at", SOURCE)
-        self.assertIn("Please approve or reject every 9:16 Short", SOURCE)
+        self.assertIn("I’ve Picked My Shorts — Continue", SOURCE)
+        self.assertIn("selection_complete_skip", SOURCE)
+
+    def test_completed_short_selection_hands_off_to_schedule_master(self):
+        self.assertIn("def _handoff_shorts_to_schedule_master", SOURCE)
+        self.assertIn('f"{target}/schedule/intake"', SOURCE)
+        self.assertIn("SCHEDULE_MASTER_INTERNAL_URL", SOURCE)
+        self.assertIn('"shorts_status": "accepted"', SOURCE)
+        self.assertIn("Schedule Master received", SOURCE)
 
     def test_existing_clipmaster_chat_is_reused(self):
         self.assertIn('os.getenv("TELEGRAM_CHAT_ID"', SOURCE)
