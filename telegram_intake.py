@@ -111,6 +111,10 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
             return
         signature = json.dumps(statuses, sort_keys=True)
         if state.get("render_queue_completion_signature") == signature:
+            if state.get("short_selection_completed_at"):
+                RENDER_EXECUTOR.submit(
+                    _handoff_shorts_to_schedule_master, request_id, chat_id
+                )
             return
         state["render_queue_completion_signature"] = signature
         db.execute(
@@ -136,6 +140,152 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
             f"\nFailed: {failed}"
             f"{folder_line}",
         )
+        with _LOCK, _telegram_db() as db:
+            latest = db.execute(
+                "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+        latest_state = json.loads(latest["state_json"]) if latest else {}
+        if latest_state.get("short_selection_completed_at"):
+            RENDER_EXECUTOR.submit(
+                _handoff_shorts_to_schedule_master, request_id, chat_id
+            )
+
+
+def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
+    """Send the final rendered 9:16 selection downstream exactly once."""
+    target = (
+        os.getenv("SCHEDULE_MASTER_INTERNAL_URL")
+        or os.getenv("SCHEDULE_MASTER_URL")
+        or ""
+    ).strip().rstrip("/")
+    if not target:
+        logger.warning(
+            "Schedule Master handoff skipped request_id=%s reason=missing_url",
+            request_id,
+        )
+        send(chat_id, "⚠️ Your Shorts are complete, but Schedule Master is not configured.")
+        return
+    with _LOCK, _telegram_db() as db:
+        row = db.execute(
+            "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if not row:
+            return
+        state = json.loads(row["state_json"])
+        schedule = dict(state.get("schedule_master") or {})
+        if schedule.get("shorts_status") in {"sending", "accepted"}:
+            return
+        reviews = dict(state.get("candidate_reviews") or {})
+        clips = (state.get("result") or {}).get("segments", [])
+        assets = []
+        for index, clip in enumerate(clips):
+            review = reviews.get(str(index)) or {}
+            if review.get("status") != "rendered" or not review.get("clip_url"):
+                continue
+            number = int(clip.get("candidate_number") or index + 1)
+            assets.append(
+                {
+                    "asset_id": f"{request_id}:short:{number}",
+                    "candidate_number": number,
+                    "asset_type": "9:16_SHORT",
+                    "drive_url": review["clip_url"],
+                    "transcript": str(clip.get("transcript") or ""),
+                    "duration_seconds": float(clip.get("duration") or 0),
+                    "main_theme": str(
+                        (state.get("result") or {}).get("analysis", {}).get("main_theme")
+                        or ""
+                    ),
+                    "keywords": ", ".join(
+                        (state.get("result") or {}).get("analysis", {}).get("keywords")
+                        or []
+                    ),
+                }
+            )
+        if not assets:
+            send(chat_id, "No rendered Shorts were selected for Schedule Master.")
+            return
+        schedule["shorts_status"] = "sending"
+        schedule["shorts_started_at"] = now()
+        state["schedule_master"] = schedule
+        db.execute(
+            "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+            (json.dumps(state), now(), request_id),
+        )
+    parsed = state.get("parsed") or {}
+    payload = {
+        "request_id": request_id,
+        "youtube_video_id": str(parsed.get("video_id") or ""),
+        "youtube_channel_id": str(state.get("youtube_channel_id") or "") or None,
+        "show_id": str(state.get("show_id") or "") or None,
+        "source_url": str(parsed.get("source_value") or "") or None,
+        "source_title": _state_vid_title(state),
+        "assets": assets,
+    }
+    headers = {}
+    secret = os.getenv("SCHEDULE_MASTER_SHARED_SECRET", "").strip()
+    if secret:
+        headers["x-schedule-master-secret"] = secret
+    try:
+        response = requests.post(
+            f"{target}/schedule/intake",
+            json=payload,
+            headers=headers,
+            timeout=(10, 60),
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Schedule Master returned {response.status_code}: {response.text[:1000]}"
+            )
+        result = response.json()
+        with _LOCK, _telegram_db() as db:
+            row = db.execute(
+                "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            latest_state = json.loads(row["state_json"])
+            latest_schedule = dict(latest_state.get("schedule_master") or {})
+            latest_schedule.update(
+                {
+                    "shorts_status": "accepted",
+                    "shorts_completed_at": now(),
+                    "shorts_response": result,
+                }
+            )
+            latest_state["schedule_master"] = latest_schedule
+            db.execute(
+                "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+                (json.dumps(latest_state), now(), request_id),
+            )
+        logger.info(
+            "Schedule Master accepted Shorts request_id=%s assets=%s track_id=%s",
+            request_id,
+            len(assets),
+            result.get("track_id", ""),
+        )
+        send(
+            chat_id,
+            f"✅ Selection complete. Schedule Master received {len(assets)} Short(s).",
+        )
+    except Exception as exc:
+        logger.exception("Schedule Master Shorts handoff failed request_id=%s", request_id)
+        with _LOCK, _telegram_db() as db:
+            row = db.execute(
+                "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if row:
+                latest_state = json.loads(row["state_json"])
+                latest_schedule = dict(latest_state.get("schedule_master") or {})
+                latest_schedule.update(
+                    {"shorts_status": "failed", "shorts_error": str(exc), "shorts_failed_at": now()}
+                )
+                latest_state["schedule_master"] = latest_schedule
+                db.execute(
+                    "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(latest_state), now(), request_id),
+                )
+        send(chat_id, f"❌ Schedule Master handoff failed: {str(exc)[:1200]}")
 
 
 def _csv_env(name: str) -> set[str]:
@@ -672,14 +822,14 @@ def _send_short_confirmation(chat_id: str, request_id: str) -> None:
         {
             "chat_id": chat_id,
             "text": (
-                "When you have approved or rejected every 9:16 Short, confirm the "
-                "Shorts review. The 16:9 highlight analysis will begin only after "
-                "this confirmation."
+                "Approve the 9:16 Shorts you want. When you are finished choosing, "
+                "tap the button below. Untouched Shorts will be skipped, your rendered "
+                "choices will go to Schedule Master, and 16:9 analysis will begin."
             ),
             "reply_markup": {
                 "inline_keyboard": [[
                     {
-                        "text": "✅ Confirm 9:16 Review",
+                        "text": "✅ I’ve Picked My Shorts — Continue",
                         "callback_data": f"rs:shorts_confirm:{request_id}",
                     }
                 ]]
@@ -1537,18 +1687,16 @@ def _accept_update(
                 if str((reviews.get(str(index)) or {}).get("status") or "")
                 not in decided_statuses
             ]
-            if pending:
-                send(
-                    chat_id,
-                    "Please approve or reject every 9:16 Short before confirming. "
-                    f"Still awaiting a decision: {', '.join(map(str, pending))}",
-                )
-                return {
-                    "status": "shorts_review_incomplete",
-                    "request_id": request_id,
-                    "pending": pending,
+            for index in pending:
+                reviews[str(index - 1)] = {
+                    "status": "rejected",
+                    "reviewed_at": now(),
+                    "user_id": user_id,
+                    "selection_complete_skip": True,
                 }
+            state["candidate_reviews"] = reviews
             state["shorts_confirmed_at"] = now()
+            state["short_selection_completed_at"] = now()
             state["topic_stage"] = "queued"
             db.execute(
                 "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? "
@@ -1557,8 +1705,10 @@ def _accept_update(
             )
         send(
             chat_id,
-            "✅ 9:16 Shorts review confirmed. Starting the 16:9 highlight analysis.",
+            f"✅ You picked your Shorts. {len(pending)} untouched candidate(s) skipped. "
+            "Starting 16:9 highlight analysis and preparing the rendered Shorts for Schedule Master.",
         )
+        _notify_render_queue_complete(request_id, chat_id)
         RENDER_EXECUTOR.submit(
             _start_16_9_after_confirmation, request_id, chat_id
         )
