@@ -156,7 +156,7 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertNotIn('row["mode"] in {"topics", "both"}', process_source)
         self.assertIn("rs:shorts_confirm:", SOURCE)
         self.assertIn("shorts_confirmed_at", SOURCE)
-        self.assertIn("I’ve Picked My Shorts — Continue", SOURCE)
+        self.assertIn("These Shorts Been Ripped — Continue", SOURCE)
         self.assertIn("selection_complete_skip", SOURCE)
 
     def test_completed_short_selection_hands_off_to_schedule_master(self):
