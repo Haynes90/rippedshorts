@@ -23,6 +23,8 @@ from source_ingestion import (
     reuse_from_drive,
     select_non_overlapping,
 )
+from google_drive import read_google_doc_text
+from google_sheets import get_rows
 from telegram_quick_edits import OPTIONS_TEXT, apply_quick_command, is_quick_command
 from clipmaster_review import (
     claims_update as clipmaster_claims_update,
@@ -684,6 +686,67 @@ def _reviewed_short_history_from_sheet(video_id: str) -> list[dict[str, Any]]:
     return sorted(found.values(), key=lambda item: item["candidate_number"])
 
 
+def _configured_short_framework_prompt() -> str:
+    """Load the shared 9:16 editorial framework from the RIPPED Show Config row."""
+    try:
+        rows = get_rows(RIPPED_LOG_SHEET_ID, "Show Config", "A1:AF1000")
+        ripped = next(
+            (
+                row
+                for row in rows
+                if str(row.get("show_id") or "").strip().upper() == "RIPPED"
+            ),
+            None,
+        )
+        reference = str(
+            (ripped or {}).get("ai_prompt")
+            or (ripped or {}).get("open_ai_prompt")
+            or (ripped or {}).get("prompt")
+            or ""
+        ).strip()
+        if not reference:
+            logger.warning("RIPPED Show Config row has no 9:16 prompt reference")
+            return ""
+        return read_google_doc_text(reference).strip()
+    except Exception as exc:
+        logger.exception("Could not load configured 9:16 editorial framework: %s", exc)
+        return ""
+
+
+def _brand_short_prompt(state: dict[str, Any]) -> str:
+    show_id = str(state.get("show_id") or "").strip().upper()
+    common = (
+        "CONVERSATIONAL CLIP RULES\n"
+        "Treat a compelling answer, response, reaction, rebuttal, or exchange as a "
+        "first-class Short candidate. Include the question or the shortest necessary "
+        "setup when the answer would otherwise be unclear. The final clip must still "
+        "open cleanly, make sense to a new viewer, and reach the speaker's complete payoff."
+    )
+    if show_id == "TCB":
+        return (
+            common
+            + "\nTCB SOURCE CONTEXT\nThis is a Chocolate Botanist appearance or "
+            "livestream clip. Favor insightful, intriguing, useful, funny, or memorable "
+            "moments that represent the appearance well. Preserve enough source-show "
+            "context for later caption attribution."
+        )
+    if show_id == "TDOG":
+        return (
+            common
+            + "\nTDOG SOURCE CONTEXT\nThis is The Dirt on Gardening. Favor complete "
+            "gardening insights, host/guest exchanges, practical answers, stories, "
+            "myth corrections, and memorable reactions."
+        )
+    if show_id == "AGAPE_CHURCH":
+        return (
+            common
+            + "\nAGAPE SOURCE CONTEXT\nFavor complete Christian teaching, motivation, "
+            "inspiration, testimony, prayer, and sermon application. Preserve theological "
+            "context and never select an isolated line that changes the intended meaning."
+        )
+    return common
+
+
 def _short_learning_prompt(video_id: str) -> str:
     """Build balanced approval/rejection examples from the durable Shorts ledger."""
     import main
@@ -812,19 +875,25 @@ def _send_short_confirmation(chat_id: str, request_id: str) -> None:
             "SELECT mode, state_json FROM telegram_requests WHERE request_id=?",
             (request_id,),
         ).fetchone()
-    if not row or row["mode"] != "both":
+    if not row:
         return
     state = json.loads(row["state_json"])
-    if state.get("shorts_confirmed_at") or state.get("topic_stage"):
+    if state.get("shorts_confirmed_at") or state.get("short_selection_completed_at"):
         return
+    continue_text = (
+        "Untouched Shorts will be skipped, your rendered choices will go to "
+        "Schedule Master, and 16:9 analysis will begin."
+        if row["mode"] == "both"
+        else "Untouched Shorts will be skipped and your rendered choices will go "
+        "to Schedule Master for captioning and scheduling."
+    )
     telegram(
         "sendMessage",
         {
             "chat_id": chat_id,
             "text": (
                 "Approve the 9:16 Shorts you want. When you are finished choosing, "
-                "tap the button below. Untouched Shorts will be skipped, your rendered "
-                "choices will go to Schedule Master, and 16:9 analysis will begin."
+                "tap the button below. " + continue_text
             ),
             "reply_markup": {
                 "inline_keyboard": [[
@@ -836,7 +905,6 @@ def _send_short_confirmation(chat_id: str, request_id: str) -> None:
             },
         },
     )
-
 
 def _transcribe(video_path: Path) -> list[dict]:
     """Extract audio and ask OpenAI for timestamped segments when Drive has no transcript."""
@@ -1416,7 +1484,20 @@ def _process(request_id: str) -> None:
             )
         else:
             supplemental = learning_prompt
-        result = main.call_openai_for_clips(enriched, supplemental)
+        framework_prompt = _configured_short_framework_prompt()
+        prompt_layers = [
+            text
+            for text in (
+                framework_prompt,
+                _brand_short_prompt(state),
+                supplemental,
+            )
+            if str(text or "").strip()
+        ]
+        result = main.call_openai_for_clips(
+            enriched,
+            "\n\n".join(prompt_layers),
+        )
         result = validate_complete_candidates(result, enriched)
         excluded_history = (
             [item for item in prior_shorts if item.get("decision") == "rejected"]
@@ -1672,8 +1753,7 @@ def _accept_update(
             if not row:
                 return {"status": "not_found"}
             state = json.loads(row["state_json"])
-            if row["mode"] != "both":
-                return {"status": "highlights_not_requested"}
+            start_highlights = row["mode"] == "both"
             if state.get("shorts_confirmed_at"):
                 return {"status": "already_confirmed", "request_id": request_id}
             clips = (state.get("result") or {}).get("segments", [])
@@ -1697,25 +1777,41 @@ def _accept_update(
             state["candidate_reviews"] = reviews
             state["shorts_confirmed_at"] = now()
             state["short_selection_completed_at"] = now()
-            state["topic_stage"] = "queued"
+            if start_highlights:
+                state["topic_stage"] = "queued"
             db.execute(
                 "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? "
                 "WHERE request_id=?",
-                ("processing_16_9", json.dumps(state), now(), request_id),
+                (
+                    "processing_16_9" if start_highlights else "awaiting_render_completion",
+                    json.dumps(state),
+                    now(),
+                    request_id,
+                ),
             )
         send(
             chat_id,
-            f"✅ You picked your Shorts. {len(pending)} untouched candidate(s) skipped. "
-            "Starting 16:9 highlight analysis and preparing the rendered Shorts for Schedule Master.",
+            (
+                f"✅ You picked your Shorts. {len(pending)} untouched candidate(s) skipped. "
+                + (
+                    "Starting 16:9 highlight analysis and preparing the rendered "
+                    "Shorts for Schedule Master."
+                    if start_highlights
+                    else "Preparing the rendered Shorts for Schedule Master."
+                )
+            ),
         )
         _notify_render_queue_complete(request_id, chat_id)
-        RENDER_EXECUTOR.submit(
-            _start_16_9_after_confirmation, request_id, chat_id
-        )
+        if start_highlights:
+            RENDER_EXECUTOR.submit(
+                _start_16_9_after_confirmation, request_id, chat_id
+            )
         return {
             "status": "shorts_confirmed",
             "request_id": request_id,
-            "next_stage": "16_9_highlights",
+            "next_stage": (
+                "16_9_highlights" if start_highlights else "schedule_master"
+            ),
         }
 
     topic_action = re.fullmatch(
