@@ -58,6 +58,17 @@ def _route_by_show_id(show_id: str) -> dict[str, str] | None:
     return None
 
 
+class _QuietYdlLogger:
+    def debug(self, message: str) -> None:
+        pass
+
+    def warning(self, message: str) -> None:
+        pass
+
+    def error(self, message: str) -> None:
+        pass
+
+
 def _youtube_channel_id(url: str) -> str:
     opts = {
         "quiet": True,
@@ -65,6 +76,7 @@ def _youtube_channel_id(url: str) -> str:
         "skip_download": True,
         "noplaylist": True,
         "socket_timeout": 30,
+        "logger": _QuietYdlLogger(),
     }
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -253,7 +265,7 @@ def _handle_new_youtube(
         route = _route_by_channel(channel_id)
     except Exception as exc:
         route_error = str(exc)
-        ti.logger.exception("YouTube route lookup failed; asking Telegram for route")
+        ti.logger.warning("YouTube route lookup unavailable; asking Telegram for route: %s", exc)
 
     state = {
         "stage": "accepted" if route else "awaiting_route",
