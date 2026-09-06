@@ -55,10 +55,22 @@ class TelegramParsingTests(unittest.TestCase):
         result = parse_request("https://m.youtube.com/watch?v=abcdefghijk")
         self.assertEqual(result["video_id"], "abcdefghijk")
 
-    def test_drive_short_request(self):
+    def test_normal_short_wording_still_defaults_to_both(self):
         result = parse_request("Find short highlights https://drive.google.com/file/d/abc_DEF-123/view")
         self.assertEqual(result["source_kind"], "drive")
+        self.assertEqual(result["mode"], "both")
+
+    def test_ripped_shorts_name_does_not_suppress_16_9(self):
+        result = parse_request("Ripped Shorts TCB clip https://youtu.be/abcdefghijk")
+        self.assertEqual(result["mode"], "both")
+
+    def test_shorts_only_requires_explicit_override(self):
+        result = parse_request("shorts only https://youtu.be/abcdefghijk")
         self.assertEqual(result["mode"], "shorts")
+
+    def test_16_9_only_requires_explicit_override(self):
+        result = parse_request("16:9 only https://youtu.be/abcdefghijk")
+        self.assertEqual(result["mode"], "topics")
 
     def test_drive_video_and_transcript_are_retained(self):
         result = parse_request("Process https://drive.google.com/file/d/video123/view transcript https://drive.google.com/file/d/transcript456/view")
