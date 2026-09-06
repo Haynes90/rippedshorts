@@ -310,16 +310,28 @@ def parse_request(text: str) -> dict[str, Any]:
     youtube = YOUTUBE_RE.search(clean)
     drive = DRIVE_RE.findall(clean)
     lowered = clean.lower()
-    if any(word in lowered for word in ("topic", "segment", "16:9", "horizontal")) and not any(
-        word in lowered for word in ("short", "both")
-    ):
-        mode: Literal["shorts", "topics", "both"] = "topics"
-    elif "short" in lowered and not any(
-        word in lowered for word in ("topic", "segment", "16:9", "horizontal", "both")
-    ):
-        mode = "shorts"
+    # Both editorial lanes are the normal workflow. Merely saying "Ripped Shorts",
+    # "clip", "highlight", or "short" must not silently suppress 16:9 highlights.
+    # A single-lane run requires an explicit "only" override.
+    shorts_only = bool(
+        re.search(
+            r"\b(?:shorts?|9:16|vertical)(?:\s+(?:clips?|videos?))?\s+only\b"
+            r"|\bonly\s+(?:shorts?|9:16|vertical)(?:\s+(?:clips?|videos?))?\b",
+            lowered,
+        )
+    )
+    topics_only = bool(
+        re.search(
+            r"\b(?:topics?|segments?|16:9|horizontal|highlights?)(?:\s+(?:clips?|videos?))?\s+only\b"
+            r"|\bonly\s+(?:topics?|segments?|16:9|horizontal|highlights?)(?:\s+(?:clips?|videos?))?\b",
+            lowered,
+        )
+    )
+    if shorts_only and not topics_only:
+        mode: Literal["shorts", "topics", "both"] = "shorts"
+    elif topics_only and not shorts_only:
+        mode = "topics"
     else:
-        # A plain link starts both editorial lanes.
         mode = "both"
     if youtube:
         return {"mode": mode, "source_kind": "youtube", "source_value": youtube.group(0), "video_id": youtube.group(1)}
