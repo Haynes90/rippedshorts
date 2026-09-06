@@ -240,7 +240,7 @@ def ingest_with_audio_master(video_id: str, youtube_url: str) -> dict[str, Any]:
     if not job_id:
         raise RuntimeError(f"Audio Master ingest returned no job_id: {accepted}")
 
-    timeout_seconds = max(60, int(os.getenv("AUDIO_MASTER_INGEST_TIMEOUT_SECONDS", "5400")))
+    timeout_seconds = max(1200, int(os.getenv("AUDIO_MASTER_INGEST_TIMEOUT_SECONDS", "5400")))
     poll_seconds = max(3, int(os.getenv("AUDIO_MASTER_INGEST_POLL_SECONDS", "15")))
     deadline = time.monotonic() + timeout_seconds
     last: dict[str, Any] = accepted
