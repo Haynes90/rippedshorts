@@ -478,11 +478,22 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
             (json.dumps(state), now(), request_id),
         )
     parsed = state.get("parsed") or {}
-    assets = _generate_schedule_copy(
-        assets,
-        str(state.get("show_id") or ""),
-        _state_vid_title(state),
-    )
+    reviewed_copy = {
+        str(item.get("asset_id") or ""): item
+        for item in (state.get("copy_drafts") or [])
+    }
+    if reviewed_copy:
+        assets = [
+            {**asset, **reviewed_copy.get(str(asset.get("asset_id") or ""), {})}
+            for asset in assets
+        ]
+    else:
+        # Compatibility fallback for jobs created before the copy-review release.
+        assets = _generate_schedule_copy(
+            assets,
+            str(state.get("show_id") or ""),
+            _state_vid_title(state),
+        )
     payload = {
         "request_id": request_id,
         "youtube_video_id": str(parsed.get("video_id") or ""),
