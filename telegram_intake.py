@@ -166,6 +166,115 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
             )
 
 
+def _generate_schedule_copy(
+    assets: list[dict[str, Any]], show_id: str, source_title: str
+) -> list[dict[str, Any]]:
+    """Create ready-to-schedule social copy while preserving a safe fallback."""
+    brand = str(show_id or "TCB").strip().upper()
+    if brand in {"TDOG", "THE_DOG"}:
+        brand_rule = (
+            "The Dirt on Gardening: identify the useful gardening idea, reference "
+            "the hosts/guest when the transcript supports it, tag known handles only, "
+            "and invite viewers to watch or follow The Dirt on Gardening."
+        )
+    elif brand.startswith("AGAPE"):
+        brand_rule = (
+            "Agape: Christianity, motivation, and inspiration. Use an inviting CTA "
+            "such as See us Sunday or Join us live online when appropriate."
+        )
+    else:
+        brand_rule = (
+            "The Chocolate Botanist: lead with the clip's insight or personality and "
+            "reference the source show, host, or channel when supported. Never invent tags."
+        )
+
+    fallback = []
+    for asset in assets:
+        transcript = str(asset.get("transcript") or "").strip()
+        title = str(asset.get("title") or "").strip() or source_title or "Video Highlight"
+        excerpt = re.sub(r"\s+", " ", transcript)[:280].strip()
+        caption = excerpt or f"A highlight from {source_title or 'this conversation'}."
+        if brand.startswith("AGAPE"):
+            caption = f"{caption}\n\nJoin us live online and see us Sunday."
+        fallback.append(
+            {
+                **asset,
+                "social_caption": caption,
+                "video_title": title[:100],
+                "video_description": caption,
+                "hashtags": "",
+                "copy_source": "fallback",
+            }
+        )
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key or not assets:
+        return fallback
+    compact_assets = [
+        {
+            "asset_id": asset["asset_id"],
+            "asset_type": asset["asset_type"],
+            "title": asset.get("title", ""),
+            "transcript": str(asset.get("transcript") or "")[:12000],
+        }
+        for asset in assets
+    ]
+    prompt = (
+        "Create publication-ready metadata for each supplied video asset. "
+        "Return JSON with an assets array; every item must contain asset_id, "
+        "social_caption, video_title, video_description, and hashtags. "
+        "For 9:16, write an engaging natural social caption with a hook, useful "
+        "context, attribution when known, a light CTA, and a few relevant hashtags. "
+        "For 16:9, write a compelling YouTube/Facebook title and a fuller description. "
+        "Do not fabricate names, handles, guests, facts, or links. Avoid clickbait that "
+        "the transcript does not earn.\n\n"
+        f"BRAND RULE:\n{brand_rule}\n\n"
+        f"SOURCE TITLE:\n{source_title}\n\n"
+        f"ASSETS:\n{json.dumps(compact_assets, ensure_ascii=False)}"
+    )
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": os.getenv("OPENAI_METADATA_MODEL", "gpt-5-mini"),
+                "messages": [
+                    {"role": "system", "content": "Return strict JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                "response_format": {"type": "json_object"},
+            },
+            timeout=(10, 600),
+        )
+        response.raise_for_status()
+        parsed = json.loads(response.json()["choices"][0]["message"]["content"])
+        generated = {
+            str(item.get("asset_id") or ""): item
+            for item in parsed.get("assets", [])
+            if item.get("asset_id")
+        }
+        enriched = []
+        for item in fallback:
+            copy = generated.get(str(item["asset_id"])) or {}
+            enriched.append(
+                {
+                    **item,
+                    "social_caption": str(copy.get("social_caption") or item["social_caption"]).strip(),
+                    "video_title": str(copy.get("video_title") or item["video_title"]).strip()[:100],
+                    "video_description": str(copy.get("video_description") or item["video_description"]).strip(),
+                    "hashtags": str(copy.get("hashtags") or "").strip(),
+                    "copy_source": "openai" if copy else item["copy_source"],
+                }
+            )
+        return enriched
+    except Exception:
+        logger.exception("Schedule copy generation failed; using transcript fallback")
+        return fallback
+
+
 def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
     """Send all final rendered 9:16 and 16:9 selections downstream once."""
     target = (
@@ -246,6 +355,11 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
             (json.dumps(state), now(), request_id),
         )
     parsed = state.get("parsed") or {}
+    assets = _generate_schedule_copy(
+        assets,
+        str(state.get("show_id") or ""),
+        _state_vid_title(state),
+    )
     payload = {
         "request_id": request_id,
         "youtube_video_id": str(parsed.get("video_id") or ""),
