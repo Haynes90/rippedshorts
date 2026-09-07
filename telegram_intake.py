@@ -2061,6 +2061,64 @@ def _accept_update(
         return {"status": "ignored"}
     if not trusted_source and not _authorized(chat_id, user_id):
         return {"status": "unauthorized"}
+    if text and not callback_data:
+        with _LOCK, _telegram_db() as db:
+            rows = db.execute(
+                "SELECT * FROM telegram_requests WHERE chat_id=? AND user_id=? "
+                "ORDER BY updated_at DESC LIMIT 20",
+                (chat_id, user_id),
+            ).fetchall()
+            edit_row = None
+            edit_state = None
+            for candidate_row in rows:
+                candidate_state = json.loads(candidate_row["state_json"])
+                waiting = candidate_state.get("awaiting_copy_input") or {}
+                if str(waiting.get("user_id") or "") == user_id:
+                    edit_row, edit_state = candidate_row, candidate_state
+                    break
+            if edit_row and edit_state:
+                waiting = edit_state.pop("awaiting_copy_input")
+                index = int(waiting["index"])
+                field = str(waiting["field"])
+                drafts = list(edit_state.get("copy_drafts") or [])
+                if index >= len(drafts):
+                    return {"status": "copy_draft_not_found"}
+                key = {
+                    "caption": "social_caption",
+                    "title": "video_title",
+                    "description": "video_description",
+                }[field]
+                drafts[index][key] = text
+                drafts[index]["user_edited"] = True
+                drafts[index]["edited_fields"] = sorted(
+                    set(drafts[index].get("edited_fields") or []) | {field}
+                )
+                edit_state["copy_drafts"] = drafts
+                db.execute(
+                    "UPDATE telegram_requests SET state_json=?, updated_at=? "
+                    "WHERE request_id=?",
+                    (json.dumps(edit_state), now(), edit_row["request_id"]),
+                )
+                request_id = edit_row["request_id"]
+                send(
+                    chat_id,
+                    f"✅ Your {field} replaced the AI draft and will be learned.\n\n{text[:3200]}",
+                )
+                telegram("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": "Make another edit above or finish the copy review.",
+                    "reply_markup": {"inline_keyboard": [[{
+                        "text": "✅ Approve Copy & Schedule",
+                        "callback_data": f"rs:copy_finish:{request_id}",
+                    }]]},
+                })
+                return {
+                    "status": "copy_updated",
+                    "request_id": request_id,
+                    "field": field,
+                    "asset_index": index,
+                }
+
     options_choice = re.fullmatch(
         r"rs:options:([A-Za-z0-9-]+)", callback_data
     )
