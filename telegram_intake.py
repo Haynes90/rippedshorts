@@ -317,6 +317,13 @@ def _generate_schedule_copy(
                 "TCB_CTA",
                 "TDOG_CTA",
                 "AGAPE_CTA",
+                "AGAPE_LEADERSHIP",
+                "AGAPE_ABOUT",
+                "AGAPE_WEDNESDAY",
+                "AGAPE_YOUTUBE_URL",
+                "AGAPE_FACEBOOK_URL",
+                "AGAPE_PASTOR_URL",
+                "AGAPE_HASHTAGS",
             }:
                 guide_rules[normalized_key] = value.strip()
     except Exception:
@@ -360,10 +367,46 @@ def _generate_schedule_copy(
             "Subscribe and join us for the next episode.",
         )
     elif brand.startswith("AGAPE"):
-        brand_cta = guide_rules.get(
-            "AGAPE_CTA",
-            "Need encouragement for the week? Join Agape live online and worship with us Sunday.",
+        agape_parts = [
+            guide_rules.get(
+                "AGAPE_CTA",
+                "Join us Sundays at 10 a.m. ET at 3601 Bastion Lane, Raleigh, NC, "
+                "for our worship experience. We’re the loving place, and everyone is welcome.",
+            ),
+            guide_rules.get(
+                "AGAPE_LEADERSHIP",
+                "Agape International COGIC is under the spirited leadership of "
+                "Superintendent Braxton D. Bowser Sr. and First Lady Dr. T’Shura Bowser.",
+            ),
+            guide_rules.get(
+                "AGAPE_ABOUT",
+                "Agape is an invigorating Christian ministry in Raleigh, North Carolina, "
+                "committed to faith, community, love, and making a positive impact throughout "
+                "the Triangle.",
+            ),
+            guide_rules.get(
+                "AGAPE_WEDNESDAY",
+                "Join Word on Wednesdays at 7 p.m. ET on Zoom.",
+            ),
+        ]
+        youtube_url = guide_rules.get("AGAPE_YOUTUBE_URL", "https://bit.ly/3uLE6Vj")
+        facebook_url = guide_rules.get("AGAPE_FACEBOOK_URL", "https://bit.ly/3oDvv5W")
+        pastor_url = guide_rules.get("AGAPE_PASTOR_URL", "https://braxtonbowser.com")
+        if youtube_url:
+            agape_parts.append(f"Subscribe on YouTube: {youtube_url}")
+        if facebook_url:
+            agape_parts.append(f"Follow us on Facebook: {facebook_url}")
+        if pastor_url:
+            agape_parts.append(f"Learn more about Pastor Bowser: {pastor_url}")
+        hashtags = guide_rules.get(
+            "AGAPE_HASHTAGS",
+            "#motivation #inspiration #nc2nd #cogic #churchofgodinchrist "
+            "#COGICchurch #COGICstrong #agapestrong #teamcogic "
+            "#agapeinternational #agapecogic #greatexploits #braxtonbowser",
         )
+        if hashtags:
+            agape_parts.append(hashtags)
+        brand_cta = "\n\n".join(part for part in agape_parts if part)
     else:
         brand_cta = guide_rules.get(
             "TCB_CTA",
