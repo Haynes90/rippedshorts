@@ -2116,6 +2116,8 @@ def _accept_update(
             state = json.loads(row["state_json"])
             if state.get("schedule_requested_at"):
                 return {"status": "already_scheduling", "request_id": request_id}
+            if state.get("copy_review_requested_at"):
+                return {"status": "copy_review_pending", "request_id": request_id}
 
             clips = (state.get("result") or {}).get("segments", [])
             short_reviews = dict(state.get("candidate_reviews") or {})
@@ -2153,17 +2155,107 @@ def _accept_update(
             state["topic_reviews"] = topic_reviews
             state["topic_selection_completed_at"] = now()
             state["topic_stage"] = "selection_complete"
+            state["copy_review_requested_at"] = now()
+            db.execute(
+                "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? "
+                "WHERE request_id=?",
+                ("awaiting_copy_review", json.dumps(state), now(), request_id),
+            )
+
+        draft_inputs = _copy_review_assets(state, request_id)
+        drafts = _generate_schedule_copy(
+            draft_inputs,
+            str(state.get("show_id") or ""),
+            _state_vid_title(state),
+        )
+        for draft in drafts:
+            draft["ai_social_caption"] = draft.get("social_caption", "")
+            draft["ai_video_title"] = draft.get("video_title", "")
+            draft["ai_video_description"] = draft.get("video_description", "")
+            draft["user_edited"] = False
+        with _LOCK, _telegram_db() as db:
+            row = db.execute(
+                "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            latest_state = json.loads(row["state_json"])
+            latest_state["copy_drafts"] = drafts
+            db.execute(
+                "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+                (json.dumps(latest_state), now(), request_id),
+            )
+        send(
+            chat_id,
+            f"📅 Video selection closed. Skipped {skipped_shorts} untouched Short(s) "
+            f"and {skipped_topics} untouched 16:9 highlight(s). Now review your "
+            "captions, titles, and descriptions.",
+        )
+        _send_copy_review(chat_id, request_id, drafts)
+        return {"status": "copy_review_requested", "request_id": request_id}
+
+    copy_edit = re.fullmatch(
+        r"rs:copy_edit_(caption|title|description):([A-Za-z0-9-]+):(\d+)",
+        callback_data,
+    )
+    if copy_edit:
+        field, request_id, index_text = copy_edit.groups()
+        index = int(index_text)
+        with _LOCK, _telegram_db() as db:
+            row = db.execute(
+                "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+            if not row:
+                return {"status": "not_found"}
+            state = json.loads(row["state_json"])
+            drafts = list(state.get("copy_drafts") or [])
+            if index >= len(drafts):
+                return {"status": "copy_draft_not_found"}
+            state["awaiting_copy_input"] = {
+                "field": field,
+                "index": index,
+                "user_id": user_id,
+            }
+            db.execute(
+                "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+                (json.dumps(state), now(), request_id),
+            )
+        send(
+            chat_id,
+            f"Send your replacement {field} as your next Telegram message. "
+            "It will replace this draft and become a learning example.",
+        )
+        return {"status": "awaiting_copy_input", "request_id": request_id, "field": field}
+
+    copy_finish = re.fullmatch(
+        r"rs:copy_finish:([A-Za-z0-9-]+)", callback_data
+    )
+    if copy_finish:
+        request_id = copy_finish.group(1)
+        with _LOCK, _telegram_db() as db:
+            row = db.execute(
+                "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+            if not row:
+                return {"status": "not_found"}
+            state = json.loads(row["state_json"])
+            if state.get("schedule_requested_at"):
+                return {"status": "already_scheduling", "request_id": request_id}
+            drafts = list(state.get("copy_drafts") or [])
+            if not drafts:
+                return {"status": "copy_drafts_missing", "request_id": request_id}
+            state.pop("awaiting_copy_input", None)
+            state["copy_review_completed_at"] = now()
             state["schedule_requested_at"] = now()
             db.execute(
                 "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? "
                 "WHERE request_id=?",
                 ("awaiting_render_completion", json.dumps(state), now(), request_id),
             )
+        _log_copy_learning(request_id, state, drafts, user_id)
         send(
             chat_id,
-            f"📅 Selection closed. Skipped {skipped_shorts} untouched Short(s) and "
-            f"{skipped_topics} untouched 16:9 highlight(s). Schedule Master will "
-            "receive all approved videos as soon as active renders finish.",
+            "✅ Copy approved. Schedule Master will receive the batch as soon as "
+            "every approved render finishes.",
         )
         _notify_render_queue_complete(request_id, chat_id)
         return {"status": "schedule_requested", "request_id": request_id}
