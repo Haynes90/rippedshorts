@@ -90,7 +90,7 @@ def _render_progress_text(request_id: str) -> str:
 
 
 def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
-    """Send one Telegram summary when the currently approved render queue drains."""
+    """Wait for every approved 9:16 and 16:9 render before scheduling."""
     summary = None
     with _LOCK, _telegram_db() as db:
         row = db.execute(
@@ -99,17 +99,29 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
         if not row:
             return
         state = json.loads(row["state_json"])
-        reviews = dict(state.get("candidate_reviews") or {})
+        short_reviews = dict(state.get("candidate_reviews") or {})
+        topic_reviews = dict(state.get("topic_reviews") or {})
+        tracked = {"queued", "rendering", "rendered", "render_failed"}
         statuses = {
-            str(index): str(review.get("status") or "")
-            for index, review in reviews.items()
-            if str(review.get("status") or "")
-            in {"queued", "rendering", "rendered", "render_failed"}
+            f"short:{index}": str(review.get("status") or "")
+            for index, review in short_reviews.items()
+            if str(review.get("status") or "") in tracked
         }
+        statuses.update(
+            {
+                f"highlight:{index}": str(review.get("status") or "")
+                for index, review in topic_reviews.items()
+                if str(review.get("status") or "") in tracked
+            }
+        )
         active = sum(status in {"queued", "rendering"} for status in statuses.values())
         rendered = sum(status == "rendered" for status in statuses.values())
         failed = sum(status == "render_failed" for status in statuses.values())
-        if active or not (rendered or failed):
+        # Schedule Now closes selection, but handoff is gated until every approved
+        # 9:16 Short and 16:9 highlight has left the queued/rendering states.
+        if active:
+            return
+        if not statuses and not state.get("schedule_requested_at"):
             return
         signature = json.dumps(statuses, sort_keys=True)
         if state.get("render_queue_completion_signature") == signature:
@@ -155,7 +167,7 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
 
 
 def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
-    """Send the final rendered 9:16 selection downstream exactly once."""
+    """Send all final rendered 9:16 and 16:9 selections downstream once."""
     target = (
         os.getenv("SCHEDULE_MASTER_INTERNAL_URL")
         or os.getenv("SCHEDULE_MASTER_URL")
