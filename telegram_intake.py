@@ -1466,30 +1466,84 @@ def _process(request_id: str) -> None:
                         RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
                     _send_short_confirmation(chat_id, request_id)
                     return
-                if rendered_clips:
-                    existing_links = [
-                        str(clip.get("_clip_url") or "")
-                        for clip in rendered_clips
-                        if clip.get("_clip_url")
-                    ]
-                    _save(
-                        request_id,
-                        "already_rendered",
-                        {
-                            **state,
-                            "stage": "already_rendered",
-                            "video_path": str(video),
-                            "source_reused": reused,
-                            "existing_clip_links": existing_links,
-                        },
+                if rendered_clips or reuse_existing:
+                    import main
+
+                    durable = main.list_existing_rendered_assets(
+                        video_id, _state_vid_title(state)
                     )
-                    links_text = "\n".join(existing_links[:20])
+                    sheet_by_number = {
+                        int(clip.get("candidate_number") or 0): clip
+                        for clip in rendered_clips
+                    }
+                    recovered_shorts = []
+                    short_reviews = {}
+                    for index, asset in enumerate(durable.get("clips") or []):
+                        number = int(asset["candidate_number"])
+                        learned = sheet_by_number.get(number, {})
+                        recovered_shorts.append(
+                            {
+                                **learned,
+                                "candidate_number": number,
+                                "clip_url": asset["clip_url"],
+                            }
+                        )
+                        short_reviews[str(index)] = {
+                            "status": "rendered",
+                            "clip_url": asset["clip_url"],
+                            "folder_id": asset.get("folder_id"),
+                            "recovered_from_drive": True,
+                        }
+
+                    recovered_highlights = []
+                    topic_reviews = {}
+                    for index, asset in enumerate(durable.get("highlights") or []):
+                        recovered_highlights.append(
+                            {
+                                "title": asset.get("title") or f"Highlight {index + 1}",
+                                "summary": "",
+                                "transcript": "",
+                                "duration": 0,
+                            }
+                        )
+                        topic_reviews[str(index)] = {
+                            "status": "rendered",
+                            "segment_url": asset["segment_url"],
+                            "folder_id": asset.get("folder_id"),
+                            "recovered_from_drive": True,
+                        }
+
+                    recovered_state = {
+                        **state,
+                        "stage": "already_rendered",
+                        "video_path": str(video),
+                        "source_reused": reused,
+                        "result": {
+                            "analysis": {
+                                "content_type": "",
+                                "main_theme": "",
+                                "key_ideas": [],
+                                "keywords": [],
+                            },
+                            "segments": recovered_shorts,
+                        },
+                        "candidate_reviews": short_reviews,
+                        "topic_result": {
+                            "segments": recovered_highlights,
+                            "selection": "recovered_from_drive",
+                        },
+                        "topic_reviews": topic_reviews,
+                        "topic_stage": (
+                            "already_rendered" if recovered_highlights else "not_found"
+                        ),
+                        "recovered_renders_from_drive": True,
+                    }
+                    _save(request_id, "already_rendered", recovered_state)
                     send(
                         chat_id,
-                        f"✅ YouTube ID {video_id} already has "
-                        f"{len(prior_shorts)} reviewed shorts in the sheet, so GPT "
-                        "selection was not run again."
-                        + (f"\n\n{links_text}" if links_text else ""),
+                        f"✅ Recovered {len(recovered_shorts)} rendered Short(s) and "
+                        f"{len(recovered_highlights)} rendered 16:9 highlight(s) from "
+                        "the existing Vid Title folder. GPT selection was not run again.",
                     )
                     _send_short_confirmation(chat_id, request_id)
                     return
