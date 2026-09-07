@@ -290,10 +290,15 @@ def _log_copy_learning(
 
 
 def _generate_schedule_copy(
-    assets: list[dict[str, Any]], show_id: str, source_title: str
+    assets: list[dict[str, Any]],
+    show_id: str,
+    source_title: str,
+    source_url: str = "",
 ) -> list[dict[str, Any]]:
-    """Create ready-to-schedule social copy while preserving a safe fallback."""
+    """Create ready-to-schedule social copy with mandatory source attribution."""
     brand = str(show_id or "TCB").strip().upper()
+    source_title = str(source_title or "").strip()
+    source_url = str(source_url or "").strip()
     if brand in {"TDOG", "THE_DOG"}:
         brand_rule = (
             "The Dirt on Gardening: identify the useful gardening idea, reference "
@@ -311,6 +316,26 @@ def _generate_schedule_copy(
             "reference the source show, host, or channel when supported. Never invent tags."
         )
 
+    if brand in {"TDOG", "THE_DOG"}:
+        brand_cta = "Follow The Dirt on Gardening for more practical gardening conversations."
+    elif brand.startswith("AGAPE"):
+        brand_cta = "Join Agape live online, and worship with us Sunday."
+    else:
+        brand_cta = "Follow The Chocolate Botanist for more conversations, insights, and highlights."
+
+    def complete_long_description(description: str) -> str:
+        """Keep the unique hook first and guarantee source credit on every long video."""
+        sections = [str(description or "").strip()]
+        credit_title = source_title or "the original conversation"
+        credit = f"🎬 Highlight from: {credit_title}"
+        if credit.lower() not in sections[0].lower():
+            sections.append(credit)
+        if source_url and source_url.lower() not in "\n".join(sections).lower():
+            sections.append(f"Watch the original: {source_url}")
+        if brand_cta.lower() not in "\n".join(sections).lower():
+            sections.append(brand_cta)
+        return "\n\n".join(section for section in sections if section).strip()[:5000]
+
     fallback = []
     for asset in assets:
         transcript = str(asset.get("transcript") or "").strip()
@@ -324,7 +349,7 @@ def _generate_schedule_copy(
                 **asset,
                 "social_caption": caption,
                 "video_title": title[:100],
-                "video_description": caption,
+                "video_description": complete_long_description(caption),
                 "hashtags": "",
                 "copy_source": "fallback",
             }
@@ -378,12 +403,16 @@ def _generate_schedule_copy(
         "For 9:16, write an engaging natural social caption with a hook, useful "
         "context, attribution when known, a light CTA, and a few relevant hashtags. "
         "For 16:9, write a compelling YouTube/Facebook title and a fuller description. "
-        "Do not fabricate names, handles, guests, facts, or links. Avoid clickbait that "
-        "the transcript does not earn.\n\n"
+        "Put a unique two- or three-sentence hook and summary first. Do not repeat the title. "
+        "The system will then append the mandatory source credit, original-video URL, and "
+        "brand CTA, so do not invent or duplicate those lines. Keep hashtags out of the "
+        "description because they are returned separately. Do not fabricate names, handles, "
+        "guests, facts, or links. Avoid clickbait that the transcript does not earn.\n\n"
         f"BRAND RULE:\n{brand_rule}\n\n"
         f"PAST AI-TO-FINAL EXAMPLES (imitate the final wording and SEO judgment, "
         f"not stale facts):\n{learning_examples or 'No examples yet.'}\n\n"
         f"SOURCE TITLE:\n{source_title}\n\n"
+        f"SOURCE URL:\n{source_url or 'Unavailable'}\n\n"
         f"ASSETS:\n{json.dumps(compact_assets, ensure_ascii=False)}"
     )
     try:
@@ -418,7 +447,9 @@ def _generate_schedule_copy(
                     **item,
                     "social_caption": str(copy.get("social_caption") or item["social_caption"]).strip(),
                     "video_title": str(copy.get("video_title") or item["video_title"]).strip()[:100],
-                    "video_description": str(copy.get("video_description") or item["video_description"]).strip(),
+                    "video_description": complete_long_description(
+                        str(copy.get("video_description") or item["video_description"]).strip()
+                    ),
                     "hashtags": str(copy.get("hashtags") or "").strip(),
                     "copy_source": "openai" if copy else item["copy_source"],
                 }
@@ -524,6 +555,7 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
             assets,
             str(state.get("show_id") or ""),
             _state_vid_title(state),
+            str((state.get("parsed") or {}).get("source_value") or ""),
         )
     payload = {
         "request_id": request_id,
@@ -2267,6 +2299,7 @@ def _accept_update(
             draft_inputs,
             str(state.get("show_id") or ""),
             _state_vid_title(state),
+            str((state.get("parsed") or {}).get("source_value") or ""),
         )
         for draft in drafts:
             draft["ai_social_caption"] = draft.get("social_caption", "")
