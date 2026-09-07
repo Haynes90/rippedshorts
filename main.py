@@ -858,6 +858,65 @@ def _drive_title_folder(vid_title: Optional[str]) -> str:
     return created["id"]
 
 
+def list_existing_rendered_assets(video_id: str, vid_title: str) -> dict:
+    """Recover durable rendered Shorts and highlights from the Vid Title folder."""
+    drive_service, _, _ = get_google_services()
+    folder_id = _drive_title_folder(vid_title)
+    safe_video_id = str(video_id or "").strip()
+    query = f"'{folder_id}' in parents and trashed = false and mimeType = 'video/mp4'"
+    files = []
+    page_token = None
+    while True:
+        response = drive_service.files().list(
+            q=query,
+            fields="nextPageToken,files(id,name,webViewLink,modifiedTime,size)",
+            pageSize=1000,
+            pageToken=page_token,
+            orderBy="modifiedTime desc",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        files.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    # Multiple renders can have the same predictable filename. Keep the newest.
+    newest_by_name = {}
+    for item in files:
+        name = str(item.get("name") or "")
+        if name not in newest_by_name:
+            newest_by_name[name] = item
+
+    clips, highlights = [], []
+    clip_pattern = re.compile(rf"^{re.escape(safe_video_id)}_Clip_(\d+)\.mp4$", re.I)
+    segment_pattern = re.compile(rf"^{re.escape(safe_video_id)}_Segment_(\d+)\.mp4$", re.I)
+    for name, item in newest_by_name.items():
+        url = item.get("webViewLink") or f"https://drive.google.com/file/d/{item['id']}/view"
+        clip_match = clip_pattern.fullmatch(name)
+        segment_match = segment_pattern.fullmatch(name)
+        if clip_match:
+            clips.append({
+                "candidate_number": int(clip_match.group(1)),
+                "clip_url": url,
+                "folder_id": folder_id,
+                "drive_file_id": item["id"],
+                "name": name,
+            })
+        elif segment_match:
+            highlights.append({
+                "segment_number": int(segment_match.group(1)),
+                "segment_url": url,
+                "folder_id": folder_id,
+                "drive_file_id": item["id"],
+                "name": name,
+                "title": f"Highlight {int(segment_match.group(1))}",
+            })
+    clips.sort(key=lambda item: item["candidate_number"])
+    highlights.sort(key=lambda item: item["segment_number"])
+    return {"clips": clips, "highlights": highlights, "folder_id": folder_id}
+
+
 def upload_clip_to_drive(
     clip_path: Path, clip_name: str, *, vid_title: Optional[str] = None
 ) -> dict:
