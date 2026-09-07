@@ -166,6 +166,129 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
             )
 
 
+def _copy_review_assets(state: dict[str, Any], request_id: str) -> list[dict[str, Any]]:
+    """Build metadata-only records for every approved render, including active ones."""
+    assets = []
+    reviews = dict(state.get("candidate_reviews") or {})
+    clips = (state.get("result") or {}).get("segments", [])
+    for index, clip in enumerate(clips):
+        status = str((reviews.get(str(index)) or {}).get("status") or "")
+        if status not in {"queued", "rendering", "rendered"}:
+            continue
+        number = int(clip.get("candidate_number") or index + 1)
+        assets.append({
+            "asset_id": f"{request_id}:short:{number}",
+            "asset_type": "9:16_SHORT",
+            "candidate_number": number,
+            "transcript": str(clip.get("transcript") or ""),
+            "title": "",
+        })
+    topic_reviews = dict(state.get("topic_reviews") or {})
+    topics = (state.get("topic_result") or {}).get("segments", [])
+    for index, segment in enumerate(topics):
+        status = str((topic_reviews.get(str(index)) or {}).get("status") or "")
+        if status not in {"queued", "rendering", "rendered"}:
+            continue
+        number = index + 1
+        assets.append({
+            "asset_id": f"{request_id}:highlight:{number}",
+            "asset_type": "16:9_HIGHLIGHT",
+            "candidate_number": number,
+            "transcript": str(segment.get("transcript") or ""),
+            "title": str(segment.get("title") or ""),
+        })
+    return assets
+
+
+def _send_copy_review(chat_id: str, request_id: str, drafts: list[dict[str, Any]]) -> None:
+    for index, draft in enumerate(drafts):
+        if draft["asset_type"] == "9:16_SHORT":
+            text = (
+                f"✍️ 9:16 Caption Draft {draft.get('candidate_number', index + 1)}\n\n"
+                f"{draft.get('social_caption', '')}\n\n{draft.get('hashtags', '')}"
+            )
+            buttons = [[{
+                "text": "✏️ Write My Caption",
+                "callback_data": f"rs:copy_edit_caption:{request_id}:{index}",
+            }]]
+        else:
+            text = (
+                f"📺 16:9 Metadata Draft {draft.get('candidate_number', index + 1)}\n\n"
+                f"TITLE\n{draft.get('video_title', '')}\n\n"
+                f"DESCRIPTION\n{draft.get('video_description', '')}\n\n"
+                f"SEO TAGS\n{draft.get('hashtags', '')}"
+            )
+            buttons = [[
+                {
+                    "text": "✏️ Edit Title",
+                    "callback_data": f"rs:copy_edit_title:{request_id}:{index}",
+                },
+                {
+                    "text": "✏️ Edit Description",
+                    "callback_data": f"rs:copy_edit_description:{request_id}:{index}",
+                },
+            ]]
+        telegram("sendMessage", {
+            "chat_id": chat_id,
+            "text": text[:4000],
+            "disable_web_page_preview": True,
+            "reply_markup": {"inline_keyboard": buttons},
+        })
+    telegram("sendMessage", {
+        "chat_id": chat_id,
+        "text": (
+            "Review the drafts above. Edit anything you want; unchanged drafts are "
+            "treated as approved. When finished, release the complete batch."
+        ),
+        "reply_markup": {"inline_keyboard": [[{
+            "text": "✅ Approve Copy & Schedule",
+            "callback_data": f"rs:copy_finish:{request_id}",
+        }]]},
+    })
+
+
+def _log_copy_learning(
+    request_id: str, state: dict[str, Any], drafts: list[dict[str, Any]], user_id: str
+) -> None:
+    """Persist AI-versus-final wording so later generations learn the user's style."""
+    try:
+        import main
+        _, _, sheets = main.get_google_services()
+        source_title = _state_vid_title(state)
+        brand_id = str(state.get("show_id") or "")
+        values = []
+        for draft in drafts:
+            edited = bool(draft.get("user_edited"))
+            values.append([
+                now(),
+                request_id,
+                str(draft.get("asset_id") or ""),
+                brand_id,
+                str(draft.get("asset_type") or ""),
+                source_title,
+                str(draft.get("transcript") or ""),
+                str(draft.get("ai_social_caption") or draft.get("social_caption") or ""),
+                str(draft.get("social_caption") or ""),
+                str(draft.get("ai_video_title") or draft.get("video_title") or ""),
+                str(draft.get("video_title") or ""),
+                str(draft.get("ai_video_description") or draft.get("video_description") or ""),
+                str(draft.get("video_description") or ""),
+                str(draft.get("hashtags") or ""),
+                "EDITED" if edited else "ACCEPTED",
+                user_id,
+            ])
+        if values:
+            sheets.spreadsheets().values().append(
+                spreadsheetId=RIPPED_LOG_SHEET_ID,
+                range="'Caption Learning'!A:P",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": values},
+            ).execute()
+    except Exception:
+        logger.exception("Could not record Caption Learning rows request_id=%s", request_id)
+
+
 def _generate_schedule_copy(
     assets: list[dict[str, Any]], show_id: str, source_title: str
 ) -> list[dict[str, Any]]:
