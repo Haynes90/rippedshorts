@@ -299,6 +299,43 @@ def _generate_schedule_copy(
     brand = str(show_id or "TCB").strip().upper()
     source_title = str(source_title or "").strip()
     source_url = str(source_url or "").strip()
+
+    guide_doc = (
+        os.getenv("SOCIAL_COPY_GUIDE_DOC_ID")
+        or "1UrndyfvrbZbYP2s7tqhBE5jV72oymboMyoSugnbV-Ug"
+    ).strip()
+    guide_text = ""
+    guide_rules: dict[str, str] = {}
+    try:
+        guide_text = read_google_doc_text(guide_doc).strip()
+        for line in guide_text.splitlines():
+            key, separator, value = line.partition(":")
+            normalized_key = key.strip().upper()
+            if separator and normalized_key in {
+                "ATTRIBUTION_FORMAT",
+                "SOURCE_LINK_LABEL",
+                "TCB_CTA",
+                "TDOG_CTA",
+                "AGAPE_CTA",
+            }:
+                guide_rules[normalized_key] = value.strip()
+    except Exception:
+        logger.exception("Could not load Social Copy & CTA Guide; using built-in defaults")
+
+    source_show = ""
+    if source_url and YOUTUBE_RE.search(source_url):
+        try:
+            oembed = requests.get(
+                "https://www.youtube.com/oembed",
+                params={"url": source_url, "format": "json"},
+                timeout=(5, 20),
+            )
+            oembed.raise_for_status()
+            source_show = str(oembed.json().get("author_name") or "").strip()
+        except Exception:
+            logger.warning("Could not resolve source YouTube channel for copy attribution")
+    source_show = source_show or "the source channel"
+
     if brand in {"TDOG", "THE_DOG"}:
         brand_rule = (
             "The Dirt on Gardening: identify the useful gardening idea, reference "
@@ -317,21 +354,41 @@ def _generate_schedule_copy(
         )
 
     if brand in {"TDOG", "THE_DOG"}:
-        brand_cta = "Follow The Dirt on Gardening for more practical gardening conversations."
+        brand_cta = guide_rules.get(
+            "TDOG_CTA",
+            "Dig into more practical gardening conversations with The Dirt on Gardening. "
+            "Subscribe and join us for the next episode.",
+        )
     elif brand.startswith("AGAPE"):
-        brand_cta = "Join Agape live online, and worship with us Sunday."
+        brand_cta = guide_rules.get(
+            "AGAPE_CTA",
+            "Need encouragement for the week? Join Agape live online and worship with us Sunday.",
+        )
     else:
-        brand_cta = "Follow The Chocolate Botanist for more conversations, insights, and highlights."
+        brand_cta = guide_rules.get(
+            "TCB_CTA",
+            "Follow The Chocolate Botanist for more plant science, bold conversations, "
+            "and highlights from across the growing world.",
+        )
+
+    attribution_format = guide_rules.get(
+        "ATTRIBUTION_FORMAT",
+        "🎬 Highlight from {source_show}'s video “{video_title}”",
+    )
+    source_link_label = guide_rules.get("SOURCE_LINK_LABEL", "Watch the original")
 
     def complete_long_description(description: str) -> str:
         """Keep the unique hook first and guarantee source credit on every long video."""
         sections = [str(description or "").strip()]
-        credit_title = source_title or "the original conversation"
-        credit = f"🎬 Highlight from: {credit_title}"
+        credit = (
+            attribution_format
+            .replace("{source_show}", source_show)
+            .replace("{video_title}", source_title or "Untitled video")
+        )
         if credit.lower() not in sections[0].lower():
             sections.append(credit)
         if source_url and source_url.lower() not in "\n".join(sections).lower():
-            sections.append(f"Watch the original: {source_url}")
+            sections.append(f"{source_link_label}: {source_url}")
         if brand_cta.lower() not in "\n".join(sections).lower():
             sections.append(brand_cta)
         return "\n\n".join(section for section in sections if section).strip()[:5000]
@@ -409,6 +466,7 @@ def _generate_schedule_copy(
         "description because they are returned separately. Do not fabricate names, handles, "
         "guests, facts, or links. Avoid clickbait that the transcript does not earn.\n\n"
         f"BRAND RULE:\n{brand_rule}\n\n"
+        f"NORMALIZED SOCIAL COPY GUIDE:\n{guide_text or 'Built-in defaults apply.'}\n\n"
         f"PAST AI-TO-FINAL EXAMPLES (imitate the final wording and SEO judgment, "
         f"not stale facts):\n{learning_examples or 'No examples yet.'}\n\n"
         f"SOURCE TITLE:\n{source_title}\n\n"
