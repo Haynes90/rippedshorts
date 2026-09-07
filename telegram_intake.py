@@ -113,7 +113,7 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
             return
         signature = json.dumps(statuses, sort_keys=True)
         if state.get("render_queue_completion_signature") == signature:
-            if state.get("short_selection_completed_at"):
+            if state.get("schedule_requested_at"):
                 RENDER_EXECUTOR.submit(
                     _handoff_shorts_to_schedule_master, request_id, chat_id
                 )
@@ -148,7 +148,7 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
                 (request_id,),
             ).fetchone()
         latest_state = json.loads(latest["state_json"]) if latest else {}
-        if latest_state.get("short_selection_completed_at"):
+        if latest_state.get("schedule_requested_at"):
             RENDER_EXECUTOR.submit(
                 _handoff_shorts_to_schedule_master, request_id, chat_id
             )
@@ -204,8 +204,27 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
                     ),
                 }
             )
+        topic_reviews = dict(state.get("topic_reviews") or {})
+        topics = (state.get("topic_result") or {}).get("segments", [])
+        for index, segment in enumerate(topics):
+            review = topic_reviews.get(str(index)) or {}
+            if review.get("status") != "rendered" or not review.get("segment_url"):
+                continue
+            number = index + 1
+            assets.append(
+                {
+                    "asset_id": f"{request_id}:highlight:{number}",
+                    "candidate_number": number,
+                    "asset_type": "16:9_HIGHLIGHT",
+                    "drive_url": review["segment_url"],
+                    "transcript": str(segment.get("transcript") or ""),
+                    "duration_seconds": float(segment.get("duration") or 0),
+                    "title": str(segment.get("title") or ""),
+                    "summary": str(segment.get("summary") or ""),
+                }
+            )
         if not assets:
-            send(chat_id, "No rendered Shorts were selected for Schedule Master.")
+            send(chat_id, "No rendered videos were selected for Schedule Master.")
             return
         schedule["shorts_status"] = "sending"
         schedule["shorts_started_at"] = now()
@@ -908,12 +927,23 @@ def _send_short_confirmation(chat_id: str, request_id: str) -> None:
                 "tap the button below. " + continue_text
             ),
             "reply_markup": {
-                "inline_keyboard": [[
-                    {
-                        "text": "✅ These Shorts Been Ripped — Continue",
-                        "callback_data": f"rs:shorts_confirm:{request_id}",
-                    }
-                ]]
+                "inline_keyboard": (
+                    [
+                        [{
+                            "text": "✅ Continue to 16:9 Highlights",
+                            "callback_data": f"rs:shorts_confirm:{request_id}",
+                        }],
+                        [{
+                            "text": "📅 No More Videos — Schedule Now",
+                            "callback_data": f"rs:schedule_now:{request_id}",
+                        }],
+                    ]
+                    if row["mode"] == "both"
+                    else [[{
+                        "text": "📅 No More Shorts — Schedule Now",
+                        "callback_data": f"rs:schedule_now:{request_id}",
+                    }]]
+                )
             },
         },
     )
@@ -1150,6 +1180,22 @@ def _send_topic_candidates(
                 },
             },
         )
+    telegram(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": (
+                "When you have approved every 16:9 highlight you want, tap "
+                "Schedule Now. Untouched highlights will be skipped."
+            ),
+            "reply_markup": {
+                "inline_keyboard": [[{
+                    "text": "📅 No More 16:9s — Schedule Now",
+                    "callback_data": f"rs:schedule_now:{request_id}",
+                }]]
+            },
+        },
+    )
 
 
 def _process_topics(
@@ -1753,6 +1799,72 @@ def _accept_update(
         background_tasks.add_task(_process, request_id)
         return {"status": choice, "request_id": request_id}
 
+    schedule_now = re.fullmatch(
+        r"rs:schedule_now:([A-Za-z0-9-]+)", callback_data
+    )
+    if schedule_now:
+        request_id = schedule_now.group(1)
+        with _LOCK, _telegram_db() as db:
+            row = db.execute(
+                "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+            if not row:
+                return {"status": "not_found"}
+            state = json.loads(row["state_json"])
+            if state.get("schedule_requested_at"):
+                return {"status": "already_scheduling", "request_id": request_id}
+
+            clips = (state.get("result") or {}).get("segments", [])
+            short_reviews = dict(state.get("candidate_reviews") or {})
+            decided = {
+                "queued", "rendering", "rendered", "render_failed", "reject", "rejected"
+            }
+            skipped_shorts = 0
+            for index in range(len(clips)):
+                if str((short_reviews.get(str(index)) or {}).get("status") or "") not in decided:
+                    short_reviews[str(index)] = {
+                        "status": "rejected",
+                        "reviewed_at": now(),
+                        "user_id": user_id,
+                        "selection_complete_skip": True,
+                    }
+                    skipped_shorts += 1
+            state["candidate_reviews"] = short_reviews
+            state["shorts_confirmed_at"] = state.get("shorts_confirmed_at") or now()
+            state["short_selection_completed_at"] = (
+                state.get("short_selection_completed_at") or now()
+            )
+
+            topics = (state.get("topic_result") or {}).get("segments", [])
+            topic_reviews = dict(state.get("topic_reviews") or {})
+            skipped_topics = 0
+            for index in range(len(topics)):
+                if str((topic_reviews.get(str(index)) or {}).get("status") or "") not in decided:
+                    topic_reviews[str(index)] = {
+                        "status": "rejected",
+                        "reviewed_at": now(),
+                        "user_id": user_id,
+                        "selection_complete_skip": True,
+                    }
+                    skipped_topics += 1
+            state["topic_reviews"] = topic_reviews
+            state["topic_selection_completed_at"] = now()
+            state["topic_stage"] = "selection_complete"
+            state["schedule_requested_at"] = now()
+            db.execute(
+                "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? "
+                "WHERE request_id=?",
+                ("awaiting_render_completion", json.dumps(state), now(), request_id),
+            )
+        send(
+            chat_id,
+            f"📅 Selection closed. Skipped {skipped_shorts} untouched Short(s) and "
+            f"{skipped_topics} untouched 16:9 highlight(s). Schedule Master will "
+            "receive all approved videos as soon as active renders finish.",
+        )
+        _notify_render_queue_complete(request_id, chat_id)
+        return {"status": "schedule_requested", "request_id": request_id}
+
     shorts_confirm = re.fullmatch(
         r"rs:shorts_confirm:([A-Za-z0-9-]+)", callback_data
     )
@@ -1791,6 +1903,8 @@ def _accept_update(
             state["short_selection_completed_at"] = now()
             if start_highlights:
                 state["topic_stage"] = "queued"
+            else:
+                state["schedule_requested_at"] = now()
             db.execute(
                 "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? "
                 "WHERE request_id=?",
@@ -2119,6 +2233,7 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
             f"✅ 16:9 Segment {index + 1} rendered and uploaded to the Vid Title folder ({vid_title}):\n"
             f"{rendered.get('segment_url', '')}",
         )
+        _notify_render_queue_complete(request_id, chat_id)
     except Exception as exc:
         logger.exception(
             "16:9 render failed request_id=%s segment=%s", request_id, index + 1
@@ -2147,6 +2262,7 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
             chat_id,
             f"❌ 16:9 Segment {index + 1} render failed:\n{str(exc)[:1500]}",
         )
+        _notify_render_queue_complete(request_id, chat_id)
 
 
 def _render_approved(request_id: str, index: int, chat_id: str) -> None:
