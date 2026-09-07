@@ -178,6 +178,37 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn('"shorts_status": "accepted"', SOURCE)
         self.assertIn("Schedule Master received", SOURCE)
 
+    def test_schedule_now_waits_for_both_render_lanes(self):
+        self.assertIn("rs:schedule_now:", SOURCE)
+        self.assertIn('"schedule_requested_at"', SOURCE)
+        notify_source = ast.get_source_segment(
+            SOURCE,
+            next(
+                node
+                for node in TREE.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "_notify_render_queue_complete"
+            ),
+        )
+        self.assertIn('state.get("candidate_reviews")', notify_source)
+        self.assertIn('state.get("topic_reviews")', notify_source)
+        self.assertIn('status in {"queued", "rendering"}', notify_source)
+        self.assertIn("if active:", notify_source)
+
+    def test_schedule_handoff_includes_short_and_highlight_assets(self):
+        handoff_source = ast.get_source_segment(
+            SOURCE,
+            next(
+                node
+                for node in TREE.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "_handoff_shorts_to_schedule_master"
+            ),
+        )
+        self.assertIn('"asset_type": "9:16_SHORT"', handoff_source)
+        self.assertIn('"asset_type": "16:9_HIGHLIGHT"', handoff_source)
+        self.assertIn('review.get("segment_url")', handoff_source)
+
     def test_existing_clipmaster_chat_is_reused(self):
         self.assertIn('os.getenv("TELEGRAM_CHAT_ID"', SOURCE)
 
