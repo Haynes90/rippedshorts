@@ -342,6 +342,35 @@ def _generate_schedule_copy(
         }
         for asset in assets
     ]
+    learning_examples = ""
+    try:
+        rows = get_rows(RIPPED_LOG_SHEET_ID, "Caption Learning", "A1:P2000")
+        matching = [
+            row
+            for row in rows
+            if str(row.get("brand_id") or "").strip().upper() == brand
+            and str(row.get("decision") or "").strip().upper()
+            in {"ACCEPTED", "EDITED"}
+        ][-25:]
+        learning_examples = "\n".join(
+            "- "
+            + json.dumps(
+                {
+                    "asset_type": row.get("asset_type", ""),
+                    "ai_caption": row.get("ai_caption", ""),
+                    "final_caption": row.get("final_caption", ""),
+                    "ai_title": row.get("ai_title", ""),
+                    "final_title": row.get("final_title", ""),
+                    "ai_description": row.get("ai_description", ""),
+                    "final_description": row.get("final_description", ""),
+                },
+                ensure_ascii=False,
+            )
+            for row in matching
+        )[:20000]
+    except Exception:
+        logger.exception("Could not load Caption Learning examples")
+
     prompt = (
         "Create publication-ready metadata for each supplied video asset. "
         "Return JSON with an assets array; every item must contain asset_id, "
@@ -352,6 +381,8 @@ def _generate_schedule_copy(
         "Do not fabricate names, handles, guests, facts, or links. Avoid clickbait that "
         "the transcript does not earn.\n\n"
         f"BRAND RULE:\n{brand_rule}\n\n"
+        f"PAST AI-TO-FINAL EXAMPLES (imitate the final wording and SEO judgment, "
+        f"not stale facts):\n{learning_examples or 'No examples yet.'}\n\n"
         f"SOURCE TITLE:\n{source_title}\n\n"
         f"ASSETS:\n{json.dumps(compact_assets, ensure_ascii=False)}"
     )
