@@ -315,7 +315,20 @@ def _generate_schedule_copy(
                 "ATTRIBUTION_FORMAT",
                 "SOURCE_LINK_LABEL",
                 "TCB_CTA",
+                "TCB_ABOUT",
+                "TCB_LINK",
+                "TCB_HASHTAGS",
                 "TDOG_CTA",
+                "TDOG_ABOUT",
+                "TDOG_HOST_ANDRE",
+                "TDOG_HOST_GRAY",
+                "TDOG_HOST_TCB",
+                "TDOG_SPONSOR_RETAIN",
+                "TDOG_SPONSOR_SONIAS",
+                "TDOG_SPONSOR_ANDRES",
+                "TDOG_TELEGRAM",
+                "TDOG_EMAIL",
+                "TDOG_HASHTAGS",
                 "AGAPE_CTA",
                 "AGAPE_LEADERSHIP",
                 "AGAPE_ABOUT",
@@ -361,11 +374,42 @@ def _generate_schedule_copy(
         )
 
     if brand in {"TDOG", "THE_DOG"}:
-        brand_cta = guide_rules.get(
-            "TDOG_CTA",
-            "Dig into more practical gardening conversations with The Dirt on Gardening. "
-            "Subscribe and join us for the next episode.",
-        )
+        tdog_parts = [
+            guide_rules.get(
+                "TDOG_CTA",
+                "Dig into more practical gardening conversations with The Dirt on Gardening. "
+                "Subscribe and join us for the next episode.",
+            ),
+            guide_rules.get(
+                "TDOG_ABOUT",
+                "The Dirt on Gardening brings together practical experience, plant knowledge, "
+                "honest conversation, and useful ideas for gardeners at every stage.",
+            ),
+        ]
+        hosts = [
+            guide_rules.get("TDOG_HOST_ANDRE", ""),
+            guide_rules.get("TDOG_HOST_GRAY", ""),
+            guide_rules.get("TDOG_HOST_TCB", ""),
+        ]
+        if any(hosts):
+            tdog_parts.append("🎙️ Our Hosts\n" + "\n".join(item for item in hosts if item))
+        sponsors = [
+            guide_rules.get("TDOG_SPONSOR_RETAIN", ""),
+            guide_rules.get("TDOG_SPONSOR_SONIAS", ""),
+            guide_rules.get("TDOG_SPONSOR_ANDRES", ""),
+        ]
+        if any(sponsors):
+            tdog_parts.append("🤝 Sponsors\n" + "\n".join(item for item in sponsors if item))
+        telegram_url = guide_rules.get("TDOG_TELEGRAM", "")
+        if telegram_url:
+            tdog_parts.append(f"💬 Join our Telegram: {telegram_url}")
+        email = guide_rules.get("TDOG_EMAIL", "")
+        if email:
+            tdog_parts.append(f"📧 Email us: {email}")
+        tdog_hashtags = guide_rules.get("TDOG_HASHTAGS", "")
+        if tdog_hashtags:
+            tdog_parts.append(tdog_hashtags)
+        brand_cta = "\n\n".join(part for part in tdog_parts if part)
     elif brand.startswith("AGAPE"):
         agape_parts = [
             guide_rules.get(
@@ -408,11 +452,27 @@ def _generate_schedule_copy(
             agape_parts.append(hashtags)
         brand_cta = "\n\n".join(part for part in agape_parts if part)
     else:
-        brand_cta = guide_rules.get(
-            "TCB_CTA",
-            "Follow The Chocolate Botanist for more plant science, bold conversations, "
-            "and highlights from across the growing world.",
+        tcb_parts = [
+            guide_rules.get(
+                "TCB_CTA",
+                "Follow The Chocolate Botanist for plant science, gardening insight, bold "
+                "conversations, and highlights from shows and livestreams across the growing world.",
+            ),
+            guide_rules.get(
+                "TCB_ABOUT",
+                "The Chocolate Botanist makes plant science approachable, useful, and "
+                "entertaining—connecting the science behind plants with the way we grow, eat, and live.",
+            ),
+        ]
+        tcb_link = guide_rules.get(
+            "TCB_LINK", "https://bio.site/thechocolatebotanist"
         )
+        if tcb_link:
+            tcb_parts.append(f"Connect with The Chocolate Botanist: {tcb_link}")
+        tcb_hashtags = guide_rules.get("TCB_HASHTAGS", "")
+        if tcb_hashtags:
+            tcb_parts.append(tcb_hashtags)
+        brand_cta = "\n\n".join(part for part in tcb_parts if part)
 
     attribution_format = guide_rules.get(
         "ATTRIBUTION_FORMAT",
