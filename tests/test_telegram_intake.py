@@ -222,6 +222,19 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn('"video_description"', SOURCE)
         self.assertIn("BRAND RULE", SOURCE)
 
+    def test_schedule_now_requires_copy_review(self):
+        self.assertIn('"copy_review_requested_at"', SOURCE)
+        self.assertIn("rs:copy_edit_caption:", SOURCE)
+        self.assertIn("rs:copy_edit_title:", SOURCE)
+        self.assertIn("rs:copy_edit_description:", SOURCE)
+        self.assertIn("rs:copy_finish:", SOURCE)
+
+    def test_copy_edits_are_saved_as_learning_examples(self):
+        self.assertIn("Caption Learning", SOURCE)
+        self.assertIn('"EDITED" if edited else "ACCEPTED"', SOURCE)
+        self.assertIn('"user_edited"] = True', SOURCE)
+        self.assertIn("PAST AI-TO-FINAL EXAMPLES", SOURCE)
+
     def test_existing_clipmaster_chat_is_reused(self):
         self.assertIn('os.getenv("TELEGRAM_CHAT_ID"', SOURCE)
 
