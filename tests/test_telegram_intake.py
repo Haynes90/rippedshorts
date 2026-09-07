@@ -209,6 +209,19 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn('"asset_type": "16:9_HIGHLIGHT"', handoff_source)
         self.assertIn('review.get("segment_url")', handoff_source)
 
+    def test_use_existing_rebuilds_assets_from_drive(self):
+        self.assertIn("list_existing_rendered_assets", SOURCE)
+        self.assertIn('"recovered_renders_from_drive": True', SOURCE)
+        self.assertIn('"status": "rendered"', SOURCE)
+        self.assertIn('"segment_url": asset["segment_url"]', SOURCE)
+
+    def test_schedule_handoff_generates_copy(self):
+        self.assertIn("def _generate_schedule_copy", SOURCE)
+        self.assertIn('"social_caption"', SOURCE)
+        self.assertIn('"video_title"', SOURCE)
+        self.assertIn('"video_description"', SOURCE)
+        self.assertIn("BRAND RULE", SOURCE)
+
     def test_existing_clipmaster_chat_is_reused(self):
         self.assertIn('os.getenv("TELEGRAM_CHAT_ID"', SOURCE)
 
