@@ -1395,7 +1395,15 @@ def job_status(job_id: str):
 from audio_master_handoff import router as audio_master_handoff_router
 app.include_router(audio_master_handoff_router)
 
-from telegram_intake import router as telegram_intake_router
+from telegram_intake import (
+    configure_ripped_telegram_webhook,
+    router as telegram_intake_router,
+)
 from schedule_route_gate import install_route_gate
 install_route_gate()
 app.include_router(telegram_intake_router)
+
+
+@app.on_event("startup")
+def register_ripped_shorts_telegram_webhook():
+    configure_ripped_telegram_webhook()
