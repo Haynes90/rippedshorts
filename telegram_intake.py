@@ -3439,7 +3439,13 @@ def configure_ripped_telegram_webhook() -> None:
         domain = "https://" + domain
     payload: dict[str, Any] = {
         "url": domain + "/api/ripped-shorts/telegram/webhook",
-        "allowed_updates": ["message", "edited_message", "callback_query"],
+        "allowed_updates": [
+            "message",
+            "edited_message",
+            "channel_post",
+            "edited_channel_post",
+            "callback_query",
+        ],
         "drop_pending_updates": False,
     }
     secret = _ripped_webhook_secret()
