@@ -501,7 +501,6 @@ def _generate_schedule_copy(
     source_link_label = guide_rules.get("SOURCE_LINK_LABEL", "Watch the original")
     source_channel_label = guide_rules.get(
         "SOURCE_CHANNEL_LABEL", "Explore more from {source_show}"
-   
     )
 
     def complete_long_description(
