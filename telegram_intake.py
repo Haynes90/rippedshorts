@@ -3285,6 +3285,24 @@ async def internal_intake(
     if status == "ignored":
         raise HTTPException(status_code=422, detail="Telegram update is missing chat or user identity")
     if status == "unauthorized":
+        callback = update.get("callback_query") or {}
+        message = (
+            callback.get("message")
+            or update.get("message")
+            or update.get("edited_message")
+            or {}
+        )
+        rejected_chat_id = str((message.get("chat") or {}).get("id", ""))
+        rejected_user_id = str(
+            (callback.get("from") or message.get("from") or {}).get("id", "")
+        )
+        logger.warning(
+            "Ripped Telegram authorization rejected chat_id=%s user_id=%s; "
+            "set Telegram_Group_Chat_ID to this chat_id or add the user_id to "
+            "TELEGRAM_ALLOWED_USER_IDS",
+            rejected_chat_id,
+            rejected_user_id,
+        )
         raise HTTPException(status_code=403, detail="Telegram chat or user is not authorized")
     if status in {"accepted", "retry_accepted"}:
         response.status_code = 202
