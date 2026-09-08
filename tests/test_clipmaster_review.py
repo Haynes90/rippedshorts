@@ -35,6 +35,22 @@ def test_telegram_routes_clipmaster_before_ripped_shorts():
     assert local_index < forward_index
 
 
+def test_pending_ripped_copy_input_wins_over_clipmaster_quick_text():
+    gateway = next(
+        node
+        for node in TELEGRAM_TREE.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "telegram_gateway"
+    )
+    source = ast.get_source_segment(TELEGRAM_SOURCE, gateway)
+    pending_index = source.index("/api/ripped-shorts/pending-copy-input")
+    quick_claim_index = source.rindex("clipmaster_claims_update")
+    assert pending_index < quick_claim_index
+    assert 'callback_data.startswith("cm:")' in source
+    assert '"pending": True' in TELEGRAM_SOURCE
+    assert '"awaiting_copy_input"' in TELEGRAM_SOURCE
+
+
 def test_every_review_has_simple_controls():
     for label in ("✅ Approve All", "✏️ Change / Add", "✅ Keep", "❌ Remove"):
         assert label in REVIEW_SOURCE
