@@ -3298,8 +3298,10 @@ def _ripped_webhook_secret() -> str:
         "TELEGRAM_WEBHOOK_SECRET",
     ):
         value = os.getenv(name, "").strip()
-        if value:
+        if value and re.fullmatch(r"[A-Za-z0-9_-]{1,256}", value):
             return value
+        if value:
+            logger.warning("%s contains characters Telegram does not allow; webhook will be registered without a secret header", name)
     return ""
 
 
@@ -3330,14 +3332,24 @@ async def ripped_telegram_webhook(
     return result
 
 
-@router.on_event("startup")
 def configure_ripped_telegram_webhook() -> None:
-    """Point only the Ripped Shorts bot at this Railway service after deployment."""
-    service_name = os.getenv("RAILWAY_SERVICE_NAME", "").strip().lower()
-    service_role = os.getenv("SERVICE_ROLE", "").strip().lower()
-    if "ripped" not in service_name and service_role not in {"ripped_shorts", "ripped-shorts"}:
+    """Point the dedicated Ripped Shorts bot at this Railway service."""
+    token = next(
+        (
+            os.getenv(name, "").strip()
+            for name in (
+                "RIPPED_SHORTS_TELEGRAM_BOT_TOKEN",
+                "TELEGRAM_RIPPED_BOT_TOKEN",
+                "Telegram_ripped_bot_token",
+            )
+            if os.getenv(name, "").strip()
+        ),
+        "",
+    )
+    # The generic Clip Master token must never be used to claim this webhook.
+    if not token:
+        logger.warning("Ripped Telegram webhook skipped: dedicated Ripped bot token missing")
         return
-    token = _ripped_bot_token()
     domain = (
         os.getenv("RIPPED_SHORTS_PUBLIC_URL")
         or os.getenv("RAILWAY_PUBLIC_DOMAIN")
