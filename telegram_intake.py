@@ -915,19 +915,34 @@ def _state_vid_title(state: dict[str, Any]) -> str:
 
 def _authorized(chat_id: str, user_id: str) -> bool:
     chats, users = _csv_env("TELEGRAM_ALLOWED_CHAT_IDS"), _csv_env("TELEGRAM_ALLOWED_USER_IDS")
-    existing_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    if existing_chat:
-        chats.add(existing_chat)
+    for name in ("TELEGRAM_CHAT_ID", "TELEGRAM_GROUP_CHAT_ID", "Telegram_Group_Chat_ID"):
+        existing_chat = os.getenv(name, "").strip()
+        if existing_chat:
+            chats.add(existing_chat)
     # Fail closed: at least one allow-list must be configured.
     if not chats and not users:
         return False
     return (bool(chats) and chat_id in chats) or (bool(users) and user_id in users)
 
 
+def _ripped_bot_token() -> str:
+    """Use the dedicated Ripped Shorts bot while preserving Railway's current names."""
+    for name in (
+        "RIPPED_SHORTS_TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_RIPPED_BOT_TOKEN",
+        "Telegram_ripped_bot_token",
+        "TELEGRAM_BOT_TOKEN",
+    ):
+        token = os.getenv(name, "").strip()
+        if token:
+            return token
+    return ""
+
+
 def telegram(method: str, payload: dict[str, Any]) -> dict:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    token = _ripped_bot_token()
     if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+        raise RuntimeError("Telegram_ripped_bot_token is not configured")
     response = requests.post(f"https://api.telegram.org/bot{token}/{method}", json=payload, timeout=(10, 60))
     if response.status_code != 200:
         raise RuntimeError(f"Telegram {method} failed ({response.status_code}): {response.text[:1000]}")
@@ -2546,10 +2561,20 @@ def _accept_update(
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(state), now(), request_id),
             )
-        send(
-            chat_id,
-            f"Send your replacement {field} as your next Telegram message. "
-            "It will replace this draft and become a learning example.",
+        telegram(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": (
+                    f"Reply to this message with your replacement {field}. "
+                    "It will replace this draft and become a learning example."
+                ),
+                "reply_markup": {
+                    "force_reply": True,
+                    "selective": True,
+                    "input_field_placeholder": f"Write replacement {field}",
+                },
+            },
         )
         return {"status": "awaiting_copy_input", "request_id": request_id, "field": field}
 
@@ -3264,3 +3289,80 @@ async def internal_intake(
     if status in {"accepted", "retry_accepted"}:
         response.status_code = 202
     return result
+
+
+def _ripped_webhook_secret() -> str:
+    for name in (
+        "RIPPED_SHORTS_TELEGRAM_WEBHOOK_SECRET",
+        "TELEGRAM_RIPPED_WEBHOOK_SECRET",
+        "TELEGRAM_WEBHOOK_SECRET",
+    ):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+@router.post("/api/ripped-shorts/telegram/webhook")
+async def ripped_telegram_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    response: Response,
+    x_telegram_bot_api_secret_token: str | None = Header(None),
+):
+    """Receive updates directly from the dedicated Ripped Shorts Telegram bot."""
+    expected = _ripped_webhook_secret()
+    if expected and x_telegram_bot_api_secret_token != expected:
+        raise HTTPException(status_code=401, detail="Invalid Telegram webhook secret")
+    update = await request.json()
+    result = _accept_update(update, background_tasks, trusted_source=False)
+    status = str(result.get("status") or "unknown")
+    logger.info(
+        "Ripped Shorts Telegram webhook update_id=%s status=%s request_id=%s",
+        update.get("update_id", ""),
+        status,
+        result.get("request_id", ""),
+    )
+    if status == "unauthorized":
+        raise HTTPException(status_code=403, detail="Telegram chat or user is not authorized")
+    if status in {"accepted", "retry_accepted"}:
+        response.status_code = 202
+    return result
+
+
+@router.on_event("startup")
+def configure_ripped_telegram_webhook() -> None:
+    """Point only the Ripped Shorts bot at this Railway service after deployment."""
+    service_name = os.getenv("RAILWAY_SERVICE_NAME", "").strip().lower()
+    service_role = os.getenv("SERVICE_ROLE", "").strip().lower()
+    if "ripped" not in service_name and service_role not in {"ripped_shorts", "ripped-shorts"}:
+        return
+    token = _ripped_bot_token()
+    domain = (
+        os.getenv("RIPPED_SHORTS_PUBLIC_URL")
+        or os.getenv("RAILWAY_PUBLIC_DOMAIN")
+        or ""
+    ).strip().rstrip("/")
+    if not token or not domain:
+        logger.warning("Ripped Telegram webhook not configured: bot token or public domain missing")
+        return
+    if not domain.startswith(("http://", "https://")):
+        domain = "https://" + domain
+    payload: dict[str, Any] = {
+        "url": domain + "/api/ripped-shorts/telegram/webhook",
+        "allowed_updates": ["message", "edited_message", "callback_query"],
+        "drop_pending_updates": False,
+    }
+    secret = _ripped_webhook_secret()
+    if secret:
+        payload["secret_token"] = secret
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/setWebhook",
+            json=payload,
+            timeout=(10, 30),
+        )
+        response.raise_for_status()
+        logger.info("Ripped Shorts Telegram webhook configured for %s", payload["url"])
+    except Exception:
+        logger.exception("Could not configure Ripped Shorts Telegram webhook")
