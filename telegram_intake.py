@@ -3344,6 +3344,35 @@ async def ripped_telegram_webhook(
         result.get("request_id", ""),
     )
     if status == "unauthorized":
+        callback = update.get("callback_query") or {}
+        message = (
+            callback.get("message")
+            or update.get("message")
+            or update.get("edited_message")
+            or {}
+        )
+        rejected_chat_id = str((message.get("chat") or {}).get("id", ""))
+        rejected_user_id = str(
+            (callback.get("from") or message.get("from") or {}).get("id", "")
+        )
+        configured_chats = sorted(
+            {
+                value
+                for name in (
+                    "TELEGRAM_CHAT_ID",
+                    "TELEGRAM_GROUP_CHAT_ID",
+                    "Telegram_Group_Chat_ID",
+                )
+                if (value := os.getenv(name, "").strip())
+            }
+        )
+        logger.warning(
+            "Ripped Telegram authorization rejected chat_id=%s user_id=%s "
+            "configured_chat_ids=%s",
+            rejected_chat_id,
+            rejected_user_id,
+            configured_chats,
+        )
         raise HTTPException(status_code=403, detail="Telegram chat or user is not authorized")
     if status in {"accepted", "retry_accepted"}:
         response.status_code = 202
