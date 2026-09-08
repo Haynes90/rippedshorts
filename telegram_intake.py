@@ -2328,6 +2328,29 @@ def _boundary_learning_prompt(limit: int = 50) -> str:
         return ""
 
 
+def _telegram_message_text(message: dict[str, Any]) -> str:
+    """Return visible text plus URLs Telegram stores only in message entities."""
+    text = str(message.get("text") or message.get("caption") or "").strip()
+    links: list[str] = []
+    entity_sets = (
+        (message.get("entities") or [], str(message.get("text") or "")),
+        (message.get("caption_entities") or [], str(message.get("caption") or "")),
+    )
+    for entities, source in entity_sets:
+        for entity in entities:
+            entity_type = str(entity.get("type") or "")
+            if entity_type == "text_link" and entity.get("url"):
+                links.append(str(entity["url"]))
+            elif entity_type == "url":
+                try:
+                    offset = int(entity.get("offset", 0))
+                    length = int(entity.get("length", 0))
+                    links.append(source[offset : offset + length])
+                except (TypeError, ValueError):
+                    continue
+    return " ".join(part for part in [text, *links] if part).strip()
+
+
 def _accept_update(
     update: dict,
     background_tasks: BackgroundTasks,
@@ -2335,11 +2358,18 @@ def _accept_update(
     trusted_source: bool = False,
 ) -> dict:
     callback = update.get("callback_query") or {}
-    message = callback.get("message") or update.get("message") or update.get("edited_message") or {}
+    message = (
+        callback.get("message")
+        or update.get("message")
+        or update.get("edited_message")
+        or update.get("channel_post")
+        or update.get("edited_channel_post")
+        or {}
+    )
     chat_id = str((message.get("chat") or {}).get("id", ""))
     user_id = str((callback.get("from") or message.get("from") or {}).get("id", ""))
     callback_data = str(callback.get("data") or "")
-    text = str(message.get("text") or message.get("caption") or "").strip()
+    text = _telegram_message_text(message)
     if not chat_id or not user_id:
         return {"status": "ignored"}
     if not trusted_source and not _authorized(chat_id, user_id):
