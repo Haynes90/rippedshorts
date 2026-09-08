@@ -298,7 +298,8 @@ def _regenerate_copy_draft(request_id: str, index: int, chat_id: str) -> None:
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(state), now(), request_id),
             )
-        _send_copy_review(chat_id, request_id, [fresh])
+        send(chat_id, f"✅ Draft {index + 1} was regenerated. Here is the refreshed review set:")
+        _send_copy_review(chat_id, request_id, drafts)
     except Exception:
         logger.exception("Could not regenerate copy request_id=%s index=%s", request_id, index)
         send(chat_id, f"❌ I couldn't regenerate draft {index + 1}. Your previous draft is still saved.")
