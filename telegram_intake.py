@@ -314,9 +314,15 @@ def _generate_schedule_copy(
             if separator and normalized_key in {
                 "ATTRIBUTION_FORMAT",
                 "SOURCE_LINK_LABEL",
+                "SOURCE_CHANNEL_LABEL",
                 "TCB_CTA",
                 "TCB_ABOUT",
-                "TCB_LINK",
+                "TCB_WEBSITE",
+                "TCB_INSTAGRAM",
+                "TCB_YOUTUBE",
+                "TCB_FACEBOOK",
+                "TCB_TIKTOK",
+                "TCB_EMAIL",
                 "TCB_HASHTAGS",
                 "TDOG_CTA",
                 "TDOG_ABOUT",
@@ -343,6 +349,7 @@ def _generate_schedule_copy(
         logger.exception("Could not load Social Copy & CTA Guide; using built-in defaults")
 
     source_show = ""
+    source_channel_url = ""
     if source_url and YOUTUBE_RE.search(source_url):
         try:
             oembed = requests.get(
@@ -351,7 +358,9 @@ def _generate_schedule_copy(
                 timeout=(5, 20),
             )
             oembed.raise_for_status()
-            source_show = str(oembed.json().get("author_name") or "").strip()
+            oembed_data = oembed.json()
+            source_show = str(oembed_data.get("author_name") or "").strip()
+            source_channel_url = str(oembed_data.get("author_url") or "").strip()
         except Exception:
             logger.warning("Could not resolve source YouTube channel for copy attribution")
     source_show = source_show or "the source channel"
@@ -455,21 +464,32 @@ def _generate_schedule_copy(
         tcb_parts = [
             guide_rules.get(
                 "TCB_CTA",
-                "Follow The Chocolate Botanist for plant science, gardening insight, bold "
-                "conversations, and highlights from shows and livestreams across the growing world.",
+                "Follow and subscribe to The Chocolate Botanist for factual, funny plant "
+                "science and gardening conversations. For business, speaking, and media "
+                "bookings, email derek@thechocolatebotanist.com.",
             ),
             guide_rules.get(
                 "TCB_ABOUT",
-                "The Chocolate Botanist makes plant science approachable, useful, and "
-                "entertaining—connecting the science behind plants with the way we grow, eat, and live.",
+                "Derek Haynes—The Chocolate Botanist—is a Black botanist, scientific "
+                "communicator, and garden communicator bringing together science, plants, "
+                "facts, and humor while cultivating a passion for plants.",
             ),
         ]
-        tcb_link = guide_rules.get(
-            "TCB_LINK", "https://bio.site/thechocolatebotanist"
+        tcb_links = [
+            ("Website", guide_rules.get("TCB_WEBSITE", "https://thechocolatebotanist.com")),
+            ("Instagram", guide_rules.get("TCB_INSTAGRAM", "https://www.instagram.com/thechocolatebotanist")),
+            ("YouTube", guide_rules.get("TCB_YOUTUBE", "https://www.youtube.com/TheChocolateBotanist")),
+            ("Facebook", guide_rules.get("TCB_FACEBOOK", "https://www.facebook.com/TheChocolateBotanist")),
+            ("TikTok", guide_rules.get("TCB_TIKTOK", "https://www.tiktok.com/@thechocolatebotanist")),
+        ]
+        tcb_parts.append(
+            "Connect with The Chocolate Botanist\n"
+            + "\n".join(f"{label}: {url}" for label, url in tcb_links if url)
         )
-        if tcb_link:
-            tcb_parts.append(f"Connect with The Chocolate Botanist: {tcb_link}")
-        tcb_hashtags = guide_rules.get("TCB_HASHTAGS", "")
+        tcb_email = guide_rules.get("TCB_EMAIL", "derek@thechocolatebotanist.com")
+        if tcb_email:
+            tcb_parts.append(f"Business and speaking inquiries: {tcb_email}")
+        tcb_hashtags = guide_rules.get("TCB_HASHTAGS", "#TheChocolateBotanist")
         if tcb_hashtags:
             tcb_parts.append(tcb_hashtags)
         brand_cta = "\n\n".join(part for part in tcb_parts if part)
@@ -479,8 +499,14 @@ def _generate_schedule_copy(
         "🎬 Highlight from {source_show}'s video “{video_title}”",
     )
     source_link_label = guide_rules.get("SOURCE_LINK_LABEL", "Watch the original")
+    source_channel_label = guide_rules.get(
+        "SOURCE_CHANNEL_LABEL", "Explore more from {source_show}"
+   
+    )
 
-    def complete_long_description(description: str) -> str:
+    def complete_long_description(
+        description: str, dynamic_hashtags: str = ""
+    ) -> str:
         """Keep the unique hook first and guarantee source credit on every long video."""
         sections = [str(description or "").strip()]
         credit = (
@@ -492,8 +518,14 @@ def _generate_schedule_copy(
             sections.append(credit)
         if source_url and source_url.lower() not in "\n".join(sections).lower():
             sections.append(f"{source_link_label}: {source_url}")
+        if source_channel_url and source_channel_url.lower() not in "\n".join(sections).lower():
+            channel_label = source_channel_label.replace("{source_show}", source_show)
+            sections.append(f"{channel_label}: {source_channel_url}")
         if brand_cta.lower() not in "\n".join(sections).lower():
             sections.append(brand_cta)
+        dynamic_hashtags = str(dynamic_hashtags or "").strip()
+        if dynamic_hashtags and dynamic_hashtags.lower() not in "\n".join(sections).lower():
+            sections.append(dynamic_hashtags)
         return "\n\n".join(section for section in sections if section).strip()[:5000]
 
     fallback = []
@@ -603,15 +635,17 @@ def _generate_schedule_copy(
         enriched = []
         for item in fallback:
             copy = generated.get(str(item["asset_id"])) or {}
+            generated_hashtags = str(copy.get("hashtags") or "").strip()
             enriched.append(
                 {
                     **item,
                     "social_caption": str(copy.get("social_caption") or item["social_caption"]).strip(),
                     "video_title": str(copy.get("video_title") or item["video_title"]).strip()[:100],
                     "video_description": complete_long_description(
-                        str(copy.get("video_description") or item["video_description"]).strip()
+                        str(copy.get("video_description") or item["video_description"]).strip(),
+                        generated_hashtags if item.get("asset_type") == "16:9_HIGHLIGHT" else "",
                     ),
-                    "hashtags": str(copy.get("hashtags") or "").strip(),
+                    "hashtags": generated_hashtags,
                     "copy_source": "openai" if copy else item["copy_source"],
                 }
             )
