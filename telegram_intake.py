@@ -3150,26 +3150,92 @@ async def telegram_gateway(request: Request, x_telegram_bot_api_secret_token: st
     if not expected or x_telegram_bot_api_secret_token != expected:
         raise HTTPException(status_code=401, detail="Invalid Telegram webhook secret")
     update = await request.json()
-    # Clip Master owns universal chapter reviews. Handle those locally before
-    # forwarding new links and rs:* callbacks to Ripped Shorts.
-    if clipmaster_claims_update(update):
-        return handle_clipmaster_update(update)
     callback = update.get("callback_query") or {}
+    callback_data = str(callback.get("data") or "")
     message = callback.get("message") or update.get("message") or update.get("edited_message") or {}
     chat_id = str((message.get("chat") or {}).get("id", ""))
     user_id = str((callback.get("from") or message.get("from") or {}).get("id", ""))
+    text = str(message.get("text") or message.get("caption") or "").strip()
+
+    # Explicit Clip Master buttons always remain local. For ordinary text, first
+    # ask Ripped Shorts whether Write My Caption/Edit Metadata is waiting. This
+    # prevents captions beginning with words such as "add" from being mistaken
+    # for Clip Master boundary commands.
+    if callback_data.startswith("cm:") and clipmaster_claims_update(update):
+        return handle_clipmaster_update(update)
+    target = os.getenv("RIPPED_SHORTS_INTERNAL_URL", "").rstrip("/")
+    secret = os.getenv("RIPPED_SHORTS_SHARED_SECRET", "").strip()
+    if text and not callback_data and target and secret:
+        try:
+            pending_response = requests.post(
+                f"{target}/api/ripped-shorts/pending-copy-input",
+                json={"chat_id": chat_id, "user_id": user_id},
+                headers={"x-ripped-shorts-secret": secret},
+                timeout=(5, 20),
+            )
+            pending_response.raise_for_status()
+            if bool(pending_response.json().get("pending")):
+                response = requests.post(
+                    f"{target}/api/ripped-shorts/intake",
+                    json=update,
+                    headers={"x-ripped-shorts-secret": secret},
+                    timeout=(10, 60),
+                )
+                if response.status_code >= 400:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Ripped Shorts caption intake failed: {response.text[:1000]}",
+                    )
+                return response.json()
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception("Could not check pending Ripped Shorts copy input")
+
+    if clipmaster_claims_update(update):
+        return handle_clipmaster_update(update)
     if not chat_id or not user_id:
         raise HTTPException(status_code=422, detail="Telegram update is missing chat or user identity")
     if not _authorized(chat_id, user_id):
         raise HTTPException(status_code=403, detail="Telegram chat or user is not authorized")
-    target = os.getenv("RIPPED_SHORTS_INTERNAL_URL", "").rstrip("/")
-    secret = os.getenv("RIPPED_SHORTS_SHARED_SECRET", "").strip()
     if not target or not secret:
         raise HTTPException(status_code=503, detail="Ripped Shorts forwarding is not configured")
     response = requests.post(f"{target}/api/ripped-shorts/intake", json=update, headers={"x-ripped-shorts-secret": secret}, timeout=(10, 60))
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"Ripped Shorts intake failed: {response.text[:1000]}")
     return response.json()
+
+
+@router.post("/api/ripped-shorts/pending-copy-input")
+async def pending_copy_input(
+    request: Request,
+    x_ripped_shorts_secret: str | None = Header(None),
+):
+    """Tell the Telegram gateway whether the next plain message is copy input."""
+    expected = os.getenv("RIPPED_SHORTS_SHARED_SECRET", "").strip()
+    if not expected or x_ripped_shorts_secret != expected:
+        raise HTTPException(status_code=401, detail="Invalid Ripped Shorts service secret")
+    payload = await request.json()
+    chat_id = str(payload.get("chat_id") or "")
+    user_id = str(payload.get("user_id") or "")
+    if not chat_id or not user_id:
+        return {"pending": False}
+    with _LOCK, _telegram_db() as db:
+        rows = db.execute(
+            "SELECT state_json FROM telegram_requests WHERE chat_id=? AND user_id=? "
+            "ORDER BY updated_at DESC LIMIT 20",
+            (chat_id, user_id),
+        ).fetchall()
+    for row in rows:
+        state = json.loads(row["state_json"])
+        waiting = state.get("awaiting_copy_input") or {}
+        if str(waiting.get("user_id") or "") == user_id:
+            return {
+                "pending": True,
+                "request_id": str(waiting.get("request_id") or ""),
+                "field": str(waiting.get("field") or ""),
+            }
+    return {"pending": False}
 
 
 @router.post("/api/ripped-shorts/intake")
