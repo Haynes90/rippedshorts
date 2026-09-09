@@ -712,6 +712,101 @@ def _generate_schedule_copy(
         return fallback
 
 
+SCHEDULE_OUTBOX_TAB = os.getenv("SCHEDULE_OUTBOX_TAB", "Schedule Handoff Outbox").strip()
+
+
+def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> None:
+    """Upsert the complete approved handoff before network delivery."""
+    import main
+    from google_sheets import get_or_create_headers
+
+    _, _, sheets = main.get_google_services()
+    headers = [
+        "recorded_at", "request_id", "asset_id", "brand_id",
+        "youtube_video_id", "youtube_channel_id", "source_url", "source_title",
+        "asset_type", "candidate_number", "drive_url", "transcript",
+        "duration_seconds", "main_theme", "keywords", "social_caption",
+        "video_title", "video_description", "hashtags", "copy_source",
+        "handoff_status",
+    ]
+    headers = get_or_create_headers(
+        RIPPED_LOG_SHEET_ID, SCHEDULE_OUTBOX_TAB, headers
+    )
+    result = sheets.spreadsheets().values().get(
+        spreadsheetId=RIPPED_LOG_SHEET_ID,
+        range=f"'{SCHEDULE_OUTBOX_TAB}'!A1:U5000",
+    ).execute()
+    values = result.get("values", [])
+    existing = {}
+    if values:
+        normalized = [
+            str(value or "").strip().lower().replace(" ", "_")
+            for value in values[0]
+        ]
+        asset_column = normalized.index("asset_id")
+        for row_number, row in enumerate(values[1:], start=2):
+            asset_id = str(row[asset_column] if asset_column < len(row) else "").strip()
+            if asset_id:
+                existing[asset_id] = row_number
+
+    rows_to_append = []
+    updates = []
+    common = {
+        "recorded_at": now(),
+        "request_id": str(payload.get("request_id") or ""),
+        "brand_id": str(payload.get("show_id") or "").upper(),
+        "youtube_video_id": str(payload.get("youtube_video_id") or ""),
+        "youtube_channel_id": str(payload.get("youtube_channel_id") or ""),
+        "source_url": str(payload.get("source_url") or ""),
+        "source_title": str(payload.get("source_title") or ""),
+        "handoff_status": status,
+    }
+    for asset in payload.get("assets") or []:
+        row = {
+            **common,
+            "asset_id": str(asset.get("asset_id") or ""),
+            "asset_type": str(asset.get("asset_type") or ""),
+            "candidate_number": asset.get("candidate_number") or "",
+            "drive_url": str(asset.get("drive_url") or ""),
+            "transcript": str(asset.get("transcript") or ""),
+            "duration_seconds": asset.get("duration_seconds") or "",
+            "main_theme": str(asset.get("main_theme") or ""),
+            "keywords": str(asset.get("keywords") or ""),
+            "social_caption": str(asset.get("social_caption") or ""),
+            "video_title": str(asset.get("video_title") or asset.get("title") or ""),
+            "video_description": str(asset.get("video_description") or ""),
+            "hashtags": str(asset.get("hashtags") or ""),
+            "copy_source": str(asset.get("copy_source") or ""),
+        }
+        ordered = [row.get(header, "") for header in headers]
+        asset_id = row["asset_id"]
+        if asset_id in existing:
+            row_number = existing[asset_id]
+            updates.append({
+                "range": f"'{SCHEDULE_OUTBOX_TAB}'!A{row_number}:U{row_number}",
+                "values": [ordered],
+            })
+        else:
+            rows_to_append.append(ordered)
+    if updates:
+        sheets.spreadsheets().values().batchUpdate(
+            spreadsheetId=RIPPED_LOG_SHEET_ID,
+            body={"valueInputOption": "RAW", "data": updates},
+        ).execute()
+    if rows_to_append:
+        sheets.spreadsheets().values().append(
+            spreadsheetId=RIPPED_LOG_SHEET_ID,
+            range=f"'{SCHEDULE_OUTBOX_TAB}'!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows_to_append},
+        ).execute()
+    logger.warning(
+        "Persisted Schedule Handoff Outbox request_id=%s assets=%s status=%s",
+        payload.get("request_id"), len(payload.get("assets") or []), status,
+    )
+
+
 def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
     """Send all final rendered 9:16 and 16:9 selections downstream once."""
     target = (
@@ -818,6 +913,36 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
         "source_title": _state_vid_title(state),
         "assets": assets,
     }
+    try:
+        _persist_schedule_outbox(payload, "READY")
+    except Exception:
+        logger.exception(
+            "Could not persist Schedule Handoff Outbox request_id=%s", request_id
+        )
+        send(
+            chat_id,
+            "❌ Scheduling paused because the durable handoff record could not be saved. "
+            "Your rendered videos remain in Drive; use Schedule Now again after Sheets recovers.",
+        )
+        with _LOCK, _telegram_db() as db:
+            row = db.execute(
+                "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if row:
+                latest_state = json.loads(row["state_json"])
+                latest_schedule = dict(latest_state.get("schedule_master") or {})
+                latest_schedule.update({
+                    "shorts_status": "failed",
+                    "shorts_error": "Durable Schedule Handoff Outbox write failed",
+                    "shorts_failed_at": now(),
+                })
+                latest_state["schedule_master"] = latest_schedule
+                db.execute(
+                    "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+                    (json.dumps(latest_state), now(), request_id),
+                )
+        return
     headers = {}
     secret = os.getenv("SCHEDULE_MASTER_SHARED_SECRET", "").strip()
     if secret:
