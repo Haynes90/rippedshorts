@@ -2022,7 +2022,11 @@ def _process(request_id: str) -> None:
                     + ". Preparing the reusable video and transcript now.",
                 )
                 try:
-                    audio_master_result = ingest_with_audio_master(video_id, parsed["source_value"])
+                    audio_master_result = ingest_with_audio_master(
+                        video_id,
+                        parsed["source_value"],
+                        progress=lambda message: send(chat_id, message),
+                    )
                     state["audio_master_ingest"] = {
                         "job_id": audio_master_result.get("job_id"),
                         "status": audio_master_result.get("status"),
