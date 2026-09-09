@@ -1938,22 +1938,62 @@ def _process(request_id: str) -> None:
                     + " and ".join(missing)
                     + ". Preparing the reusable video and transcript now.",
                 )
-                audio_master_result = ingest_with_audio_master(video_id, parsed["source_value"])
-                state["audio_master_ingest"] = {
-                    "job_id": audio_master_result.get("job_id"),
-                    "status": audio_master_result.get("status"),
-                    "skip_metadata_podhome": audio_master_result.get("skip_metadata_podhome"),
-                }
-                cache = reuse_from_drive(video_id, work)
-                video = cache.get("video_path")
-                segments = cache.get("segments") or []
+                try:
+                    audio_master_result = ingest_with_audio_master(video_id, parsed["source_value"])
+                    state["audio_master_ingest"] = {
+                        "job_id": audio_master_result.get("job_id"),
+                        "status": audio_master_result.get("status"),
+                        "skip_metadata_podhome": audio_master_result.get("skip_metadata_podhome"),
+                    }
+                except Exception as audio_master_error:
+                    # Audio Master is a cache accelerator, not a single point of
+                    # failure. Its retained-video path can fail independently
+                    # while Ripped Shorts can still download/transcribe directly.
+                    state["audio_master_ingest"] = {
+                        "status": "fallback_to_ripped_shorts",
+                        "error": str(audio_master_error),
+                    }
+                    state.setdefault("warnings", []).append(
+                        f"Audio Master reusable-source path failed; using Ripped Shorts fallback: {audio_master_error}"
+                    )
+                    logger.warning(
+                        "Audio Master source unavailable; continuing with direct Ripped Shorts ingestion "
+                        "request_id=%s video_id=%s error=%s",
+                        request_id,
+                        video_id,
+                        audio_master_error,
+                    )
+                    send(
+                        chat_id,
+                        "⚠️ Audio Master did not retain a usable source video. "
+                        "Ripped Shorts is continuing with its direct backup path.",
+                    )
+
+                try:
+                    cache = reuse_from_drive(video_id, work)
+                except Exception as cache_error:
+                    cache = {"video_path": None, "segments": [], "sermon_boundary": None}
+                    state.setdefault("warnings", []).append(
+                        f"Post-ingest Drive cache lookup failed: {cache_error}"
+                    )
+                video = cache.get("video_path") or video
+                segments = cache.get("segments") or segments
                 boundary = cache.get("sermon_boundary") or boundary
+
+                if not video:
+                    send(chat_id, "⬇️ Downloading the YouTube video with the Ripped Shorts backup path.")
+                    video = download_youtube_resilient(video_id, parsed["source_value"], work)
+                    reused = False
+                if not segments:
+                    send(chat_id, "📝 Creating the timed transcript with the Ripped Shorts backup path.")
+                    segments = _transcribe(video)
+                    reused = False
                 if not video or not segments:
                     raise RuntimeError(
-                        "Audio Master completed but the reusable source video or timed transcript "
-                        f"for YouTube ID {video_id} was not found in the configured Drive folder."
+                        "Neither Audio Master, Drive cache, nor the direct Ripped Shorts fallback "
+                        f"produced a usable video and timed transcript for YouTube ID {video_id}."
                     )
-                reused = True
+                reused = bool(reused or cache.get("video_path") or cache.get("segments"))
 
             if boundary:
                 bounded = restrict_to_boundary(segments, boundary)
