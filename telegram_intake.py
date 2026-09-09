@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import uuid
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -1538,37 +1538,120 @@ def _send_short_confirmation(chat_id: str, request_id: str) -> None:
         },
     )
 
-def _transcribe(video_path: Path) -> list[dict]:
-    """Extract audio and ask OpenAI for timestamped segments when Drive has no transcript."""
+def _transcribe(video_path: Path, progress=None) -> list[dict]:
+    """Transcribe safely in bounded chunks and recombine absolute timestamps."""
     import subprocess
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is required to transcribe a Drive video without a transcript")
-    audio = video_path.with_suffix(".mp3")
+        raise RuntimeError("OPENAI_API_KEY is required to transcribe a video without a transcript")
+
+    chunk_seconds = max(120, int(os.getenv("RIPPED_TRANSCRIPTION_CHUNK_SECONDS", "600")))
+    workers = max(1, min(6, int(os.getenv("RIPPED_TRANSCRIPTION_WORKERS", "4"))))
+    retries = max(1, int(os.getenv("RIPPED_TRANSCRIPTION_RETRIES", "3")))
+    chunk_dir = video_path.parent / "transcription-chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    pattern = chunk_dir / "chunk-%03d.mp3"
+    if progress:
+        progress("📝 Preparing audio for safe, chunked transcription.")
+
     completed = subprocess.run(
-        [os.getenv("FFMPEG_BINARY", "ffmpeg"), "-y", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", str(audio)],
+        [
+            os.getenv("FFMPEG_BINARY", "ffmpeg"), "-y", "-i", str(video_path),
+            "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k",
+            "-f", "segment", "-segment_time", str(chunk_seconds),
+            "-reset_timestamps", "1", str(pattern),
+        ],
         capture_output=True, text=True, timeout=3600,
     )
     if completed.returncode != 0:
-        raise RuntimeError(f"Audio extraction failed: {completed.stderr[-1000:]}")
-    with audio.open("rb") as handle:
-        response = requests.post(
-            "https://api.openai.com/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {api_key}"},
-            data={"model": os.getenv("TRANSCRIPTION_MODEL", "whisper-1"), "response_format": "verbose_json", "timestamp_granularities[]": "segment"},
-            files={"file": (audio.name, handle, "audio/mpeg")}, timeout=(10, 1800),
+        raise RuntimeError(f"Audio chunking failed: {completed.stderr[-1000:]}")
+
+    chunk_paths = sorted(
+        path for path in chunk_dir.glob("chunk-*.mp3")
+        if path.is_file() and path.stat().st_size > 0
+    )
+    if not chunk_paths:
+        raise RuntimeError("Audio chunking produced no usable files")
+    oversize = [path for path in chunk_paths if path.stat().st_size >= 24 * 1024 * 1024]
+    if oversize:
+        raise RuntimeError(
+            "A transcription chunk exceeded the 24 MiB safety ceiling: "
+            + ", ".join(f"{path.name}={path.stat().st_size}" for path in oversize)
         )
-    if response.status_code != 200:
-        raise RuntimeError(f"Transcription failed ({response.status_code}): {response.text[:1000]}")
+    if progress:
+        progress(f"🎧 Audio prepared in {len(chunk_paths)} chunk(s); transcription started.")
+
+    def transcribe_one(index_path):
+        index, path = index_path
+        last_error = None
+        for attempt in range(1, retries + 1):
+            try:
+                with path.open("rb") as handle:
+                    response = requests.post(
+                        "https://api.openai.com/v1/audio/transcriptions",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        data={
+                            "model": os.getenv("TRANSCRIPTION_MODEL", "whisper-1"),
+                            "response_format": "verbose_json",
+                            "timestamp_granularities[]": "segment",
+                        },
+                        files={"file": (path.name, handle, "audio/mpeg")},
+                        timeout=(10, 1800),
+                    )
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"HTTP {response.status_code}: {response.text[:1000]}"
+                    )
+                offset = index * chunk_seconds
+                adjusted = []
+                for item in response.json().get("segments", []):
+                    start = float(item["start"]) + offset
+                    end = float(item["end"]) + offset
+                    adjusted.append({
+                        "start": start,
+                        "end": end,
+                        "duration": end - start,
+                        "text": str(item["text"]).strip(),
+                        "chunk_index": index + 1,
+                    })
+                return adjusted
+            except Exception as exc:
+                last_error = exc
+                if attempt < retries:
+                    import time
+                    time.sleep(min(2 ** attempt, 10))
+        raise RuntimeError(
+            f"Transcription chunk {index + 1}/{len(chunk_paths)} failed after "
+            f"{retries} attempts: {last_error}"
+        )
+
     result = []
-    for item in response.json().get("segments", []):
-        start, end = float(item["start"]), float(item["end"])
-        result.append({"start": start, "end": end, "duration": end - start, "text": str(item["text"]).strip()})
+    completed_count = 0
+    last_bucket = -1
+    with ThreadPoolExecutor(max_workers=min(workers, len(chunk_paths))) as executor:
+        futures = {
+            executor.submit(transcribe_one, item): item[0]
+            for item in enumerate(chunk_paths)
+        }
+        for future in as_completed(futures):
+            result.extend(future.result())
+            completed_count += 1
+            percent = int(completed_count * 100 / len(chunk_paths))
+            bucket = percent // 25
+            if progress and (completed_count == 1 or completed_count == len(chunk_paths) or bucket > last_bucket):
+                progress(
+                    f"📝 Transcript progress: {completed_count}/{len(chunk_paths)} "
+                    f"chunk(s) complete ({percent}%)."
+                )
+                last_bucket = bucket
+
+    result.sort(key=lambda item: (item["start"], item["end"]))
     if not result:
         raise RuntimeError("Transcription returned no timed segments")
+    if progress:
+        progress(f"✅ Timed transcript complete: {len(result)} segments.")
     return result
-
 
 def _topic_break_suggestions(transcript_segments: list[dict]) -> list[dict]:
     """Select the strongest standalone 16:9 highlights from the full transcript."""
@@ -1903,7 +1986,7 @@ def _process(request_id: str) -> None:
                     item["duration"] = item["end"] - item["start"]
             else:
                 send(chat_id, "📝 No transcript link supplied; transcribing the Drive video.")
-                segments = _transcribe(video)
+                segments = _transcribe(video, progress=lambda message: send(chat_id, message))
             reused = True
         else:
             parsed = state["parsed"]
@@ -1986,7 +2069,7 @@ def _process(request_id: str) -> None:
                     reused = False
                 if not segments:
                     send(chat_id, "📝 Creating the timed transcript with the Ripped Shorts backup path.")
-                    segments = _transcribe(video)
+                    segments = _transcribe(video, progress=lambda message: send(chat_id, message))
                     reused = False
                 if not video or not segments:
                     raise RuntimeError(
