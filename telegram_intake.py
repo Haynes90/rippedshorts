@@ -3283,6 +3283,25 @@ def _accept_update(
     retry_match = re.fullmatch(r"/retry\s+([A-Za-z0-9-]+)", text, re.I)
     if retry_match:
         request_id = retry_match.group(1)
+        with _LOCK, _telegram_db() as db:
+            retry_row = db.execute(
+                "SELECT request_id FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+        if not retry_row:
+            send(
+                chat_id,
+                "⚠️ That job belonged to an earlier Railway container and its "
+                "interactive record is no longer available. Paste the original "
+                "YouTube URL again to create a recoverable new job. Ripped Shorts "
+                "will check Drive for the existing video/transcript instead of "
+                "starting the media work from scratch.",
+            )
+            return {
+                "status": "retry_source_missing",
+                "request_id": request_id,
+                "next_action": "resend_original_youtube_url",
+            }
         background_tasks.add_task(_process, request_id)
         return {"status": "retry_accepted", "request_id": request_id}
     if is_quick_command(text):
