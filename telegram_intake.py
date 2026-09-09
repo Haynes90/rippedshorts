@@ -3831,60 +3831,94 @@ def _ripped_webhook_secret() -> str:
     return ""
 
 
-@router.post("/api/ripped-shorts/telegram/webhook")
+@router.get("/api/ripped-shorts/telegram/webhook")
+def ripped_telegram_webhook_health() -> dict[str, Any]:
+    """Allow Railway/browser health checks without pretending to be Telegram."""
+    return {
+        "status": "ok",
+        "bot": "@rippedshortsbot",
+        "delivery_method": "POST",
+    }
+
+
+class _ExecutorBackgroundTasks:
+    """Submit follow-on work when an update is processed after webhook ACK."""
+
+    @staticmethod
+    def add_task(function: Any, *args: Any, **kwargs: Any) -> None:
+        RENDER_EXECUTOR.submit(function, *args, **kwargs)
+
+
+def _process_ripped_telegram_update_after_ack(update: dict[str, Any]) -> None:
+    try:
+        result = _accept_update(
+            update,
+            _ExecutorBackgroundTasks(),
+            trusted_source=False,
+        )
+        logger.info(
+            "Ripped Shorts Telegram update processed after ACK "
+            "update_id=%s status=%s request_id=%s",
+            update.get("update_id", ""),
+            result.get("status", "unknown"),
+            result.get("request_id", ""),
+        )
+    except Exception:
+        logger.exception(
+            "Ripped Shorts Telegram update failed after ACK update_id=%s",
+            update.get("update_id", ""),
+        )
+
+
+@router.post("/api/ripped-shorts/telegram/webhook", status_code=202)
 async def ripped_telegram_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
-    response: Response,
     x_telegram_bot_api_secret_token: str | None = Header(None),
 ):
-    """Receive updates directly from the dedicated Ripped Shorts Telegram bot."""
+    """Acknowledge Telegram immediately; process conversation work afterward."""
     expected = _ripped_webhook_secret()
     if expected and x_telegram_bot_api_secret_token != expected:
         raise HTTPException(status_code=401, detail="Invalid Telegram webhook secret")
     update = await request.json()
-    result = _accept_update(update, background_tasks, trusted_source=False)
-    status = str(result.get("status") or "unknown")
-    logger.info(
-        "Ripped Shorts Telegram webhook update_id=%s status=%s request_id=%s",
-        update.get("update_id", ""),
-        status,
-        result.get("request_id", ""),
+
+    callback = update.get("callback_query") or {}
+    message = (
+        callback.get("message")
+        or update.get("message")
+        or update.get("edited_message")
+        or update.get("channel_post")
+        or update.get("edited_channel_post")
+        or {}
     )
-    if status == "unauthorized":
-        callback = update.get("callback_query") or {}
-        message = (
-            callback.get("message")
-            or update.get("message")
-            or update.get("edited_message")
-            or {}
+    chat_id = str((message.get("chat") or {}).get("id", ""))
+    user_id = str((callback.get("from") or message.get("from") or {}).get("id", ""))
+    if not chat_id or not user_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Telegram update is missing chat or user identity",
         )
-        rejected_chat_id = str((message.get("chat") or {}).get("id", ""))
-        rejected_user_id = str(
-            (callback.get("from") or message.get("from") or {}).get("id", "")
-        )
-        configured_chats = sorted(
-            {
-                value
-                for name in (
-                    "TELEGRAM_CHAT_ID",
-                    "TELEGRAM_GROUP_CHAT_ID",
-                    "Telegram_Group_Chat_ID",
-                )
-                if (value := os.getenv(name, "").strip())
-            }
-        )
+    if not _authorized(chat_id, user_id):
         logger.warning(
-            "Ripped Telegram authorization rejected chat_id=%s user_id=%s "
-            "configured_chat_ids=%s",
-            rejected_chat_id,
-            rejected_user_id,
-            configured_chats,
+            "Ripped Telegram authorization rejected before ACK "
+            "chat_id=%s user_id=%s",
+            chat_id,
+            user_id,
         )
-        raise HTTPException(status_code=403, detail="Telegram chat or user is not authorized")
-    if status in {"accepted", "retry_accepted"}:
-        response.status_code = 202
-    return result
+        raise HTTPException(
+            status_code=403,
+            detail="Telegram chat or user is not authorized",
+        )
+
+    background_tasks.add_task(_process_ripped_telegram_update_after_ack, update)
+    logger.info(
+        "Ripped Shorts Telegram webhook ACK update_id=%s",
+        update.get("update_id", ""),
+    )
+    return {
+        "status": "accepted_for_processing",
+        "update_id": update.get("update_id", ""),
+    }
 
 
 _RIPPED_WEBHOOK_WATCHDOG_STARTED = False
