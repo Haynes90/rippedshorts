@@ -3280,7 +3280,9 @@ def _accept_update(
             )
             send(chat_id, f"Short {index + 1} rejected.")
         return {"status": verb, "request_id": request_id, "short_index": index}
-    retry_match = re.fullmatch(r"/retry\s+([A-Za-z0-9-]+)", text, re.I)
+    retry_match = re.fullmatch(
+        r"/retry(?:@rippedshortsbot)?\s+([A-Za-z0-9-]+)", text, re.I
+    )
     if retry_match:
         request_id = retry_match.group(1)
         with _LOCK, _telegram_db() as db:
@@ -3358,6 +3360,14 @@ def _accept_update(
     try:
         parsed = parse_request(text)
     except ValueError:
+        command = text.split(None, 1)[0][:80] if text else ""
+        logger.info(
+            "Ripped Shorts ignored group message command=%r has_youtube_entity=%s "
+            "message_type=%s",
+            command,
+            bool(YOUTUBE_RE.search(text)),
+            "callback" if callback_data else "text",
+        )
         return {"status": "ignored_non_ripped_shorts_message"}
     request_id, update_id, stamp = str(uuid.uuid4()), str(update.get("update_id", "")), now()
     state = {"stage": "accepted", "parsed": parsed, "message_id": message.get("message_id")}
