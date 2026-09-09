@@ -277,7 +277,7 @@ def ingest_with_audio_master(video_id: str, youtube_url: str) -> dict[str, Any]:
     )
 
 def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -> Path:
-    """Use Audio Master's yt-dlp fallback pattern instead of a paid download API."""
+    """Acquire a full video using Audio Master's ordered YouTube provider profiles."""
     workdir.mkdir(parents=True, exist_ok=True)
     destination = workdir / f"{video_id}-source.mp4"
     cookie_file = (
@@ -286,49 +286,152 @@ def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -
         or os.getenv("YOUTUBE_COOKIES_FILE")
         or os.getenv("YOUTUBE_COOKIE_FILE")
         or os.getenv("YT_DLP_COOKIE_FILE")
+        or os.getenv("YTDLP_COOKIES_FILE")
         or ""
     ).strip()
     generated_cookie_file = workdir / "youtube-cookies.txt"
-    cookies_base64 = (os.getenv("YOUTUBE_COOKIES_BASE64") or "").strip()
+    cookies_base64 = (
+        os.getenv("YOUTUBE_COOKIES_BASE64")
+        or os.getenv("YTDLP_COOKIES_BASE64")
+        or ""
+    ).strip()
     cookie_text = (os.getenv("YOUTUBE_COOKIES") or "").strip()
 
-    # Railway variables cannot create a filesystem path by themselves. Prefer
-    # the portable base64 secret whenever the configured path is unavailable.
     if cookies_base64 and (not cookie_file or not Path(cookie_file).is_file()):
         try:
             decoded = base64.b64decode(cookies_base64, validate=True).decode("utf-8")
         except (binascii.Error, UnicodeDecodeError) as exc:
-            raise RuntimeError("YOUTUBE_COOKIES_BASE64 is not valid base64-encoded UTF-8 cookie text") from exc
+            raise RuntimeError("YouTube cookie base64 value is not valid UTF-8 cookie text") from exc
         generated_cookie_file.write_text(decoded.rstrip() + "\n", encoding="utf-8")
         cookie_file = str(generated_cookie_file)
     elif cookie_text and (not cookie_file or not Path(cookie_file).is_file()):
         generated_cookie_file.write_text(cookie_text.replace("\\n", "\n").rstrip() + "\n", encoding="utf-8")
         cookie_file = str(generated_cookie_file)
-    options: dict[str, Any] = {
-        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
-        "outtmpl": str(destination),
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "retries": 5,
-        "fragment_retries": 5,
-        "concurrent_fragment_downloads": 4,
-        "socket_timeout": 30,
-        "quiet": True,
-        "no_warnings": True,
-        "http_headers": {"User-Agent": "Mozilla/5.0"},
-        "extractor_args": {"youtube": {"player_client": ["android_vr", "web_safari", "web"]}},
-    }
+
+    pot_home = (
+        os.getenv("YTDLP_POT_PROVIDER_HOME")
+        or "/opt/bgutil-ytdlp-pot-provider/server"
+    ).strip()
+    has_pot = bool(pot_home and Path(pot_home).is_dir())
+    profiles: list[dict[str, Any]] = [
+        {
+            "name": "public_original_selector",
+            "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+            "player_client": ["default", "tv_simply"],
+        },
+        {
+            "name": "public_auto_format",
+            "format": None,
+            "player_client": ["default", "tv_simply"],
+        },
+        {
+            "name": "public_android_vr",
+            "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+            "player_client": ["android_vr"],
+        },
+        {
+            "name": "public_web_safari",
+            "format": None,
+            "player_client": ["web_safari"],
+        },
+    ]
+    if has_pot:
+        profiles.extend(
+            [
+                {
+                    "name": "automatic_po_token_mweb",
+                    "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+                    "player_client": ["mweb"],
+                    "pot": True,
+                },
+                {
+                    "name": "automatic_po_token_web_safari",
+                    "format": None,
+                    "player_client": ["web_safari"],
+                    "pot": True,
+                },
+            ]
+        )
     if cookie_file and Path(cookie_file).is_file():
-        options["cookiefile"] = cookie_file
-    with YoutubeDL(options) as ydl:
-        ydl.extract_info(youtube_url, download=True)
-    if not destination.is_file() or destination.stat().st_size <= 0:
-        matches = sorted(workdir.glob(f"{video_id}-source.*"))
-        if matches:
-            destination = matches[0]
-    if not destination.is_file() or destination.stat().st_size <= 0:
-        raise RuntimeError("yt-dlp completed without a usable source video")
-    return destination
+        profiles.extend(
+            [
+                {
+                    "name": "cookie_auto_format",
+                    "format": None,
+                    "player_client": None,
+                    "cookies": True,
+                },
+                {
+                    "name": "cookie_po_token_mweb",
+                    "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+                    "player_client": ["mweb"],
+                    "cookies": True,
+                    "pot": has_pot,
+                },
+            ]
+        )
+
+    failures: list[str] = []
+    for profile in profiles:
+        for old in workdir.glob(f"{video_id}-source.*"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        options: dict[str, Any] = {
+            "outtmpl": str(destination),
+            "merge_output_format": "mp4",
+            "noplaylist": True,
+            "retries": 5,
+            "fragment_retries": 5,
+            "extractor_retries": 3,
+            "concurrent_fragment_downloads": 4,
+            "socket_timeout": 45,
+            "quiet": True,
+            "no_warnings": True,
+            "http_headers": {"User-Agent": "Mozilla/5.0"},
+        }
+        if profile.get("format"):
+            options["format"] = profile["format"]
+        clients = profile.get("player_client")
+        if clients:
+            options["extractor_args"] = {"youtube": {"player_client": clients}}
+        if profile.get("pot"):
+            options.setdefault("extractor_args", {})["youtubepot-bgutilscript"] = {
+                "server_home": [pot_home]
+            }
+        if profile.get("cookies"):
+            options["cookiefile"] = cookie_file
+        try:
+            print(
+                f"RIPPED_SOURCE_PROFILE start video_id={video_id} profile={profile['name']} "
+                f"po_token={bool(profile.get('pot'))} cookies={bool(profile.get('cookies'))}",
+                flush=True,
+            )
+            with YoutubeDL(options) as ydl:
+                ydl.extract_info(youtube_url, download=True)
+            matches = sorted(workdir.glob(f"{video_id}-source.*"))
+            usable = next((item for item in matches if item.is_file() and item.stat().st_size > 0), None)
+            if usable:
+                print(
+                    f"RIPPED_SOURCE_PROFILE success video_id={video_id} profile={profile['name']} "
+                    f"bytes={usable.stat().st_size}",
+                    flush=True,
+                )
+                return usable
+            raise RuntimeError("profile completed without a usable source video")
+        except Exception as exc:
+            failures.append(f"{profile['name']}: {type(exc).__name__}: {exc}")
+            print(
+                f"RIPPED_SOURCE_PROFILE failed video_id={video_id} profile={profile['name']} "
+                f"error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+    raise RuntimeError(
+        "All Ripped Shorts full-video acquisition profiles failed for "
+        f"{video_id}: " + "; ".join(failures[-12:])
+    )
 
 
 def upload_cache_file(path: Path, name: str, mime_type: str) -> dict[str, Any]:
