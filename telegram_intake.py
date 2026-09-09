@@ -4012,18 +4012,81 @@ def _ensure_ripped_telegram_webhook() -> dict[str, Any]:
         )
 
     last_error = str(info.get("last_error_message") or "").strip()
+    last_error_date = int(info.get("last_error_date") or 0)
+    last_error_age = (
+        max(0, int(datetime.now(timezone.utc).timestamp()) - last_error_date)
+        if last_error_date
+        else None
+    )
+    can_read_group_messages = bool(me.get("can_read_all_group_messages"))
+
+    configured_chat_id = next(
+        (
+            os.getenv(name, "").strip()
+            for name in (
+                "TELEGRAM_CHAT_ID",
+                "TELEGRAM_GROUP_CHAT_ID",
+                "Telegram_Group_Chat_ID",
+            )
+            if os.getenv(name, "").strip()
+        ),
+        "",
+    )
+    membership_status = "unknown"
+    if configured_chat_id:
+        try:
+            membership = dict(
+                _telegram_api(
+                    token,
+                    "getChatMember",
+                    {
+                        "chat_id": configured_chat_id,
+                        "user_id": me.get("id"),
+                    },
+                ).get("result")
+                or {}
+            )
+            membership_status = str(membership.get("status") or "unknown")
+        except Exception:
+            logger.exception(
+                "Could not verify @%s membership in configured Telegram group",
+                username,
+            )
+
     logger.info(
         "Ripped Shorts Telegram webhook verified bot=@%s url=%s "
-        "pending_updates=%s last_error=%s",
+        "pending_updates=%s group_read_all=%s group_status=%s "
+        "last_error=%s last_error_age_seconds=%s",
         username,
         registered_url,
         info.get("pending_update_count", 0),
+        can_read_group_messages,
+        membership_status,
         last_error or "none",
+        last_error_age if last_error_age is not None else "none",
     )
-    if last_error:
+    if (
+        not can_read_group_messages
+        and membership_status != "administrator"
+    ):
         logger.warning(
-            "Telegram reports a delivery error for @%s: %s",
+            "@%s cannot receive plain group messages. Disable privacy mode "
+            "for this bot with BotFather or make it a group administrator; "
+            "addressed commands and replies remain available.",
             username,
+        )
+    if last_error and last_error_age is not None and last_error_age <= 600:
+        logger.warning(
+            "Telegram reports a recent delivery error for @%s age=%ss: %s",
+            username,
+            last_error_age,
+            last_error,
+        )
+    elif last_error:
+        logger.info(
+            "Telegram retains a historical delivery error for @%s age=%ss: %s",
+            username,
+            last_error_age,
             last_error,
         )
     return info
