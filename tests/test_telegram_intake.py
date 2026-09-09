@@ -98,6 +98,36 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("Ripped Shorts job queued", SOURCE)
         self.assertIn("response.status_code = 202", SOURCE)
 
+    def test_dedicated_webhook_acknowledges_before_processing(self):
+        self.assertIn(
+            '@router.post("/api/ripped-shorts/telegram/webhook", status_code=202)',
+            SOURCE,
+        )
+        self.assertIn("_process_ripped_telegram_update_after_ack", SOURCE)
+        self.assertIn(
+            "background_tasks.add_task(_process_ripped_telegram_update_after_ack, update)",
+            SOURCE,
+        )
+        webhook_start = SOURCE.index(
+            '@router.post("/api/ripped-shorts/telegram/webhook", status_code=202)'
+        )
+        webhook_end = SOURCE.index(
+            "_RIPPED_WEBHOOK_WATCHDOG_STARTED", webhook_start
+        )
+        webhook_source = SOURCE[webhook_start:webhook_end]
+        self.assertNotIn("_accept_update(update, background_tasks", webhook_source)
+
+    def test_webhook_get_is_a_health_check_not_an_update(self):
+        self.assertIn(
+            '@router.get("/api/ripped-shorts/telegram/webhook")',
+            SOURCE,
+        )
+        self.assertIn('"delivery_method": "POST"', SOURCE)
+
+    def test_shared_group_retry_accepts_bot_username(self):
+        self.assertIn('(?:@rippedshortsbot)?', SOURCE)
+        self.assertIn('"retry_source_missing"', SOURCE)
+
     def test_processing_failures_are_written_to_railway_logs(self):
         process_source = ast.get_source_segment(
             SOURCE,
