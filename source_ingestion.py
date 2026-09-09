@@ -207,7 +207,7 @@ def reuse_from_drive(video_id: str, workdir: Path) -> dict[str, Any]:
 
 
 
-def ingest_with_audio_master(video_id: str, youtube_url: str) -> dict[str, Any]:
+def ingest_with_audio_master(video_id: str, youtube_url: str, progress=None) -> dict[str, Any]:
     """Run Audio Master's cache/download/transcription path and wait for Drive assets."""
     base = (os.getenv("AUDIO_MASTER_INTERNAL_URL") or "").strip().rstrip("/")
     if base and "://" not in base:
@@ -244,6 +244,9 @@ def ingest_with_audio_master(video_id: str, youtube_url: str) -> dict[str, Any]:
     poll_seconds = max(3, int(os.getenv("AUDIO_MASTER_INGEST_POLL_SECONDS", "15")))
     deadline = time.monotonic() + timeout_seconds
     last: dict[str, Any] = accepted
+    last_progress_signature = None
+    if progress:
+        progress("🎧 Audio Master accepted the source; preparing reusable media.")
     while time.monotonic() < deadline:
         status_response = requests.get(
             f"{base}/api/ripped-shorts/ingest/{job_id}",
@@ -261,6 +264,26 @@ def ingest_with_audio_master(video_id: str, youtube_url: str) -> dict[str, Any]:
         transcript = last.get("transcript") or {}
         source_video = last.get("source_video") or {}
         source_status = str(source_video.get("status") or "").lower()
+        transcription_progress = last.get("transcription_progress") or {}
+        progress_signature = (
+            status,
+            transcription_progress.get("stage"),
+            transcription_progress.get("completed_chunks"),
+            transcription_progress.get("total_chunks"),
+            source_status,
+        )
+        if progress and progress_signature != last_progress_signature:
+            completed = transcription_progress.get("completed_chunks")
+            total = transcription_progress.get("total_chunks")
+            percent = transcription_progress.get("percent")
+            if completed is not None and total:
+                progress(
+                    f"📝 Audio Master transcription: {completed}/{total} chunk(s) "
+                    f"complete ({percent or 0}%)."
+                )
+            elif status:
+                progress(f"🎧 Audio Master stage: {status}.")
+            last_progress_signature = progress_signature
         if source_status in {"failed", "awaiting_route_rerun"}:
             raise RuntimeError(
                 "Audio Master's retained source-video path failed: "
