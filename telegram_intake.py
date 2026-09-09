@@ -1307,8 +1307,21 @@ def _reviewed_short_history_from_sheet(video_id: str) -> list[dict[str, Any]]:
     return sorted(found.values(), key=lambda item: item["candidate_number"])
 
 
+def _packaged_short_framework_prompt() -> str:
+    """Return the last approved framework snapshot shipped with the service."""
+    path = Path(__file__).with_name("ripped_shorts_9x16_framework.txt")
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    except Exception as exc:
+        logger.error("Packaged 9:16 framework unavailable: %s", exc)
+    return ""
+
+
 def _configured_short_framework_prompt() -> str:
-    """Load the shared 9:16 editorial framework from the RIPPED Show Config row."""
+    """Prefer the editable Google Doc and fail over to its approved snapshot."""
+    packaged = _packaged_short_framework_prompt()
     try:
         rows = get_rows(RIPPED_LOG_SHEET_ID, "Show Config", "A1:AF1000")
         ripped = next(
@@ -1326,12 +1339,26 @@ def _configured_short_framework_prompt() -> str:
             or ""
         ).strip()
         if not reference:
-            logger.warning("RIPPED Show Config row has no 9:16 prompt reference")
-            return ""
-        return read_google_doc_text(reference).strip()
+            logger.warning(
+                "RIPPED Show Config has no prompt reference; using packaged approved framework"
+            )
+            return packaged
+        configured = read_google_doc_text(reference).strip()
+        if configured:
+            logger.info("Loaded live 9:16 editorial framework from Google Docs")
+            return configured
+        logger.warning("Live 9:16 framework was blank; using packaged approved framework")
     except Exception as exc:
-        logger.exception("Could not load configured 9:16 editorial framework: %s", exc)
-        return ""
+        logger.warning(
+            "Live 9:16 editorial framework unavailable; using packaged approved "
+            "framework instead: %s",
+            exc,
+        )
+    if not packaged:
+        raise RuntimeError(
+            "Neither the live Google Doc nor the packaged approved 9:16 framework is available"
+        )
+    return packaged
 
 
 def _brand_short_prompt(state: dict[str, Any]) -> str:
