@@ -1123,13 +1123,43 @@ def _ripped_bot_token() -> str:
 
 
 def telegram(method: str, payload: dict[str, Any]) -> dict:
+    """Send through Telegram without allowing a temporary rate limit to corrupt a job."""
     token = _ripped_bot_token()
     if not token:
         raise RuntimeError("Telegram_ripped_bot_token is not configured")
-    response = requests.post(f"https://api.telegram.org/bot{token}/{method}", json=payload, timeout=(10, 60))
-    if response.status_code != 200:
-        raise RuntimeError(f"Telegram {method} failed ({response.status_code}): {response.text[:1000]}")
-    return response.json()
+    last_error = ""
+    for attempt in range(1, 7):
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/{method}",
+            json=payload,
+            timeout=(10, 60),
+        )
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        if response.status_code == 429 or int(data.get("error_code") or 0) == 429:
+            retry_after = max(
+                1, int((data.get("parameters") or {}).get("retry_after") or 1)
+            )
+            last_error = str(data.get("description") or response.text[:1000])
+            logger.warning(
+                "Telegram %s rate limited attempt=%s retry_after=%ss",
+                method,
+                attempt,
+                retry_after,
+            )
+            threading.Event().wait(min(retry_after + 1, 65))
+            continue
+        if response.status_code != 200 or not data.get("ok", False):
+            raise RuntimeError(
+                f"Telegram {method} failed ({response.status_code}): "
+                f"{data.get('description') or response.text[:1000]}"
+            )
+        return data
+    raise RuntimeError(
+        f"Telegram {method} remained rate limited after retries: {last_error}"
+    )
 
 
 def send(chat_id: str, text: str) -> None:
@@ -2538,8 +2568,48 @@ def _process(request_id: str) -> None:
         )
     except Exception as exc:
         logger.exception("Ripped Shorts processing failed request_id=%s", request_id)
-        _save(request_id, "error", {**state, "stage": "error", "error_type": type(exc).__name__, "error": str(exc), "retryable": True})
-        send(chat_id, f"❌ Processing failed\nJob ID: {request_id}\n{str(exc)[:1500]}\n\nSend /retry {request_id} to try again.")
+        # Never replace a durable candidate set with the older pre-result state
+        # merely because Telegram could not deliver all review messages.
+        with _LOCK, _telegram_db() as db:
+            latest_row = db.execute(
+                "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+        latest_state = json.loads(latest_row["state_json"]) if latest_row else state
+        candidates_exist = bool(
+            (latest_state.get("result") or {}).get("segments")
+        )
+        if candidates_exist:
+            latest_state["notification_error"] = str(exc)
+            latest_state["notification_retryable"] = True
+            latest_state["stage"] = "awaiting_review"
+            _save(request_id, "awaiting_review", latest_state)
+            failure_text = (
+                f"⚠️ Candidate review delivery was interrupted\nJob ID: {request_id}\n"
+                f"{str(exc)[:1200]}\n\nYour candidates remain saved. "
+                f"Send /retry {request_id} to resend the review."
+            )
+        else:
+            latest_state.update(
+                {
+                    "stage": "error",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "retryable": True,
+                }
+            )
+            _save(request_id, "error", latest_state)
+            failure_text = (
+                f"❌ Processing failed\nJob ID: {request_id}\n{str(exc)[:1500]}"
+                f"\n\nSend /retry {request_id} to try again."
+            )
+        try:
+            send(chat_id, failure_text)
+        except Exception:
+            logger.exception(
+                "Could not deliver Ripped Shorts processing failure notice request_id=%s",
+                request_id,
+            )
 
 
 
