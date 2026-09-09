@@ -3788,9 +3788,12 @@ async def ripped_telegram_webhook(
     return result
 
 
-def configure_ripped_telegram_webhook() -> None:
-    """Point the dedicated Ripped Shorts bot at this Railway service."""
-    token = next(
+_RIPPED_WEBHOOK_WATCHDOG_STARTED = False
+_RIPPED_WEBHOOK_WATCHDOG_LOCK = threading.Lock()
+
+
+def _ripped_bot_token() -> str:
+    return next(
         (
             os.getenv(name, "").strip()
             for name in (
@@ -3802,41 +3805,127 @@ def configure_ripped_telegram_webhook() -> None:
         ),
         "",
     )
-    # The generic Clip Master token must never be used to claim this webhook.
-    if not token:
-        logger.warning("Ripped Telegram webhook skipped: dedicated Ripped bot token missing")
-        return
+
+
+def _ripped_webhook_url() -> str:
     domain = (
         os.getenv("RIPPED_SHORTS_PUBLIC_URL")
         or os.getenv("RAILWAY_PUBLIC_DOMAIN")
         or ""
     ).strip().rstrip("/")
-    if not token or not domain:
-        logger.warning("Ripped Telegram webhook not configured: bot token or public domain missing")
-        return
-    if not domain.startswith(("http://", "https://")):
+    if domain and not domain.startswith(("http://", "https://")):
         domain = "https://" + domain
-    payload: dict[str, Any] = {
-        "url": domain + "/api/ripped-shorts/telegram/webhook",
-        "allowed_updates": [
-            "message",
-            "edited_message",
-            "channel_post",
-            "edited_channel_post",
-            "callback_query",
-        ],
-        "drop_pending_updates": False,
-    }
-    secret = _ripped_webhook_secret()
-    if secret:
-        payload["secret_token"] = secret
-    try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{token}/setWebhook",
-            json=payload,
-            timeout=(10, 30),
+    return domain + "/api/ripped-shorts/telegram/webhook" if domain else ""
+
+
+def _telegram_api(token: str, method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Call Telegram and reject HTTP-200 responses whose JSON says ok=false."""
+    response = requests.post(
+        f"https://api.telegram.org/bot{token}/{method}",
+        json=payload or {},
+        timeout=(10, 30),
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("ok"):
+        raise RuntimeError(
+            f"Telegram {method} rejected the request: "
+            f"{data.get('error_code', 'unknown')} {data.get('description', data)}"
         )
-        response.raise_for_status()
-        logger.info("Ripped Shorts Telegram webhook configured for %s", payload["url"])
+    return data
+
+
+def _ensure_ripped_telegram_webhook() -> dict[str, Any]:
+    """Verify bot identity and ensure Telegram points it at this service."""
+    token = _ripped_bot_token()
+    target_url = _ripped_webhook_url()
+    if not token:
+        raise RuntimeError("dedicated Ripped Shorts Telegram bot token is missing")
+    if not target_url:
+        raise RuntimeError("Ripped Shorts public URL / Railway public domain is missing")
+
+    me = dict(_telegram_api(token, "getMe").get("result") or {})
+    username = str(me.get("username") or "").strip()
+    if username.lower() != "rippedshortsbot":
+        raise RuntimeError(
+            "The configured dedicated token belongs to "
+            f"@{username or 'unknown'}, not @rippedshortsbot"
+        )
+
+    before = dict(_telegram_api(token, "getWebhookInfo").get("result") or {})
+    current_url = str(before.get("url") or "")
+    if current_url != target_url:
+        payload: dict[str, Any] = {
+            "url": target_url,
+            "allowed_updates": [
+                "message",
+                "edited_message",
+                "channel_post",
+                "edited_channel_post",
+                "callback_query",
+            ],
+            "drop_pending_updates": False,
+        }
+        secret = _ripped_webhook_secret()
+        if secret:
+            payload["secret_token"] = secret
+        _telegram_api(token, "setWebhook", payload)
+
+    info = dict(_telegram_api(token, "getWebhookInfo").get("result") or {})
+    registered_url = str(info.get("url") or "")
+    if registered_url != target_url:
+        raise RuntimeError(
+            f"Telegram reports webhook {registered_url!r}; expected {target_url!r}"
+        )
+
+    last_error = str(info.get("last_error_message") or "").strip()
+    logger.info(
+        "Ripped Shorts Telegram webhook verified bot=@%s url=%s "
+        "pending_updates=%s last_error=%s",
+        username,
+        registered_url,
+        info.get("pending_update_count", 0),
+        last_error or "none",
+    )
+    if last_error:
+        logger.warning(
+            "Telegram reports a delivery error for @%s: %s",
+            username,
+            last_error,
+        )
+    return info
+
+
+def _ripped_webhook_watchdog() -> None:
+    interval = max(
+        60, int(os.getenv("RIPPED_TELEGRAM_WEBHOOK_CHECK_SECONDS", "300"))
+    )
+    while True:
+        threading.Event().wait(interval)
+        try:
+            _ensure_ripped_telegram_webhook()
+        except Exception:
+            logger.exception(
+                "Ripped Shorts Telegram webhook watchdog could not verify or repair ownership"
+            )
+
+
+def configure_ripped_telegram_webhook() -> None:
+    """Verify the dedicated bot webhook and keep its ownership from drifting."""
+    global _RIPPED_WEBHOOK_WATCHDOG_STARTED
+    try:
+        _ensure_ripped_telegram_webhook()
     except Exception:
         logger.exception("Could not configure Ripped Shorts Telegram webhook")
+        return
+
+    with _RIPPED_WEBHOOK_WATCHDOG_LOCK:
+        if _RIPPED_WEBHOOK_WATCHDOG_STARTED:
+            return
+        thread = threading.Thread(
+            target=_ripped_webhook_watchdog,
+            name="ripped-telegram-webhook-watchdog",
+            daemon=True,
+        )
+        thread.start()
+        _RIPPED_WEBHOOK_WATCHDOG_STARTED = True
