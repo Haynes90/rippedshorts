@@ -1,8 +1,12 @@
+FROM denoland/deno:bin AS deno
+
 # syntax=docker/dockerfile:1
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
+
+COPY --from=deno /deno /usr/local/bin/deno
 
 WORKDIR /app
 
