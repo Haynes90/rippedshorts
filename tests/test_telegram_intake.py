@@ -128,6 +128,13 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn('(?:@rippedshortsbot)?', SOURCE)
         self.assertIn('"retry_source_missing"', SOURCE)
 
+    def test_webhook_monitor_distinguishes_stale_errors_and_group_privacy(self):
+        self.assertIn('"last_error_date"', SOURCE)
+        self.assertIn('"last_error_age_seconds=%s"', SOURCE)
+        self.assertIn('"can_read_all_group_messages"', SOURCE)
+        self.assertIn('"getChatMember"', SOURCE)
+        self.assertIn("cannot receive plain group messages", SOURCE)
+
     def test_processing_failures_are_written_to_railway_logs(self):
         process_source = ast.get_source_segment(
             SOURCE,
