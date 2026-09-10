@@ -54,6 +54,8 @@ RIPPED_SHORTS_RENDER_WORKERS = max(
     1, int(os.getenv("RIPPED_SHORTS_RENDER_WORKERS", "3"))
 )
 RENDER_EXECUTOR = ThreadPoolExecutor(max_workers=RIPPED_SHORTS_RENDER_WORKERS)
+STATUS_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+_STATUS_CARD_LAST: dict[str, float] = {}
 RIPPED_LOG_SHEET_ID = (
     os.getenv("RIPPED_SHORTS_LOG_SHEET_ID")
     or os.getenv("PODCAST_SHEET_ID")
@@ -1172,29 +1174,114 @@ def send(chat_id: str, text: str) -> None:
     telegram("sendMessage", {"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
 
 
+def _status_card_text(request_id: str, status: str, state: dict[str, Any]) -> str:
+    reviews = dict(state.get("candidate_reviews") or {})
+    topics = dict(state.get("topic_reviews") or {})
+    short_total = len((state.get("result") or {}).get("segments") or [])
+    topic_total = len((state.get("topic_result") or {}).get("segments") or [])
+    rendered = sum(
+        str(item.get("status") or "") == "rendered"
+        for item in [*reviews.values(), *topics.values()]
+    )
+    active = sum(
+        str(item.get("status") or "") in {"queued", "rendering"}
+        for item in [*reviews.values(), *topics.values()]
+    )
+    error = str(state.get("error") or state.get("notification_error") or "")
+    return (
+        f"📍 Ripped Shorts Job Status\n"
+        f"Job: {request_id}\n"
+        f"Brand: {state.get('show_id') or 'pending'}\n"
+        f"Stage: {state.get('stage') or status}\n"
+        f"Shorts: {short_total} candidates\n"
+        f"16:9: {topic_total} candidates\n"
+        f"Renders: {rendered} complete, {active} active\n"
+        f"Next: {state.get('next_action') or 'continue'}"
+        + (
+            f"\nError: {classify_error(error)} — {error[:500]}"
+            if error
+            else ""
+        )
+    )
+
+
+def _update_status_card(
+    request_id: str, status: str, state: dict[str, Any], chat_id: str
+) -> None:
+    if not chat_id:
+        return
+    try:
+        text = _status_card_text(request_id, status, state)
+        message_id = state.get("status_message_id")
+        if message_id:
+            try:
+                telegram(
+                    "editMessageText",
+                    {
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "text": text,
+                        "disable_web_page_preview": True,
+                    },
+                )
+                return
+            except Exception as exc:
+                if "message is not modified" in str(exc).lower():
+                    return
+                logger.warning(
+                    "Status card edit failed; creating replacement job_id=%s",
+                    request_id,
+                )
+        result = telegram(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": True,
+            },
+        )
+        new_message_id = (result.get("result") or {}).get("message_id")
+        if new_message_id:
+            state["status_message_id"] = new_message_id
+            with _LOCK, _telegram_db() as db:
+                db.execute(
+                    "UPDATE telegram_requests SET state_json=?, updated_at=? "
+                    "WHERE request_id=?",
+                    (json.dumps(state), now(), request_id),
+                )
+    except Exception:
+        logger.exception("JOB_STATUS_CARD_FAILED job_id=%s", request_id)
+
+
 def _save(request_id: str, status: str, state: dict[str, Any]) -> None:
-    saved_at = now()
-    chat_id = ""
-    user_id = ""
+    state["heartbeat_at"] = now()
+    if status != "error":
+        state["last_successful_stage"] = str(state.get("stage") or status)
     with _LOCK, _telegram_db() as db:
         db.execute(
             "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
-            (status, json.dumps(state), saved_at, request_id),
+            (status, json.dumps(state), now(), request_id),
         )
-        identity = db.execute(
+        row = db.execute(
             "SELECT chat_id, user_id FROM telegram_requests WHERE request_id=?",
             (request_id,),
         ).fetchone()
-        if identity:
-            chat_id = str(identity["chat_id"])
-            user_id = str(identity["user_id"])
+    chat_id = str(row["chat_id"]) if row else ""
+    user_id = str(row["user_id"]) if row else ""
     upsert_job(
         RIPPED_LOG_SHEET_ID,
         request_id,
         status,
         state,
+        chat_id=chat_id,
+        user_id=user_id,
+    )
+    STATUS_EXECUTOR.submit(
+        _update_status_card,
+        request_id,
+        status,
+        dict(state),
         chat_id,
-        user_id,
     )
 
 
