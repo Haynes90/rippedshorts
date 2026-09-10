@@ -1656,43 +1656,78 @@ def _safe_log_candidate(*args, **kwargs) -> None:
 def _send_candidates(
     chat_id: str, request_id: str, result: dict, *, start_index: int = 0
 ) -> None:
+    """Send compact review pages instead of one Telegram message per candidate."""
     clips = result.get("segments", [])
     review_count = max(0, len(clips) - start_index)
-    send(
-        chat_id,
-        f"✅ Analysis complete\nJob ID: {request_id}\n"
-        f"New shorts for review: {review_count}\n\n"
-        "Approve only the shorts you want created.",
+    page_size = max(
+        2, min(5, int(os.getenv("TELEGRAM_CANDIDATES_PER_PAGE", "4")))
     )
-    for zero_index in range(start_index, len(clips)):
-        clip = clips[zero_index]
-        short_number = int(clip.get("candidate_number") or zero_index + 1)
-        transcript = str(clip.get("transcript", "")).strip()
-        if len(transcript) > 2600:
-            transcript = transcript[:2597] + "..."
-        text = (
-            f"Short {short_number}\n\n"
-            f"Time: {_timecode(float(clip['start']))}–{_timecode(float(clip['end']))}\n"
-            f"Duration: {round(float(clip['duration']))} seconds\n"
-            f"Category: {clip.get('category', 'social clip')}\n"
-            f"Score: {clip.get('score', '')}\n\n"
-            f"Why selected:\n{clip.get('reason', '')}\n\n"
-            f"Transcript:\n{transcript}"
+    selected = list(range(start_index, len(clips)))
+    if not selected:
+        send(
+            chat_id,
+            f"✅ Analysis complete\nJob ID: {request_id}\nNo new Shorts need review.",
         )
-        telegram("sendMessage", {
-            "chat_id": chat_id,
-            "text": text,
-            "disable_web_page_preview": True,
-            "reply_markup": {"inline_keyboard": [
+        _send_short_confirmation(chat_id, request_id)
+        return
+
+    total_pages = (len(selected) + page_size - 1) // page_size
+    for page_number, offset in enumerate(range(0, len(selected), page_size), 1):
+        indexes = selected[offset : offset + page_size]
+        sections = [
+            f"✅ Shorts review • Page {page_number}/{total_pages}\n"
+            f"Job ID: {request_id}\n"
+            f"{review_count} new candidate(s). Approve only what you want rendered."
+        ]
+        buttons = []
+        for zero_index in indexes:
+            clip = clips[zero_index]
+            short_number = int(
+                clip.get("candidate_number") or zero_index + 1
+            )
+            transcript = str(clip.get("transcript", "")).strip()
+            if len(transcript) > 560:
+                transcript = transcript[:557] + "..."
+            sections.append(
+                f"\nSHORT {short_number}\n"
+                f"{_timecode(float(clip['start']))}–"
+                f"{_timecode(float(clip['end']))} • "
+                f"{round(float(clip['duration']))}s • "
+                f"{clip.get('category', 'social clip')}\n"
+                f"Why: {str(clip.get('reason', ''))[:260]}\n"
+                f"{transcript}"
+            )
+            buttons.append(
                 [
-                    {"text": "✅ Approve & Render", "callback_data": f"rs:approve:{request_id}:{zero_index}"},
-                    {"text": "❌ Reject", "callback_data": f"rs:reject:{request_id}:{zero_index}"},
-                ],
-                [
-                    {"text": "✏️ Change / Add / Options", "callback_data": f"rs:options:{request_id}"}
-                ],
-            ]},
-        })
+                    {
+                        "text": f"✅ {short_number}",
+                        "callback_data": (
+                            f"rs:approve:{request_id}:{zero_index}"
+                        ),
+                    },
+                    {
+                        "text": f"❌ {short_number}",
+                        "callback_data": (
+                            f"rs:reject:{request_id}:{zero_index}"
+                        ),
+                    },
+                ]
+            )
+        buttons.append(
+            [{
+                "text": "✏️ Change / Add / Options",
+                "callback_data": f"rs:options:{request_id}",
+            }]
+        )
+        telegram(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": "\n".join(sections)[:4000],
+                "disable_web_page_preview": True,
+                "reply_markup": {"inline_keyboard": buttons},
+            },
+        )
     _send_short_confirmation(chat_id, request_id)
 
 
