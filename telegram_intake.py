@@ -3304,6 +3304,79 @@ def _accept_update(
             )
             send(chat_id, f"Short {index + 1} rejected.")
         return {"status": verb, "request_id": request_id, "short_index": index}
+    resume_match = re.fullmatch(
+        r"/resume(?:@rippedshortsbot)?(?:\s+latest)?", text, re.I
+    )
+    if resume_match:
+        try:
+            durable = latest_incomplete(
+                RIPPED_LOG_SHEET_ID,
+                chat_id=chat_id,
+                user_id=user_id,
+            )
+        except Exception as exc:
+            logger.exception("Could not read durable Workflow Jobs ledger")
+            send(chat_id, f"❌ Resume lookup failed: {str(exc)[:800]}")
+            return {"status": "resume_lookup_failed"}
+        if not durable:
+            send(chat_id, "There is no unfinished Ripped Shorts job to resume.")
+            return {"status": "no_unfinished_job"}
+        request_id = str(durable.get("job_id") or "")
+        with _LOCK, _telegram_db() as db:
+            existing = db.execute(
+                "SELECT request_id FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+        if not existing:
+            source_url = str(durable.get("source_url") or "").strip()
+            try:
+                parsed = parse_request(source_url)
+            except ValueError:
+                send(
+                    chat_id,
+                    "⚠️ The latest durable job has no usable source URL. "
+                    "Paste the original YouTube URL again.",
+                )
+                return {
+                    "status": "resume_source_missing",
+                    "request_id": request_id,
+                }
+            recorded_mode = str(durable.get("mode") or "").strip()
+            if recorded_mode in {"shorts", "topics", "both"}:
+                parsed["mode"] = recorded_mode
+            stamp = now()
+            recovered_state = {
+                "stage": "accepted",
+                "parsed": parsed,
+                "show_id": str(durable.get("show_code") or ""),
+                "attempt_count": int(durable.get("attempt_count") or 0) + 1,
+                "resumed_from_workflow_jobs_at": stamp,
+            }
+            with _LOCK, _telegram_db() as db:
+                db.execute(
+                    "INSERT INTO telegram_requests VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        request_id,
+                        str(update.get("update_id") or f"resume-{uuid.uuid4()}"),
+                        chat_id,
+                        user_id,
+                        "accepted",
+                        parsed["mode"],
+                        parsed["source_kind"],
+                        parsed["source_value"],
+                        json.dumps(recovered_state),
+                        stamp,
+                        stamp,
+                    ),
+                )
+            _save(request_id, "accepted", recovered_state)
+        send(
+            chat_id,
+            f"▶️ Resuming the latest unfinished job\nJob ID: {request_id}",
+        )
+        background_tasks.add_task(_process, request_id)
+        return {"status": "resume_accepted", "request_id": request_id}
+
     retry_match = re.fullmatch(
         r"/retry(?:@rippedshortsbot)?\s+([A-Za-z0-9-]+)", text, re.I
     )
