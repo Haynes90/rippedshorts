@@ -4384,6 +4384,22 @@ def configure_ripped_telegram_webhook() -> None:
         logger.exception("Could not configure Ripped Shorts Telegram webhook")
         return
 
+    readiness = _readiness()
+    logger.info(
+        "RIPPED_SHORTS_READINESS ready=%s checks=%s",
+        readiness.get("ready"),
+        json.dumps(readiness.get("checks") or {}, sort_keys=True),
+    )
+    if not readiness.get("ready"):
+        logger.warning(
+            "RIPPED_SHORTS_NOT_READY failed_checks=%s",
+            [
+                name
+                for name, passed in (readiness.get("checks") or {}).items()
+                if not passed
+            ],
+        )
+
     with _RIPPED_WEBHOOK_WATCHDOG_LOCK:
         if _RIPPED_WEBHOOK_WATCHDOG_STARTED:
             return
