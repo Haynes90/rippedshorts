@@ -1173,11 +1173,29 @@ def send(chat_id: str, text: str) -> None:
 
 
 def _save(request_id: str, status: str, state: dict[str, Any]) -> None:
+    saved_at = now()
+    chat_id = ""
+    user_id = ""
     with _LOCK, _telegram_db() as db:
         db.execute(
             "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
-            (status, json.dumps(state), now(), request_id),
+            (status, json.dumps(state), saved_at, request_id),
         )
+        identity = db.execute(
+            "SELECT chat_id, user_id FROM telegram_requests WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+        if identity:
+            chat_id = str(identity["chat_id"])
+            user_id = str(identity["user_id"])
+    upsert_job(
+        RIPPED_LOG_SHEET_ID,
+        request_id,
+        status,
+        state,
+        chat_id,
+        user_id,
+    )
 
 
 def _reusable_youtube_job(video_id: str) -> dict | None:
