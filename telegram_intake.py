@@ -1211,6 +1211,17 @@ def _update_status_card(
     if not chat_id:
         return
     try:
+        # Status updates are queued. Always refresh the latest row so an older
+        # queued snapshot cannot overwrite newer workflow state or create a
+        # second card before the first card's message ID is persisted.
+        with _LOCK, _telegram_db() as db:
+            row = db.execute(
+                "SELECT status, state_json FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+        if row:
+            status = str(row["status"] or status)
+            state = json.loads(row["state_json"])
         text = _status_card_text(request_id, status, state)
         message_id = state.get("status_message_id")
         if message_id:
@@ -1242,13 +1253,21 @@ def _update_status_card(
         )
         new_message_id = (result.get("result") or {}).get("message_id")
         if new_message_id:
-            state["status_message_id"] = new_message_id
+            # Merge only the Telegram message ID into the newest saved state.
+            # Never replace the row with the stale state used to render a card.
             with _LOCK, _telegram_db() as db:
-                db.execute(
-                    "UPDATE telegram_requests SET state_json=?, updated_at=? "
-                    "WHERE request_id=?",
-                    (json.dumps(state), now(), request_id),
-                )
+                latest = db.execute(
+                    "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                    (request_id,),
+                ).fetchone()
+                if latest:
+                    latest_state = json.loads(latest["state_json"])
+                    latest_state["status_message_id"] = new_message_id
+                    db.execute(
+                        "UPDATE telegram_requests SET state_json=?, updated_at=? "
+                        "WHERE request_id=?",
+                        (json.dumps(latest_state), now(), request_id),
+                    )
     except Exception:
         logger.exception("JOB_STATUS_CARD_FAILED job_id=%s", request_id)
 
