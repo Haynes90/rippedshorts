@@ -3893,6 +3893,56 @@ def ripped_shorts_runtime_info() -> dict:
     }
 
 
+def _readiness() -> dict[str, Any]:
+    return readiness_snapshot(
+        DB_PATH,
+        _ripped_webhook_url(),
+        bool(_ripped_bot_token()),
+        bool(
+            os.getenv("TELEGRAM_CHAT_ID")
+            or os.getenv("TELEGRAM_GROUP_CHAT_ID")
+            or os.getenv("Telegram_Group_Chat_ID")
+        ),
+        str(os.getenv("SCHEDULE_MASTER_INTERNAL_URL") or "").strip(),
+    )
+
+
+@router.get("/api/ripped-shorts/readiness")
+def ripped_shorts_readiness() -> dict[str, Any]:
+    return _readiness()
+
+
+@router.get("/api/ripped-shorts/smoke-test")
+def ripped_shorts_smoke_test() -> dict[str, Any]:
+    snapshot = _readiness()
+    telegram_check: dict[str, Any] = {
+        "bot_identity": False,
+        "webhook_owned": False,
+    }
+    try:
+        token = _ripped_bot_token()
+        me = dict(_telegram_api(token, "getMe").get("result") or {})
+        info = dict(_telegram_api(token, "getWebhookInfo").get("result") or {})
+        telegram_check = {
+            "bot_identity": str(me.get("username") or "").lower()
+            == "rippedshortsbot",
+            "webhook_owned": str(info.get("url") or "")
+            == _ripped_webhook_url(),
+            "pending_updates": int(info.get("pending_update_count") or 0),
+            "group_read_all": bool(me.get("can_read_all_group_messages")),
+        }
+    except Exception as exc:
+        telegram_check["error_class"] = classify_error(exc)
+        telegram_check["error"] = str(exc)[:800]
+    snapshot["telegram"] = telegram_check
+    snapshot["ready"] = bool(
+        snapshot.get("ready")
+        and telegram_check.get("bot_identity")
+        and telegram_check.get("webhook_owned")
+    )
+    return snapshot
+
+
 @router.post("/api/telegram/webhook")
 async def telegram_gateway(request: Request, x_telegram_bot_api_secret_token: str | None = Header(None)):
     """Clip Master owns Telegram and forwards only Ripped Shorts messages."""
