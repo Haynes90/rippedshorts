@@ -316,6 +316,20 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("latest_state", SOURCE)
         self.assertIn("render_failed", SOURCE)
 
+    def test_status_card_merges_into_latest_state(self):
+        status_source = ast.get_source_segment(
+            SOURCE,
+            next(
+                node
+                for node in TREE.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "_update_status_card"
+            ),
+        )
+        self.assertIn("SELECT status, state_json", status_source)
+        self.assertIn('latest_state["status_message_id"]', status_source)
+        self.assertNotIn("(json.dumps(state), now(), request_id)", status_source)
+
 
 if __name__ == "__main__":
     unittest.main()
