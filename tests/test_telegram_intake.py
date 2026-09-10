@@ -135,6 +135,23 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn('"getChatMember"', SOURCE)
         self.assertIn("cannot receive plain group messages", SOURCE)
 
+    def test_reliability_features_are_integrated(self):
+        reliability = (
+            Path(__file__).resolve().parents[1] / "workflow_reliability.py"
+        ).read_text()
+        self.assertIn("Workflow Jobs", reliability)
+        self.assertIn("def upsert_job", reliability)
+        self.assertIn("def latest_incomplete", reliability)
+        self.assertIn("def classify_error", reliability)
+        self.assertIn("def readiness_snapshot", reliability)
+        self.assertIn("/resume(?:@rippedshortsbot)?", SOURCE)
+        self.assertIn("def _update_status_card", SOURCE)
+        self.assertIn("editMessageText", SOURCE)
+        self.assertIn("TELEGRAM_CANDIDATES_PER_PAGE", SOURCE)
+        self.assertIn("/api/ripped-shorts/readiness", SOURCE)
+        self.assertIn("/api/ripped-shorts/smoke-test", SOURCE)
+        self.assertIn("RIPPED_SHORTS_READINESS", SOURCE)
+
     def test_processing_failures_are_written_to_railway_logs(self):
         process_source = ast.get_source_segment(
             SOURCE,
