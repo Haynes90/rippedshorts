@@ -3922,7 +3922,11 @@ def _readiness() -> dict[str, Any]:
             or os.getenv("TELEGRAM_GROUP_CHAT_ID")
             or os.getenv("Telegram_Group_Chat_ID")
         ),
-        str(os.getenv("SCHEDULE_MASTER_INTERNAL_URL") or "").strip(),
+        str(
+            os.getenv("SCHEDULE_MASTER_INTERNAL_URL")
+            or os.getenv("SCHEDULE_MASTER_URL")
+            or ""
+        ).strip(),
     )
 
 
