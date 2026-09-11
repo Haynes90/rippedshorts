@@ -229,6 +229,7 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("def _handoff_shorts_to_schedule_master", SOURCE)
         self.assertIn('f"{target}/schedule/intake"', SOURCE)
         self.assertIn("SCHEDULE_MASTER_INTERNAL_URL", SOURCE)
+        self.assertIn("SCHEDULE_MASTER_URL", SOURCE)
         self.assertIn('"shorts_status": "accepted"', SOURCE)
         self.assertIn("Schedule Master received", SOURCE)
 
