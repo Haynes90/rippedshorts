@@ -789,6 +789,16 @@ def _build_vertical_filter(
 ) -> tuple[str, bool]:
     """Choose stable single-person framing or a two-person stacked composition."""
     width, height = _probe_video_dimensions(video_path)
+    if os.getenv("ACTIVE_SPEAKER_LAYOUT_ENABLED", "true").lower() not in {
+        "0", "false", "no", "off"
+    }:
+        from active_speaker import build_active_speaker_filter
+
+        active_filter = build_active_speaker_filter(
+            video_path, start, duration, width, height, _load_face_cascade
+        )
+        if active_filter:
+            return active_filter, True
     dual = _estimate_dual_participant_tracks(video_path, start, duration)
     if dual is not None and os.getenv("DUAL_SPEAKER_STACKED_ENABLED", "true").lower() not in {
         "0", "false", "no", "off"
