@@ -4416,7 +4416,7 @@ def _resume_stale_jobs() -> int:
     resumed = 0
     with _LOCK, _telegram_db() as db:
         rows = db.execute(
-            "SELECT request_id,status,state_json,updated_at FROM telegram_requests"
+            "SELECT request_id,status,state_json,updated_at,chat_id FROM telegram_requests"
         ).fetchall()
     for row in rows:
         try:
@@ -4440,7 +4440,7 @@ def _resume_stale_jobs() -> int:
                 RENDER_EXECUTOR.submit(
                     _handoff_shorts_to_schedule_master,
                     row["request_id"],
-                    str(state.get("chat_id") or ""),
+                    str(row["chat_id"] or ""),
                 )
             else:
                 RENDER_EXECUTOR.submit(_process, row["request_id"])
