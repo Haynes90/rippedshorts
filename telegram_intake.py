@@ -816,7 +816,7 @@ def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> 
     )
 
 
-@durable_job("schedule_handoff")
+@durable_job("schedule_handoff", idempotent=True)
 def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
     """Send all final rendered 9:16 and 16:9 selections downstream once."""
     target = (
