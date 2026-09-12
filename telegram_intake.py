@@ -9,7 +9,7 @@ import threading
 import uuid
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -4384,6 +4384,76 @@ def _ensure_ripped_telegram_webhook() -> dict[str, Any]:
     return info
 
 
+def _purge_expired_local_artifacts() -> int:
+    """Keep rerun material for 48 hours, then reclaim only local cache files."""
+    retention_hours = max(1, int(os.getenv("LOCAL_ARTIFACT_RETENTION_HOURS", "48")))
+    cutoff = datetime.now(timezone.utc).timestamp() - retention_hours * 3600
+    data_dir = Path(os.getenv("DATA_DIR", str(DB_PATH.parent)))
+    removed = 0
+    if not data_dir.exists():
+        return 0
+    protected = {DB_PATH.resolve()}
+    for path in sorted(data_dir.rglob("*"), reverse=True):
+        try:
+            if path.is_file() and path.resolve() not in protected:
+                if path.name in {DB_PATH.name + "-wal", DB_PATH.name + "-shm"}:
+                    continue
+                if path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+            elif path.is_dir() and path != data_dir and not any(path.iterdir()):
+                path.rmdir()
+        except OSError:
+            logger.warning("Could not purge expired artifact path=%s", path)
+    if removed:
+        logger.info("RIPPED_ARTIFACT_CLEANUP removed=%s retention_hours=%s", removed, retention_hours)
+    return removed
+
+
+def _resume_stale_jobs() -> int:
+    """Lease-recover machine-owned jobs while leaving human review stages alone."""
+    now_value = datetime.now(timezone.utc)
+    resumed = 0
+    with _LOCK, _telegram_db() as db:
+        rows = db.execute(
+            "SELECT request_id,status,state_json,updated_at FROM telegram_requests"
+        ).fetchall()
+    for row in rows:
+        try:
+            state = json.loads(row["state_json"])
+            stage = str(state.get("stage") or row["status"] or "").lower()
+            if any(word in stage for word in ("review", "awaiting", "scheduled", "complete")):
+                continue
+            updated = datetime.fromisoformat(str(row["updated_at"]).replace("Z", "+00:00"))
+            if not updated.tzinfo:
+                updated = updated.replace(tzinfo=timezone.utc)
+            stale_minutes = 30 if "render" in stage else (5 if "handoff" in stage else 15)
+            if now_value - updated.astimezone(timezone.utc) < timedelta(minutes=stale_minutes):
+                continue
+            attempts = int(state.get("watchdog_resume_count") or 0)
+            if attempts >= 3:
+                continue
+            state["watchdog_resume_count"] = attempts + 1
+            state["watchdog_resumed_at"] = now()
+            _save(row["request_id"], "retrying", state)
+            if "handoff" in stage:
+                RENDER_EXECUTOR.submit(
+                    _handoff_shorts_to_schedule_master,
+                    row["request_id"],
+                    str(state.get("chat_id") or ""),
+                )
+            else:
+                RENDER_EXECUTOR.submit(_process, row["request_id"])
+            resumed += 1
+            logger.warning(
+                "RIPPED_JOB_WATCHDOG resumed request_id=%s stage=%s attempt=%s",
+                row["request_id"], stage, attempts + 1,
+            )
+        except Exception:
+            logger.exception("RIPPED_JOB_WATCHDOG could not inspect request_id=%s", row["request_id"])
+    return resumed
+
+
 def _ripped_webhook_watchdog() -> None:
     interval = max(
         60, int(os.getenv("RIPPED_TELEGRAM_WEBHOOK_CHECK_SECONDS", "300"))
@@ -4392,6 +4462,8 @@ def _ripped_webhook_watchdog() -> None:
         threading.Event().wait(interval)
         try:
             _ensure_ripped_telegram_webhook()
+            _purge_expired_local_artifacts()
+            _resume_stale_jobs()
         except Exception:
             logger.exception(
                 "Ripped Shorts Telegram webhook watchdog could not verify or repair ownership"
