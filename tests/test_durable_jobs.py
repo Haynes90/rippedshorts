@@ -5,6 +5,8 @@ from pathlib import Path
 
 import durable_jobs
 
+INTAKE = Path("telegram_intake.py").read_text(encoding="utf-8")
+
 
 class DurableJobsTests(unittest.TestCase):
     def setUp(self):
@@ -48,6 +50,14 @@ class DurableJobsTests(unittest.TestCase):
             }
         self.assertIn("durable_job_leases", names)
         self.assertIn("durable_outbox", names)
+
+    def test_handoff_completes_only_after_downstream_ack(self):
+        self.assertIn(
+            "def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:",
+            INTAKE,
+        )
+        self.assertIn("return True", INTAKE)
+        self.assertIn("complete=bool(idempotent and result is True)", Path("durable_jobs.py").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
