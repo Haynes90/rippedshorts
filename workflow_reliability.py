@@ -18,7 +18,7 @@ HEADERS = [
     "job_id", "source_url", "video_id", "show_code", "mode",
     "current_owner", "current_stage", "last_successful_stage", "next_action",
     "status", "attempt_count", "heartbeat_at", "error_class",
-    "error_message", "chat_id", "user_id", "updated_at",
+    "error_message", "chat_id", "user_id", "updated_at", "standard_state",
 ]
 _LOCK = threading.RLock()
 _READY_STAGES = {
@@ -27,6 +27,35 @@ _READY_STAGES = {
     "schedule_handoff", "scheduled", "publishing", "published",
 }
 
+
+
+def standard_state(stage: str, status: str) -> str:
+    value = f"{stage} {status}".lower()
+    if any(x in value for x in ("permanent_failure", "cancelled")):
+        return "PERMANENT_FAILURE"
+    if any(x in value for x in ("configuration_blocked", "auth")):
+        return "CONFIGURATION_BLOCKED"
+    if any(x in value for x in ("retry", "stale")):
+        return "RETRY_WAIT"
+    if any(x in value for x in ("published", "complete")):
+        return "PUBLISHED"
+    if "publishing" in value:
+        return "PUBLISHING"
+    if any(x in value for x in ("scheduled", "schedule_handoff")):
+        return "SCHEDULED" if "scheduled" in value else "READY_TO_SCHEDULE"
+    if any(x in value for x in ("copy_review", "caption")):
+        return "AWAITING_COPY_APPROVAL"
+    if any(x in value for x in ("render", "processing_16_9")):
+        return "RENDERING"
+    if any(x in value for x in ("asset", "files_ready")):
+        return "ASSETS_READY"
+    if any(x in value for x in ("review", "awaiting")):
+        return "AWAITING_CONTENT_APPROVAL"
+    if "transcript" in value:
+        return "TRANSCRIPT_READY"
+    if any(x in value for x in ("source_ready", "downloaded")):
+        return "SOURCE_READY"
+    return "ACCEPTED"
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -95,7 +124,7 @@ def _ensure_tab(sheets: Any, spreadsheet_id: str) -> None:
         ).execute()
     values = sheets.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range=f"'{WORKFLOW_JOBS_TAB}'!A1:Q1",
+        range=f"'{WORKFLOW_JOBS_TAB}'!A1:R1",
     ).execute().get("values", [])
     if not values:
         sheets.spreadsheets().values().update(
@@ -129,6 +158,7 @@ def upsert_job(spreadsheet_id: str, request_id: str, status: str, state: dict[st
         chat_id,
         user_id,
         utc_now(),
+        standard_state(stage, status),
     ]
     try:
         with _LOCK:
@@ -136,7 +166,7 @@ def upsert_job(spreadsheet_id: str, request_id: str, status: str, state: dict[st
             _ensure_tab(sheets, spreadsheet_id)
             result = sheets.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id,
-                range=f"'{WORKFLOW_JOBS_TAB}'!A:Q",
+                range=f"'{WORKFLOW_JOBS_TAB}'!A:R",
             ).execute()
             rows = result.get("values", [])
             target = next(
@@ -147,7 +177,7 @@ def upsert_job(spreadsheet_id: str, request_id: str, status: str, state: dict[st
             if target:
                 sheets.spreadsheets().values().update(
                     spreadsheetId=spreadsheet_id,
-                    range=f"'{WORKFLOW_JOBS_TAB}'!A{target}:Q{target}",
+                    range=f"'{WORKFLOW_JOBS_TAB}'!A{target}:R{target}",
                     valueInputOption="RAW",
                     body={"values": [row]},
                 ).execute()
@@ -172,14 +202,14 @@ def latest_incomplete(spreadsheet_id: str, chat_id: str = "", user_id: str = "")
     ).execute().get("values", [])
     records = []
     for values in rows[1:]:
-        padded = list(values) + [""] * (17 - len(values))
+        padded = list(values) + [""] * (18 - len(values))
         if padded[9].lower() in {"published", "complete", "cancelled"}:
             continue
         if chat_id and padded[14] and padded[14] != chat_id:
             continue
         if user_id and padded[15] and padded[15] != user_id:
             continue
-        records.append(dict(zip(HEADERS, padded[:17])))
+        records.append(dict(zip(HEADERS, padded[:18])))
     return records[-1] if records else None
 
 
