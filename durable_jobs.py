@@ -100,9 +100,9 @@ def claim(db_path: Path, job_id: str, action: str, lease_seconds: int = LEASE_SE
     return True
 
 
-def finish(db_path: Path, job_id: str, action: str, error: str = "") -> None:
+def finish(db_path: Path, job_id: str, action: str, error: str = "", *, complete: bool = False) -> None:
     now = _utc_now().isoformat()
-    state = "RETRY_WAIT" if error else "COMPLETE"
+    state = "RETRY_WAIT" if error else ("COMPLETE" if complete else "RELEASED")
     with _connect(db_path) as db:
         db.execute(
             "UPDATE durable_job_leases SET state=?, lease_until=?, last_error=?, updated_at=? "
@@ -111,7 +111,7 @@ def finish(db_path: Path, job_id: str, action: str, error: str = "") -> None:
         )
 
 
-def durable_job(action: str):
+def durable_job(action: str, *, idempotent: bool = False):
     """Decorate a function whose first argument is its stable request/job ID."""
     def decorate(function):
         @functools.wraps(function)
@@ -127,7 +127,7 @@ def durable_job(action: str):
             except Exception as exc:
                 finish(path, str(job_id), action, f"{type(exc).__name__}: {exc}")
                 raise
-            finish(path, str(job_id), action)
+            finish(path, str(job_id), action, complete=idempotent)
             return result
         return wrapped
     return decorate
