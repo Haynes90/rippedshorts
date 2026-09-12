@@ -697,6 +697,109 @@ def _stepped_crop_expression(
     return expression
 
 
+
+def _estimate_dual_participant_tracks(
+    video_path: Path, start: float, duration: float
+) -> Optional[tuple[float, float]]:
+    """Return persistent left/right participant centers for split-screen sources."""
+    import cv2
+    from statistics import median
+
+    cap = cv2.VideoCapture(str(video_path))
+    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    sample_seconds = max(0.5, float(os.getenv("DUAL_TRACK_SAMPLE_SECONDS", "1.0")))
+    frame_step = max(1, int(round(fps * sample_seconds)))
+    total_frames = max(1, int(round(duration * fps)))
+    cascade = _load_face_cascade()
+    if cascade is None:
+        cap.release()
+        return None
+
+    left_centers: list[float] = []
+    right_centers: list[float] = []
+    sampled = 0
+    frame_number = 0
+    while frame_number <= total_frames:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(round(start * fps)) + frame_number)
+        ok, frame = cap.read()
+        if not ok:
+            break
+        sampled += 1
+        scale = min(1.0, 720.0 / max(frame.shape[:2]))
+        analysis = cv2.resize(frame, None, fx=scale, fy=scale) if scale < 1 else frame
+        gray = cv2.cvtColor(analysis, cv2.COLOR_BGR2GRAY)
+        faces = list(cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)
+        ))
+        # Prefer prominent faces and require meaningful horizontal separation.
+        faces.sort(key=lambda box: box[2] * box[3], reverse=True)
+        pair = None
+        for first_index, first in enumerate(faces[:4]):
+            for second in faces[first_index + 1:4]:
+                first_center = (first[0] + first[2] / 2) / gray.shape[1]
+                second_center = (second[0] + second[2] / 2) / gray.shape[1]
+                if abs(first_center - second_center) >= 0.22:
+                    pair = tuple(sorted((first_center, second_center)))
+                    break
+            if pair:
+                break
+        if pair:
+            left_centers.append(pair[0])
+            right_centers.append(pair[1])
+        frame_number += frame_step
+    cap.release()
+
+    required_fraction = min(
+        0.9, max(0.25, float(os.getenv("DUAL_TRACK_MIN_FRACTION", "0.50")))
+    )
+    if sampled < 2 or len(left_centers) / sampled < required_fraction:
+        return None
+    left = float(median(left_centers))
+    right = float(median(right_centers))
+    if right - left < 0.22:
+        return None
+    return left, right
+
+
+def _stacked_participant_filter(
+    width: int, height: int, centers: tuple[float, float]
+) -> str:
+    """Independently crop two participants and stack them in a 9:16 canvas."""
+    participant_width = min(width, int(height * 9 / 8))
+    participant_width = max(2, participant_width - participant_width % 2)
+    positions = [
+        max(0, min(width - participant_width, int(center * width) - participant_width // 2))
+        for center in centers
+    ]
+    return (
+        f"split=2[p0][p1];"
+        f"[p0]crop={participant_width}:{height}:{positions[0]}:0,"
+        "scale=1080:960:force_original_aspect_ratio=increase,"
+        "crop=1080:960[top];"
+        f"[p1]crop={participant_width}:{height}:{positions[1]}:0,"
+        "scale=1080:960:force_original_aspect_ratio=increase,"
+        "crop=1080:960[bottom];"
+        "[top][bottom]vstack=inputs=2[v]"
+    )
+
+
+def _build_vertical_filter(
+    video_path: Path, start: float, duration: float
+) -> tuple[str, bool]:
+    """Choose stable single-person framing or a two-person stacked composition."""
+    width, height = _probe_video_dimensions(video_path)
+    dual = _estimate_dual_participant_tracks(video_path, start, duration)
+    if dual is not None and os.getenv("DUAL_SPEAKER_STACKED_ENABLED", "true").lower() not in {
+        "0", "false", "no", "off"
+    }:
+        logger.info(
+            "Vertical layout=stacked participants_left=%.3f participants_right=%.3f",
+            dual[0], dual[1],
+        )
+        return _stacked_participant_filter(width, height, dual), True
+    return _build_crop_filter(video_path, start, duration), False
+
 def _build_crop_filter(video_path: Path, start: float, duration: float) -> str:
     width, height = _probe_video_dimensions(video_path)
     target_width = min(width, int(height * 9 / 16))
@@ -715,7 +818,9 @@ def _build_crop_filter(video_path: Path, start: float, duration: float) -> str:
 
 
 def create_clip_file(video_path: Path, start: float, duration: float, output_path: Path) -> None:
-    crop_filter = _build_crop_filter(video_path, start, duration)
+    vertical_filter, complex_filter = _build_vertical_filter(
+        video_path, start, duration
+    )
     command = [
         "ffmpeg",
         "-y",
@@ -725,8 +830,16 @@ def create_clip_file(video_path: Path, start: float, duration: float, output_pat
         f"{duration:.2f}",
         "-i",
         str(video_path),
-        "-vf",
-        f"{crop_filter},scale=1080:1920",
+    ]
+    if complex_filter:
+        command.extend([
+            "-filter_complex", vertical_filter,
+            "-map", "[v]",
+            "-map", "0:a?",
+        ])
+    else:
+        command.extend(["-vf", f"{vertical_filter},scale=1080:1920"])
+    command.extend([
         "-c:v",
         "libx264",
         "-preset",
@@ -736,7 +849,7 @@ def create_clip_file(video_path: Path, start: float, duration: float, output_pat
         "-movflags",
         "+faststart",
         str(output_path),
-    ]
+    ])
     completed = subprocess.run(command, capture_output=True, text=True, timeout=3600)
     if completed.returncode != 0:
         raise RuntimeError(
