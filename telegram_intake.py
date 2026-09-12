@@ -31,6 +31,7 @@ from clipmaster_review import (
     handle_update as handle_clipmaster_update,
     router as clipmaster_review_router,
 )
+from durable_jobs import durable_job
 from workflow_reliability import (
     classify_error,
     latest_incomplete,
@@ -815,6 +816,7 @@ def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> 
     )
 
 
+@durable_job("schedule_handoff")
 def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
     """Send all final rendered 9:16 and 16:9 selections downstream once."""
     target = (
@@ -2305,6 +2307,7 @@ def _start_16_9_after_confirmation(request_id: str, chat_id: str) -> None:
         )
 
 
+@durable_job("process")
 def _process(request_id: str) -> None:
     logger.info("Ripped Shorts job starting request_id=%s", request_id)
     with _LOCK, _telegram_db() as db:
