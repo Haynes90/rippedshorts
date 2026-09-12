@@ -126,7 +126,7 @@ def _ensure_tab(sheets: Any, spreadsheet_id: str) -> None:
         spreadsheetId=spreadsheet_id,
         range=f"'{WORKFLOW_JOBS_TAB}'!A1:R1",
     ).execute().get("values", [])
-    if not values:
+    if not values or list(values[0])[:len(HEADERS)] != HEADERS:
         sheets.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range=f"'{WORKFLOW_JOBS_TAB}'!A1:Q1",
