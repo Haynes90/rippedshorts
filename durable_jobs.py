@@ -127,7 +127,7 @@ def durable_job(action: str, *, idempotent: bool = False):
             except Exception as exc:
                 finish(path, str(job_id), action, f"{type(exc).__name__}: {exc}")
                 raise
-            finish(path, str(job_id), action, complete=idempotent)
+            finish(path, str(job_id), action, complete=bool(idempotent and result is True))
             return result
         return wrapped
     return decorate
