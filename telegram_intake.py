@@ -817,7 +817,7 @@ def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> 
 
 
 @durable_job("schedule_handoff", idempotent=True)
-def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
+def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
     """Send all final rendered 9:16 and 16:9 selections downstream once."""
     target = (
         os.getenv("SCHEDULE_MASTER_INTERNAL_URL")
@@ -830,17 +830,17 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
             request_id,
         )
         send(chat_id, "⚠️ Your Shorts are complete, but Schedule Master is not configured.")
-        return
+        return False
     with _LOCK, _telegram_db() as db:
         row = db.execute(
             "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
         ).fetchone()
         if not row:
-            return
+            return False
         state = json.loads(row["state_json"])
         schedule = dict(state.get("schedule_master") or {})
         if schedule.get("shorts_status") in {"sending", "accepted"}:
-            return
+            return False
         reviews = dict(state.get("candidate_reviews") or {})
         clips = (state.get("result") or {}).get("segments", [])
         assets = []
@@ -888,7 +888,7 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
             )
         if not assets:
             send(chat_id, "No rendered videos were selected for Schedule Master.")
-            return
+            return False
         schedule["shorts_status"] = "sending"
         schedule["shorts_started_at"] = now()
         state["schedule_master"] = schedule
@@ -952,7 +952,7 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
                     "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                     (json.dumps(latest_state), now(), request_id),
                 )
-        return
+        return False
     headers = {}
     secret = os.getenv("SCHEDULE_MASTER_SHARED_SECRET", "").strip()
     if secret:
@@ -998,6 +998,7 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> None:
             chat_id,
             f"✅ Selection complete. Schedule Master received {len(assets)} Short(s).",
         )
+        return True
     except Exception as exc:
         logger.exception("Schedule Master Shorts handoff failed request_id=%s", request_id)
         with _LOCK, _telegram_db() as db:
