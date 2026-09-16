@@ -13,6 +13,7 @@ import shutil
 from urllib.parse import urlparse, parse_qs
 
 import requests
+from clip_completion import render_complete_clip
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from google.oauth2 import service_account
@@ -921,7 +922,9 @@ def attach_topic_segment_asset(
     duration = float(segment.get("duration", 0.0))
     if duration <= 0:
         raise RuntimeError("16:9 segment duration must be positive")
-    create_topic_segment_file(video_path, start, duration, output_path)
+    segment = render_complete_clip(
+        video_path, segment, output_path, create_topic_segment_file, "16:9"
+    )
     uploaded = upload_clip_to_drive(output_path, segment_name, vid_title=vid_title)
     return {
         **segment,
@@ -1114,7 +1117,9 @@ def attach_clip_assets(
         # Keep the user-facing Drive filename predictable while ensuring
         # simultaneous FFmpeg processes never write to the same local path.
         output_path = workdir / f".render-{uuid.uuid4().hex}-{clip_name}"
-        create_clip_file(video_path, start, duration, output_path)
+        segment.update(render_complete_clip(
+            video_path, segment, output_path, create_clip_file, "9:16"
+        ))
         clip_info = upload_clip_to_drive(
             output_path, clip_name, vid_title=resolved_vid_title
         )
