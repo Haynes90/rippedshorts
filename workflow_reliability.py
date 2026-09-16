@@ -20,6 +20,15 @@ HEADERS = [
     "status", "attempt_count", "heartbeat_at", "error_class",
     "error_message", "chat_id", "user_id", "updated_at", "standard_state",
 ]
+def _last_column() -> str:
+    number = len(HEADERS)
+    column = ""
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        column = chr(65 + remainder) + column
+    return column
+
+
 _LOCK = threading.RLock()
 _READY_STAGES = {
     "source_resolution", "source_ready", "transcript_ready", "awaiting_review",
@@ -124,12 +133,12 @@ def _ensure_tab(sheets: Any, spreadsheet_id: str) -> None:
         ).execute()
     values = sheets.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range=f"'{WORKFLOW_JOBS_TAB}'!A1:R1",
+        range=f"'{WORKFLOW_JOBS_TAB}'!A1:{_last_column()}1",
     ).execute().get("values", [])
     if not values or list(values[0])[:len(HEADERS)] != HEADERS:
         sheets.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
-            range=f"'{WORKFLOW_JOBS_TAB}'!A1:Q1",
+            range=f"'{WORKFLOW_JOBS_TAB}'!A1:{_last_column()}1",
             valueInputOption="RAW",
             body={"values": [HEADERS]},
         ).execute()
@@ -166,7 +175,7 @@ def upsert_job(spreadsheet_id: str, request_id: str, status: str, state: dict[st
             _ensure_tab(sheets, spreadsheet_id)
             result = sheets.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id,
-                range=f"'{WORKFLOW_JOBS_TAB}'!A:R",
+                range=f"'{WORKFLOW_JOBS_TAB}'!A:{_last_column()}",
             ).execute()
             rows = result.get("values", [])
             target = next(
@@ -177,14 +186,14 @@ def upsert_job(spreadsheet_id: str, request_id: str, status: str, state: dict[st
             if target:
                 sheets.spreadsheets().values().update(
                     spreadsheetId=spreadsheet_id,
-                    range=f"'{WORKFLOW_JOBS_TAB}'!A{target}:R{target}",
+                    range=f"'{WORKFLOW_JOBS_TAB}'!A{target}:{_last_column()}{target}",
                     valueInputOption="RAW",
                     body={"values": [row]},
                 ).execute()
             else:
                 sheets.spreadsheets().values().append(
                     spreadsheetId=spreadsheet_id,
-                    range=f"'{WORKFLOW_JOBS_TAB}'!A:Q",
+                    range=f"'{WORKFLOW_JOBS_TAB}'!A:{_last_column()}",
                     valueInputOption="RAW",
                     insertDataOption="INSERT_ROWS",
                     body={"values": [row]},
@@ -198,18 +207,18 @@ def latest_incomplete(spreadsheet_id: str, chat_id: str = "", user_id: str = "")
     _ensure_tab(sheets, spreadsheet_id)
     rows = sheets.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range=f"'{WORKFLOW_JOBS_TAB}'!A:Q",
+        range=f"'{WORKFLOW_JOBS_TAB}'!A:{_last_column()}",
     ).execute().get("values", [])
     records = []
     for values in rows[1:]:
-        padded = list(values) + [""] * (18 - len(values))
+        padded = list(values) + [""] * (len(HEADERS) - len(values))
         if padded[9].lower() in {"published", "complete", "cancelled"}:
             continue
         if chat_id and padded[14] and padded[14] != chat_id:
             continue
         if user_id and padded[15] and padded[15] != user_id:
             continue
-        records.append(dict(zip(HEADERS, padded[:18])))
+        records.append(dict(zip(HEADERS, padded[:len(HEADERS)])))
     return records[-1] if records else None
 
 
