@@ -4249,18 +4249,22 @@ def _ripped_webhook_url() -> str:
 
 def _telegram_api(token: str, method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     """Call Telegram and reject HTTP-200 responses whose JSON says ok=false."""
-    response = requests.post(
-        f"https://api.telegram.org/bot{token}/{method}",
-        json=payload or {},
-        timeout=(10, 30),
-    )
-    response.raise_for_status()
-    data = response.json()
-    if not data.get("ok"):
-        raise RuntimeError(
-            f"Telegram {method} rejected the request: "
-            f"{data.get('error_code', 'unknown')} {data.get('description', data)}"
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/{method}",
+            json=payload or {},
+            timeout=(10, 30),
         )
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as exc:
+        # Request errors contain the bot token in their URL; suppress chaining.
+        raise RuntimeError(f"Telegram {method} transport failure ({type(exc).__name__})") from None
+    except ValueError:
+        raise RuntimeError(f"Telegram {method} returned invalid JSON") from None
+    if not isinstance(data, dict) or not data.get("ok"):
+        code = data.get("error_code", "unknown") if isinstance(data, dict) else "unknown"
+        raise RuntimeError(f"Telegram {method} rejected the request: {code}")
     return data
 
 

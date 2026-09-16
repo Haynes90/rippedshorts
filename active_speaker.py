@@ -161,7 +161,7 @@ def _section_filter(label: str, layout: str, left: float, right: float, width: i
         crop_width = min(width, int(height * 9 / 16))
         crop_width = max(2, crop_width - crop_width % 2)
         x = _crop_x(left if layout == "A" else right, width, crop_width)
-        return f"[{label}]crop={crop_width}:{height}:{x}:0,scale=1080:1920[v{label[1:]}]"
+        return f"[{label}]crop={crop_width}:{height}:{x}:0,scale=1080:1920,setsar=1[v{label[1:]}]"
     crop_width = min(width, int(height * 9 / 8))
     crop_width = max(2, crop_width - crop_width % 2)
     lx, rx = _crop_x(left, width, crop_width), _crop_x(right, width, crop_width)
@@ -169,10 +169,10 @@ def _section_filter(label: str, layout: str, left: float, right: float, width: i
     return (
         f"[{label}]split=2[{label}a][{label}b];"
         f"[{label}a]crop={crop_width}:{height}:{lx}:0,scale=1080:960:"
-        "force_original_aspect_ratio=increase,crop=1080:960"
+        "force_original_aspect_ratio=increase,crop=1080:960,setsar=1"
         f"[top{index}];"
         f"[{label}b]crop={crop_width}:{height}:{rx}:0,scale=1080:960:"
-        "force_original_aspect_ratio=increase,crop=1080:960"
+        "force_original_aspect_ratio=increase,crop=1080:960,setsar=1"
         f"[bottom{index}];[top{index}][bottom{index}]vstack=2[v{index}]"
     )
 
