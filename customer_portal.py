@@ -168,6 +168,8 @@ def me(user=Depends(account)):
 
 @router.post('/api/checkout')
 def checkout(user=Depends(account)):
+    if os.getenv('PILOT_ACCEPTING_CUSTOMERS') != '1':
+        raise HTTPException(503, 'We are finishing delivery testing. Please check back soon.')
     if user.get('subscription'):
         raise HTTPException(409, 'Use Manage billing for your existing subscription')
     if not all(os.getenv(k) for k in ('STRIPE_SECRET_KEY','STRIPE_WEBHOOK_SECRET','STRIPE_PRICE_ID','STRIPE_PAYMENT_LINK_ID')):
