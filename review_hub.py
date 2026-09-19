@@ -372,4 +372,4 @@ def handoff_manifest(project_id: str, owner=Depends(identity)):
     payload = {"contract_version": 1, "project_id": project_id, "account_id": info["account_id"],
                "request_id": project_id, "assets": assets, "action": "review_before_scheduling"}
     return Response(json.dumps(payload, indent=2), media_type="application/json", headers={
-        "Content-Disposition": 'attachment; filename="ripped-shorts-handoff.json"', "Cache-Control": "no-store"})
+        "Content-Disposition": 'attachment; filename="r3cycle-handoff.json"', "Cache-Control": "no-store"})

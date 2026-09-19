@@ -12,7 +12,7 @@ os.environ.setdefault("REVIEW_HUB_USER_ID", "operator")
 from review_hub import router
 from customer_portal import router as customer_router
 
-app = FastAPI(title="Ripped Shorts customer pilot", docs_url=None, redoc_url=None)
+app = FastAPI(title="r3cycle customer pilot", docs_url=None, redoc_url=None)
 app.include_router(router)
 app.include_router(customer_router)
 
