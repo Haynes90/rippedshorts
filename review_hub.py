@@ -36,8 +36,12 @@ def config():
     key = os.getenv("REVIEW_HUB_SECRET", "")
     chat = os.getenv("REVIEW_HUB_CHAT_ID", "")
     user = os.getenv("REVIEW_HUB_USER_ID", "")
-    if len(key) < 32 or not chat or not user:
-        raise HTTPException(503, "Review hub is not configured")
+    if not key:
+        raise HTTPException(503, "Studio setup: REVIEW_HUB_SECRET is missing from the running service. Add it in Railway and deploy.")
+    if len(key) < 32:
+        raise HTTPException(503, "Studio setup: REVIEW_HUB_SECRET must contain at least 32 characters. Update it in Railway and deploy.")
+    if not chat or not user:
+        raise HTTPException(503, "Studio setup: operator identity is missing. Set REVIEW_HUB_CHAT_ID=pilot and REVIEW_HUB_USER_ID=operator in Railway and deploy.")
     return key, chat, user
 
 
