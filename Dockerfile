@@ -21,5 +21,5 @@ COPY . /app
 
 # Railway provides PORT. Docker JSON CMD doesn't expand env vars,
 # so use a shell form command.
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "uvicorn ${APP_MODULE:-main:app} --host 0.0.0.0 --port ${PORT:-8000}"]
  

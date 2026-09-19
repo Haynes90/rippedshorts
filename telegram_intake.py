@@ -1135,6 +1135,9 @@ def _ripped_bot_token() -> str:
 
 def telegram(method: str, payload: dict[str, Any]) -> dict:
     """Send through Telegram without allowing a temporary rate limit to corrupt a job."""
+    if os.getenv("RIPPED_PILOT_MODE") == "1":
+        # The isolated pilot is operated through the web hub, with no bot ownership.
+        return {"ok": True, "result": {"message_id": 0}}
     token = _ripped_bot_token()
     if not token:
         raise RuntimeError("Telegram_ripped_bot_token is not configured")
@@ -1279,7 +1282,26 @@ def _save(request_id: str, status: str, state: dict[str, Any]) -> None:
     state["heartbeat_at"] = now()
     if status != "error":
         state["last_successful_stage"] = str(state.get("stage") or status)
+    if status == "awaiting_review":
+        state.setdefault("selection_ready_at", now())
     with _LOCK, _telegram_db() as db:
+        previous = db.execute("SELECT state_json, chat_id, user_id FROM telegram_requests WHERE request_id=?", (request_id,)).fetchone()
+        if previous:
+            prior_state = json.loads(previous["state_json"])
+            # Web edits and identity must survive older snapshots in long-running jobs.
+            for key in ("web_captions", "project_id", "account_id", "expires_at", "review_hub"):
+                if key in prior_state:
+                    state[key] = prior_state[key]
+            if prior_state.get("topic_stage") and state.get("topic_stage") is None:
+                for key in ("topic_stage", "topic_result", "topic_reviews", "topic_error"):
+                    if key in prior_state:
+                        state[key] = prior_state[key]
+            state.setdefault("project_id", request_id)
+            state.setdefault("account_id", f"telegram:{previous['chat_id']}:{previous['user_id']}")
+        launch_highlights = bool(state.get("review_hub") and status == "awaiting_review"
+                                 and state.get("topic_source_segments") and state.get("topic_stage") is None)
+        if launch_highlights:
+            state["topic_stage"] = "queued"
         db.execute(
             "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
             (status, json.dumps(state), now(), request_id),
@@ -1290,6 +1312,8 @@ def _save(request_id: str, status: str, state: dict[str, Any]) -> None:
         ).fetchone()
     chat_id = str(row["chat_id"]) if row else ""
     user_id = str(row["user_id"]) if row else ""
+    if launch_highlights:
+        RENDER_EXECUTOR.submit(_start_16_9_after_confirmation, request_id, chat_id)
     upsert_job(
         RIPPED_LOG_SHEET_ID,
         request_id,
@@ -1894,7 +1918,7 @@ def _transcribe(video_path: Path, progress=None) -> list[dict]:
     return transcribe_source(video_path, progress)
 
 
-def _topic_break_suggestions(transcript_segments: list[dict]) -> list[dict]:
+def _topic_break_suggestions(transcript_segments: list[dict], *, use_learning: bool = True) -> list[dict]:
     """Select the strongest standalone 16:9 highlights from the full transcript."""
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -1930,7 +1954,7 @@ def _topic_break_suggestions(transcript_segments: list[dict]) -> list[dict]:
         '"summary":"...","highlight_type":"point","reason":"..."}]}. '
         "Do not include Markdown or commentary.\n\nTRANSCRIPT:\n"
         + "\n".join(lines)
-        + _boundary_learning_prompt()
+        + (_boundary_learning_prompt() if use_learning else "")
     )
     payload = {
         "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
@@ -2123,7 +2147,7 @@ def _process_topics(
 ) -> dict[str, Any]:
     send(
         chat_id,
-        "📺 The 9:16 Shorts review is confirmed. Selecting the strongest standalone "
+        "📺 Selecting the strongest standalone "
         "16:9 highlights now. Gaps are allowed; every highlight must be at least "
         "three minutes and contain a complete point, discussion, or story.",
     )
@@ -2136,16 +2160,19 @@ def _process_topics(
             "the quality and completeness requirements.",
         )
     topic_result = {"segments": topics, "selection": "best_standalone_highlights"}
-    state.update(
-        {
-            "video_path": str(video),
-            "source_reused": reused,
-            "topic_result": topic_result,
-            "topic_reviews": state.get("topic_reviews") or {},
-            "topic_stage": "awaiting_review" if topics else "not_eligible",
-        }
-    )
-    _save(request_id, "awaiting_review" if topics else "processing", state)
+    # Selection can overlap web/Telegram review. Merge only this lane's fields
+    # into the latest row instead of replacing concurrent Short decisions.
+    with _LOCK, _telegram_db() as db:
+        latest = db.execute("SELECT state_json FROM telegram_requests WHERE request_id=?", (request_id,)).fetchone()
+        state = json.loads(latest["state_json"]) if latest else state
+        state.update({"video_path": str(video), "source_reused": reused,
+                      "topic_result": topic_result, "topic_reviews": state.get("topic_reviews") or {},
+                      "topic_stage": "awaiting_review" if topics else "not_eligible"})
+        if state.get("parsed", {}).get("mode") == "topics":
+            state["stage"] = "awaiting_review"
+            state.setdefault("selection_ready_at", now())
+        db.execute("UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
+                   ("awaiting_review", json.dumps(state), now(), request_id))
     if topics:
         _send_topic_candidates(chat_id, request_id, topic_result)
     return state
@@ -2208,6 +2235,9 @@ def _process(request_id: str) -> None:
         logger.error("Ripped Shorts job missing from database request_id=%s", request_id)
         return
     state, chat_id = json.loads(row["state_json"]), row["chat_id"]
+    if state.get("basic_pilot"):
+        from review_basic import process
+        return process(request_id)
     try:
         _save(request_id, "processing", {**state, "stage": "source_resolution"})
         send(chat_id, f"⬇️ Retrieving source\nJob ID: {request_id}")
@@ -3163,7 +3193,7 @@ def _accept_update(
             if not row:
                 return {"status": "not_found"}
             state = json.loads(row["state_json"])
-            start_highlights = row["mode"] == "both"
+            start_highlights = row["mode"] == "both" and state.get("topic_stage") in {None, "failed"}
             if state.get("shorts_confirmed_at"):
                 return {"status": "already_confirmed", "request_id": request_id}
             clips = (state.get("result") or {}).get("segments", [])
@@ -3189,7 +3219,7 @@ def _accept_update(
             state["short_selection_completed_at"] = now()
             if start_highlights:
                 state["topic_stage"] = "queued"
-            else:
+            elif row["mode"] != "both":
                 state["schedule_requested_at"] = now()
             db.execute(
                 "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? "
@@ -3586,13 +3616,14 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
             )
         send(chat_id, f"🎬 16:9 Segment {index + 1} is now rendering.")
         segment = state["topic_result"]["segments"][index]
-        video = Path(state["video_path"])
+        video = Path(segment.get("review_source_path") or state["video_path"])
         video_id = state["parsed"].get("video_id", request_id)
         vid_title = _state_vid_title(state)
         import main
 
         rendered = main.attach_topic_segment_asset(
-            dict(segment),
+            {**segment, "project_id": request_id,
+             "account_id": state.get("account_id", f"telegram:{row['chat_id']}:{row['user_id']}")},
             video_id,
             video,
             index + 1,
@@ -3661,17 +3692,16 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             row = db.execute(
                 "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
             ).fetchone()
-        if not row:
-            raise RuntimeError(f"Ripped Shorts request not found: {request_id}")
-        state = json.loads(row["state_json"])
-        reviews = dict(state.get("candidate_reviews") or {})
-        reviews[str(index)] = {
-            **reviews.get(str(index), {}),
-            "status": "rendering",
-            "render_started_at": now(),
-        }
-        state["candidate_reviews"] = reviews
-        with _LOCK, _telegram_db() as db:
+            if not row:
+                raise RuntimeError(f"Ripped Shorts request not found: {request_id}")
+            state = json.loads(row["state_json"])
+            reviews = dict(state.get("candidate_reviews") or {})
+            reviews[str(index)] = {
+                **reviews.get(str(index), {}),
+                "status": "rendering",
+                "render_started_at": now(),
+            }
+            state["candidate_reviews"] = reviews
             db.execute(
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(state), now(), request_id),
@@ -3685,11 +3715,12 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         user_id = str(
             (state.get("candidate_reviews") or {}).get(str(index), {}).get("user_id", "")
         )
-        video = Path(state["video_path"])
+        video = Path(candidate.get("review_source_path") or state["video_path"])
         vid_title = _state_vid_title(state)
         import main
 
-        payload_candidate = dict(candidate)
+        payload_candidate = {**candidate, "project_id": request_id,
+                             "account_id": state.get("account_id", f"telegram:{row['chat_id']}:{row['user_id']}")}
         payload_candidate["candidate_number"] = int(
             candidate.get("candidate_number") or index + 1
         )
