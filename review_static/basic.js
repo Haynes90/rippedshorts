@@ -26,6 +26,7 @@ function render(){
   $('count').textContent=items.length?`${index+1} of ${items.length}`:'No clips yet';$('empty').hidden=!!items.length;$('review-card').hidden=!items.length;
   $('empty').textContent=current.error||(current.status==='awaiting_review'?'No complete standalone moments qualified for this format in the selected sections.':'Understanding topics and checking complete thoughts before review.');
   $('rebuild').hidden=!current.can_rebuild||current.expired;
+  $('selection-report').href=`/review/api/projects/${current.project_id}/selection-report`;
   $('retry').hidden=!(current.status==='error'||(current.status==='awaiting_review'&&!current.lanes.shorts.length))||current.expired;$('transcript-download').href=`/review/api/projects/${current.project_id}/transcript.txt`;$('transcript-download').hidden=!current.transcript_ready||current.expired;
   const c=clip();if(!c)return;$('clip-title').textContent=c.title;$('clip-state').textContent=c.status.replaceAll('_',' ');$('transcript').textContent=c.transcript;$('clip-error').textContent=c.error||'';
   $('clip-timing').textContent=`Source start ${Math.round(Number(c.start)+Number(c.source_offset||0))}s · ${Math.round(Number(c.duration))} seconds`;

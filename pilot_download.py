@@ -54,6 +54,7 @@ def download_youtube(video_id, youtube_url, workdir):
     template = os.getenv('YOUTUBE_DL_PATH_TEMPLATE', '/download_video/{video_id}')
     endpoint = f'https://{host}{template.format(video_id=video_id)}'
     partial = workdir / f'{video_id}-source.partial.mp4'
+    failure = 'no download URL after bounded polling'
     try:
         for attempt in range(3):
             response = requests.get(endpoint, headers={'x-rapidapi-key': key, 'x-rapidapi-host': host},
@@ -74,12 +75,13 @@ def download_youtube(video_id, youtube_url, workdir):
                 return output
             if attempt < 2:
                 time.sleep(420 if attempt == 0 else 120)
-    except (requests.RequestException, ValueError, OSError):
+    except (requests.RequestException, ValueError, OSError) as exc:
         # Do not persist signed download URLs, API responses, or credential headers.
-        pass
+        status = getattr(getattr(exc, 'response', None), 'status_code', None)
+        failure = f'HTTP {status}' if status is not None else type(exc).__name__
     finally:
         partial.unlink(missing_ok=True)
     if os.getenv('PILOT_YTDLP_FALLBACK', '0') == '1':
         from source_ingestion import download_youtube_resilient
         return download_youtube_resilient(video_id, youtube_url, workdir)
-    raise RuntimeError('RapidAPI could not prepare a usable video. Check the downloader subscription/quota, or submit the source through Google Drive. Direct YouTube fallback is disabled while bot blocking persists.')
+    raise RuntimeError(f'RapidAPI could not prepare a usable video ({failure}). Check the downloader subscription/quota, or submit the source through Google Drive. Direct YouTube fallback is disabled while bot blocking persists.')

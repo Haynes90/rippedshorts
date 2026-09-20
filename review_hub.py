@@ -348,6 +348,18 @@ def transcript_download(project_id: str, owner=Depends(identity)):
     return Response(text, media_type="text/plain", headers={"Content-Disposition": 'attachment; filename="transcript.txt"', "Cache-Control": "no-store"})
 
 
+@router.get("/api/projects/{project_id}/selection-report")
+def selection_report(project_id: str, response: Response, owner=Depends(identity)):
+    e = engine()
+    with e._LOCK, e._telegram_db() as db:
+        row = owned(db, project_id, owner)
+    active(row)
+    state = json.loads(row["state_json"])
+    response.headers["Cache-Control"] = "no-store"
+    return {"version": state.get("selection_version"), "understanding": state.get("source_understanding"),
+            "audit": state.get("selection_audit")}
+
+
 @router.post("/api/projects/{project_id}/retry", status_code=202)
 def retry(project_id: str, owner=Depends(identity)):
     e = engine()
