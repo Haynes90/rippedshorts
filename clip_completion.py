@@ -482,6 +482,10 @@ def render_complete_clip(video, segment, output, renderer, aspect):
 
     """Two bounded rebuild attempts; upload callers only receive verified exports."""
 
+    if os.getenv("RIPPED_PILOT_MODE") == "1" and segment.get("project_id"):
+        from pilot_render import render_approved
+        return render_approved(video, segment, output, renderer, aspect)
+
     original_start = float(segment.get("start", 0))
 
     original_end = float(segment.get("end", original_start + float(segment.get("duration", 0))))

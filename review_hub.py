@@ -235,6 +235,8 @@ def project(project_id: str, response: Response, owner=Depends(identity)):
     state = json.loads(row["state_json"])
     result = estimate(summary(row), row, history)
     result["transcript_ready"] = bool(state.get("transcript_text"))
+    result["selection_version"] = state.get("selection_version", 1)
+    result["can_rebuild"] = bool(state.get("basic_pilot") and row["status"] == "awaiting_review" and state.get("selection_version", 1) < 2 and not any(r.get("status") in {"queued", "rendering", "rendered"} for key in ("candidate_reviews", "topic_reviews") for r in state.get(key, {}).values()))
     result["lanes"] = {}
     for lane, (results, reviews) in LANES.items():
         result["lanes"][lane] = [{
@@ -272,6 +274,9 @@ def decide(project_id: str, lane: str, index: int, body: Decision, owner=Depends
         active(row)
         state = json.loads(row["state_json"])
         _, review_key = candidate(state, lane, index)
+        if body.decision == "approve" and state.get("basic_pilot") and os.getenv("RIPPED_PILOT_MODE") == "1":
+            if row["status"] != "awaiting_review" or state.get("selection_version", 1) < 2:
+                raise HTTPException(409, "Rebuild selections to verify complete thoughts before rendering")
         reviews = state.setdefault(review_key, {})
         status = (reviews.get(str(index)) or {}).get("status", "pending")
         if status in {"queued", "rendering", "rendered"}:
@@ -358,6 +363,30 @@ def retry(project_id: str, owner=Depends(identity)):
                 raise HTTPException(409, "Approved clips must not be replaced")
             state.pop("basic_selection_complete", None)
             db.execute("DELETE FROM durable_job_leases WHERE job_id=? AND action IN ('process','basic_pilot')", (project_id,))
+        db.execute("UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?", ("retrying", json.dumps(state), e.now(), project_id))
+    e.RENDER_EXECUTOR.submit(e._process, project_id)
+    return {"status": "retrying"}
+
+
+@router.post("/api/projects/{project_id}/rebuild", status_code=202)
+def rebuild(project_id: str, owner=Depends(identity)):
+    """Upgrade old candidates using cached selected sections; retain review history."""
+    e = engine()
+    with e._LOCK, e._telegram_db() as db:
+        row = owned(db, project_id, owner)
+        active(row)
+        state = json.loads(row["state_json"])
+        if not state.get("basic_pilot") or row["status"] != "awaiting_review" or state.get("selection_version", 1) >= 2:
+            raise HTTPException(409, "Only older completed selections can be rebuilt")
+        if any(r.get("status") in {"queued", "rendering", "rendered"} for key in ("candidate_reviews", "topic_reviews") for r in state.get(key, {}).values()):
+            raise HTTPException(409, "Approved clips must not be replaced")
+        state.setdefault("selection_history", []).append({"saved_at": e.now(), **{k: state.get(k, {}) for k in ("result", "topic_result", "candidate_reviews", "topic_reviews")}})
+        for key in ("result", "topic_result", "candidate_reviews", "topic_reviews"):
+            state[key] = {}
+        state.pop("basic_selection_complete", None)
+        state.pop("error", None)
+        state["stage"] = "rebuilding_selections"
+        db.execute("DELETE FROM durable_job_leases WHERE job_id=? AND action IN ('process','basic_pilot')", (project_id,))
         db.execute("UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?", ("retrying", json.dumps(state), e.now(), project_id))
     e.RENDER_EXECUTOR.submit(e._process, project_id)
     return {"status": "retrying"}

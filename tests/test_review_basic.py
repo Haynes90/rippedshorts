@@ -44,6 +44,8 @@ def test_learning_never_crosses_customer_accounts(studio):
 def test_processing_transcribes_only_trimmed_sections(studio, tmp_path, monkeypatch):
     _, fake, seed=studio
     import main
+    import pilot_download
+    import pilot_selection
     import telegram_intake as engine
     import clip_completion
     import durable_jobs
@@ -58,7 +60,7 @@ def test_processing_transcribes_only_trimmed_sections(studio, tmp_path, monkeypa
     monkeypatch.setattr(engine,'_save',lambda pid,status,state:saved.append((status,dict(state))))
     monkeypatch.setattr(durable_jobs,'claim',lambda *a,**k:True)
     monkeypatch.setattr(durable_jobs,'finish',Mock())
-    monkeypatch.setattr(main,'download_youtube_video',lambda *a:tmp_path/'original.mp4')
+    monkeypatch.setattr(pilot_download,'download_youtube',lambda *a:tmp_path/'original.mp4')
     monkeypatch.setattr(clip_completion,'media_duration',lambda _:1000)
     trimmed=[]
     def cut(source,output,start,end):
@@ -71,6 +73,10 @@ def test_processing_transcribes_only_trimmed_sections(studio, tmp_path, monkeypa
     monkeypatch.setattr(clip_completion,'transcribe_source',transcribe)
     monkeypatch.setattr(main,'call_openai_for_clips',lambda *a:{"segments":[{"start":0,"duration":30,"transcript":"Complete thought."}]})
     monkeypatch.setattr(engine,'validate_complete_candidates',lambda result,*_:result)
+    def selection(sections, *args):
+        return {'shorts': [{'start':0,'duration':30,'transcript':'Complete thought.', 'source_offset':section['offset']} for section in sections],
+                'highlights': [], 'understanding': {}, 'proposals': {}, 'semantic_reviews': {}}
+    monkeypatch.setattr(pilot_selection,'select',selection)
     monkeypatch.setattr(engine,'_topic_break_suggestions',lambda *a,**k:[])
     monkeypatch.setattr(engine,'_build_contiguous_topic_segments',lambda *a:[])
     review_basic.process('one')
