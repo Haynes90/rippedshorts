@@ -350,14 +350,16 @@ def transcript_download(project_id: str, owner=Depends(identity)):
 
 @router.get("/api/projects/{project_id}/selection-report")
 def selection_report(project_id: str, response: Response, owner=Depends(identity)):
+    import html
     e = engine()
     with e._LOCK, e._telegram_db() as db:
         row = owned(db, project_id, owner)
     active(row)
     state = json.loads(row["state_json"])
     response.headers["Cache-Control"] = "no-store"
-    return {"version": state.get("selection_version"), "understanding": state.get("source_understanding"),
-            "audit": state.get("selection_audit")}
+    report = {"version": state.get("selection_version"), "understanding": state.get("source_understanding"),
+              "audit": state.get("selection_audit")}
+    return Response('<!doctype html><meta name="viewport" content="width=device-width"><title>r3cycle selection report</title><h1>Selection report</h1><pre style="white-space:pre-wrap;overflow-wrap:anywhere">' + html.escape(json.dumps(report, indent=2, ensure_ascii=False)) + '</pre>', media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
 @router.post("/api/projects/{project_id}/retry", status_code=202)
