@@ -349,9 +349,16 @@ def retry(project_id: str, owner=Depends(identity)):
     with e._LOCK, e._telegram_db() as db:
         row = owned(db, project_id, owner)
         active(row)
-        if row["status"] != "error":
-            raise HTTPException(409, "Only failed source jobs can be retried here")
-        db.execute("UPDATE telegram_requests SET status=?, updated_at=? WHERE request_id=?", ("retrying", e.now(), project_id))
+        state = json.loads(row["state_json"])
+        empty_selection = row["status"] == "awaiting_review" and state.get("basic_pilot") and not state.get("result", {}).get("segments")
+        if row["status"] != "error" and not empty_selection:
+            raise HTTPException(409, "Only failed jobs or empty Shorts selections can be retried here")
+        if empty_selection:
+            if any(review.get("status") in {"queued", "rendering", "rendered"} for key in ("candidate_reviews", "topic_reviews") for review in state.get(key, {}).values()):
+                raise HTTPException(409, "Approved clips must not be replaced")
+            state.pop("basic_selection_complete", None)
+            db.execute("DELETE FROM durable_job_leases WHERE job_id=? AND action IN ('process','basic_pilot')", (project_id,))
+        db.execute("UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?", ("retrying", json.dumps(state), e.now(), project_id))
     e.RENDER_EXECUTOR.submit(e._process, project_id)
     return {"status": "retrying"}
 

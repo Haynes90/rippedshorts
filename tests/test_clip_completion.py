@@ -168,3 +168,10 @@ def test_upload_is_blocked_on_verification_failure(name,aspect,tmp_path):
         if aspect=='16:9': env[name](segment,'test',tmp_path/'source',1,vid_title='test')
         else: env[name]({'segments':[segment]},'test',None,video_path_override=tmp_path/'source',vid_title='test')
     assert calls==[]
+
+def test_restore_asr_punctuation_without_changing_words():
+    ws=[{'word':'Hello','start':0,'end':1},{'word':'world','start':1,'end':2},{'word':'Next','start':2,'end':3}]
+    restored=c.restore_punctuation(ws,'Hello world. Next!')
+    assert [w['word'] for w in restored]==['Hello','world.','Next!']
+    assert [w['end'] for w in restored]==[1,2,3]
+    assert c.restore_punctuation(ws,'Different text.')==ws

@@ -78,14 +78,18 @@ def process(project_id):
         parsed = state["parsed"]
         state["stage"] = "source_download"
         e._save(project_id, "processing", state)
-        if parsed["source_kind"] == "youtube":
+        sections_ready = all((work / f"section-{i}.mp4").is_file() and abs(media_duration(work / f"section-{i}.mp4") - (b["end"] - b["start"])) < .5 for i, b in enumerate(ranges))
+        if sections_ready:
+            video = None
+            title = parsed.get("video_id") or "Source"
+        elif parsed["source_kind"] == "youtube":
             video = main.download_youtube_video(parsed["video_id"], parsed["source_value"], work)
             title = parsed["video_id"]
         else:
             metadata = e.drive_metadata(parsed["drive_ids"][0])
             video = e.download_drive(parsed["drive_ids"][0], work / "source.mp4", metadata)
             title = metadata.get("name", "Source")
-        duration = media_duration(video)
+        duration = max(b["end"] for b in ranges) if sections_ready else media_duration(video)
         if any(item["end"] > duration + .05 for item in ranges):
             raise ValueError("A selected section ends after the source video")
         # Each customer project gets its own output folder; do not reuse another order.
@@ -95,7 +99,7 @@ def process(project_id):
             section = work / f"section-{section_index}.mp4"
             state["stage"] = f"transcribing_section_{section_index + 1}_of_{len(ranges)}"
             e._save(project_id, "processing", state)
-            cache = work / f"section-{section_index}.json"
+            cache = work / f"section-{section_index}-punctuated.json"
             if not section.is_file():
                 cut_section(video, section, bounds["start"], bounds["end"])
             if cache.is_file():
