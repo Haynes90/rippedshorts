@@ -193,8 +193,9 @@ def submit(body: Source, tasks: BackgroundTasks, owner=Depends(identity)):
 def submit_source(body, tasks, owner, *, project_id_override=None, clip_limits=None):
     e = engine()
     from review_basic import normalize_ranges
-    if os.getenv("RIPPED_PILOT_MODE") == "1" and not all(os.getenv(key) for key in ("OPENAI_API_KEY", "DRIVE_FOLDER_ID", "RIPPED_SHORTS_LOG_SHEET_ID")):
-        raise HTTPException(503, "Configure the customer processing key, Drive folder, and Sheet before accepting work")
+    missing = [key for key in ("OPENAI_API_KEY", "DRIVE_FOLDER_ID", "RIPPED_SHORTS_LOG_SHEET_ID") if not os.getenv(key, "").strip()]
+    if os.getenv("RIPPED_PILOT_MODE") == "1" and missing:
+        raise HTTPException(503, "Missing Railway settings: " + ", ".join(missing) + ". Add non-empty values and deploy.")
     if not body.allowance_checked:
         raise HTTPException(422, "Verify payment/trial eligibility and remaining monthly allowance first")
     try:
