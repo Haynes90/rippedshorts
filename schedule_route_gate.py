@@ -147,10 +147,16 @@ def _resume_after_route(request_id: str, chat_id: str, state: dict[str, Any], ba
                     "from your approvals and rejections?"
                 ),
                 "reply_markup": {
-                    "inline_keyboard": [[
-                        {"text": "♻️ Re-rip Shorts", "callback_data": f"rs:rerip:{request_id}"},
-                        {"text": "▶️ Use Existing", "callback_data": f"rs:reuse:{request_id}"},
-                    ]]
+                    "inline_keyboard": [
+                        [
+                            {"text": "♻️ Re-rip Shorts", "callback_data": f"rs:rerip:{request_id}"},
+                            {"text": "▶️ Use Existing", "callback_data": f"rs:reuse:{request_id}"},
+                        ],
+                        [{
+                            "text": "🧼 Fresh Start — Keep Learning",
+                            "callback_data": f"rs:fresh_start:{request_id}",
+                        }],
+                    ]
                 },
             },
         )

@@ -1660,8 +1660,22 @@ def validate_complete_candidates(
         ]
         expected = " ".join(included).casefold()
         quoted = str(candidate.get("transcript", "")).strip().casefold()
-        complete_end = bool(
-            re.search(sentence_end, str(candidate.get("transcript", "")).strip())
+        candidate_text = str(candidate.get("transcript", "")).strip()
+        complete_end = bool(re.search(sentence_end, candidate_text))
+        start_position = next(
+            (
+                idx
+                for idx, (seg_start, _, _) in enumerate(boundaries)
+                if abs(start - seg_start) <= tolerance
+            ),
+            None,
+        )
+        complete_start = bool(
+            start_position == 0
+            or (
+                start_position is not None
+                and re.search(sentence_end, boundaries[start_position - 1][2])
+            )
         )
         if (
             begins_cleanly
@@ -1671,6 +1685,7 @@ def validate_complete_candidates(
             and (quoted in expected or expected in quoted)
             and end > start
             and end - start <= 90
+            and complete_start
             and complete_end
         ):
             candidate.update(
@@ -1682,7 +1697,7 @@ def validate_complete_candidates(
                 {
                     "start": start,
                     "end": end,
-                    "reason": "Unsupported text or incomplete sentence/thought boundary",
+                    "reason": "Unsupported text or incomplete opening/ending thought boundary",
                 }
             )
     return {
@@ -1952,7 +1967,7 @@ def _brand_short_prompt(state: dict[str, Any]) -> str:
 
 
 def _short_learning_prompt(video_id: str) -> str:
-    """Build balanced approval/rejection examples from the durable Shorts ledger."""
+    """Build weighted approval/rejection learning from the durable Shorts ledger."""
     import main
 
     _, _, sheets = main.get_google_services()
@@ -1967,7 +1982,11 @@ def _short_learning_prompt(video_id: str) -> str:
         if str((list(values) + [""] * 21)[2]).strip() == video_id
         and str((list(values) + [""] * 21)[4]).strip()
     }
+
     examples = []
+    category_scores: dict[str, float] = {}
+    content_type_scores: dict[str, float] = {}
+    total_rows = max(1, len(rows))
     for recency, values in enumerate(rows):
         padded = list(values) + [""] * (21 - len(values))
         decision = str(padded[15]).strip().lower()
@@ -1976,27 +1995,39 @@ def _short_learning_prompt(video_id: str) -> str:
         transcript = str(padded[13]).strip()
         if not transcript:
             continue
-        content_type = str(padded[4]).strip().lower()
-        priority = (
-            2 if str(padded[2]).strip() == video_id else
-            1 if content_type and content_type in same_video_types else
-            0
+
+        row_video_id = str(padded[2]).strip()
+        content_type = str(padded[4]).strip().lower() or "unknown"
+        category = str(padded[12]).strip().lower() or "unknown"
+
+        # Weighted wins/losses:
+        # - same video carries the most weight
+        # - same content type carries extra weight
+        # - newer reviews matter a little more than older ones
+        base_weight = 3.0 if row_video_id == video_id else 1.0
+        if content_type in same_video_types:
+            base_weight += 1.0
+        recency_weight = 1.0 + (recency / total_rows)
+        weight = round(base_weight * recency_weight, 3)
+        signed_weight = weight if decision == "approved" else -weight
+
+        category_scores[category] = category_scores.get(category, 0.0) + signed_weight
+        content_type_scores[content_type] = (
+            content_type_scores.get(content_type, 0.0) + signed_weight
         )
         examples.append({
             "decision": decision,
-            "priority": priority,
+            "weight": weight,
             "recency": recency,
-            "content_type": content_type or "unknown",
-            "category": str(padded[12]).strip() or "unknown",
+            "content_type": content_type,
+            "category": category,
             "transcript": transcript[:700],
             "reason": str(padded[14]).strip()[:300],
         })
 
-    examples.sort(
-        key=lambda item: (item["priority"], item["recency"]), reverse=True
-    )
-    approved = [item for item in examples if item["decision"] == "approved"][:10]
-    rejected = [item for item in examples if item["decision"] == "rejected"][:10]
+    examples.sort(key=lambda item: (item["weight"], item["recency"]), reverse=True)
+    approved = [item for item in examples if item["decision"] == "approved"][:12]
+    rejected = [item for item in examples if item["decision"] == "rejected"][:12]
 
     def format_examples(label: str, selected: list[dict[str, Any]]) -> str:
         if not selected:
@@ -2004,22 +2035,40 @@ def _short_learning_prompt(video_id: str) -> str:
         lines = [label + ":"]
         for item in selected:
             lines.append(
-                f"- type={item['content_type']} category={item['category']} | "
+                f"- weight={item['weight']:.2f} "
+                f"type={item['content_type']} category={item['category']} | "
                 f"{item['transcript']}"
                 + (f" | prior reason={item['reason']}" if item["reason"] else "")
             )
         return "\n".join(lines)
 
+    def format_scores(label: str, scores: dict[str, float]) -> str:
+        if not scores:
+            return f"{label}: none yet"
+        ordered = sorted(scores.items(), key=lambda item: abs(item[1]), reverse=True)[:10]
+        return label + ":\n" + "\n".join(
+            f"- {name}: {score:+.2f}" for name, score in ordered
+        )
+
     return (
         "LEARNING FROM DEREK'S SHORT REVIEWS\n"
-        "Treat approvals as positive structural examples and rejections as negative "
-        "examples. Learn the qualities, not their exact wording or timestamps. "
-        "Reject scripture-only readings without interpretation/application, generic "
-        "blurbs without a payoff, incomplete setups, and context-dependent fragments. "
-        "Require a standalone hook, developed point, and payoff.\n"
-        + format_examples("APPROVED SHORTS", approved)
+        "Use weighted wins/losses, not simple counts. Positive scores represent patterns "
+        "that have been approved more strongly; negative scores represent patterns that "
+        "have been rejected more strongly. Same-video reviews and recent reviews carry "
+        "more weight. Learn the qualities, not exact wording or timestamps.\n"
+        "A candidate must be a complete standalone thought: start at a natural thought "
+        "boundary, include the minimum setup needed for context, and end only after the "
+        "speaker completes the sentence or payoff. Never cut in mid-sentence or stop "
+        "before the thought resolves. Reject generic blurbs, incomplete setups, "
+        "context-dependent fragments, and scripture-only readings without interpretation "
+        "or application. Require a hook, developed point, and payoff.\n"
+        + format_scores("WEIGHTED CATEGORY WINS/LOSSES", category_scores)
         + "\n"
-        + format_examples("REJECTED SHORTS", rejected)
+        + format_scores("WEIGHTED CONTENT-TYPE WINS/LOSSES", content_type_scores)
+        + "\n"
+        + format_examples("HIGH-WEIGHT APPROVED SHORTS", approved)
+        + "\n"
+        + format_examples("HIGH-WEIGHT REJECTED SHORTS", rejected)
     )
 
 
