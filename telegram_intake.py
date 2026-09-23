@@ -229,6 +229,84 @@ def _queue_missing_approved_renders(request_id: str, chat_id: str) -> dict[str, 
     }
 
 
+
+def _fresh_start_from_request(
+    request_id: str,
+    chat_id: str,
+    user_id: str,
+) -> dict[str, Any]:
+    """Create a clean Telegram job while preserving Sheet-based learning."""
+    with _LOCK, _telegram_db() as db:
+        row = db.execute(
+            "SELECT * FROM telegram_requests WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+        if not row:
+            return {"status": "not_found", "request_id": request_id}
+
+        old_state = json.loads(row["state_json"])
+        parsed = dict(old_state.get("parsed") or {})
+        if not parsed:
+            return {"status": "missing_source", "request_id": request_id}
+
+        new_request_id = str(uuid.uuid4())
+        stamp = now()
+        fresh_state = {
+            "stage": "accepted",
+            "parsed": parsed,
+            "show_id": old_state.get("show_id"),
+            "force_rerip": True,
+            "reuse_existing": False,
+            "fresh_start": True,
+            "approval_learning_preserved": True,
+            "supersedes_request_id": request_id,
+        }
+        db.execute(
+            "INSERT INTO telegram_requests VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                new_request_id,
+                f"fresh-{uuid.uuid4()}",
+                str(row["chat_id"]),
+                str(user_id or row["user_id"] or ""),
+                "accepted",
+                str(row["mode"]),
+                str(row["source_kind"]),
+                str(row["source_value"]),
+                json.dumps(fresh_state),
+                stamp,
+                stamp,
+            ),
+        )
+        old_state["stage"] = "superseded"
+        old_state["rebuild_in_progress"] = False
+        old_state["superseded_by_request_id"] = new_request_id
+        old_state["superseded_at"] = stamp
+        db.execute(
+            "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? "
+            "WHERE request_id=?",
+            ("superseded", json.dumps(old_state), stamp, request_id),
+        )
+
+    _save(new_request_id, "accepted", fresh_state)
+    send(
+        chat_id,
+        "🧼 Clean start created. The broken Telegram job has been retired, "
+        "but your prior approvals and rejections remain in the Podcast sheet and "
+        "will still teach the next clip selection.\n"
+        f"Old Job ID: {request_id}\nNew Job ID: {new_request_id}",
+    )
+    threading.Thread(
+        target=_process,
+        args=(new_request_id,),
+        daemon=True,
+        name=f"fresh-start-{new_request_id[:8]}",
+    ).start()
+    return {
+        "status": "fresh_start_accepted",
+        "old_request_id": request_id,
+        "request_id": new_request_id,
+    }
+
 def _render_progress_text(request_id: str) -> str:
     with _LOCK, _telegram_db() as db:
         row = db.execute(
@@ -329,10 +407,16 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
                     "chat_id": chat_id,
                     "text": message,
                     "reply_markup": {
-                        "inline_keyboard": [[{
-                            "text": "♻️ Retry Missing Renders",
-                            "callback_data": f"rs:retry_missing:{request_id}",
-                        }]]
+                        "inline_keyboard": [
+                            [{
+                                "text": "♻️ Retry Missing Renders",
+                                "callback_data": f"rs:retry_missing:{request_id}",
+                            }],
+                            [{
+                                "text": "🧼 Fresh Start — Keep Learning",
+                                "callback_data": f"rs:fresh_start:{request_id}",
+                            }],
+                        ]
                     },
                 },
             )
@@ -2582,6 +2666,7 @@ def _process(request_id: str) -> None:
                     recovered_state = {
                         **state,
                         "stage": "awaiting_review",
+                        "rebuild_in_progress": False,
                         "video_path": str(video),
                         "source_reused": reused,
                         "result": recovered_result,
@@ -3147,6 +3232,16 @@ def _accept_update(
         background_tasks.add_task(_process, request_id)
         return {"status": choice, "request_id": request_id}
 
+    fresh_start = re.fullmatch(
+        r"rs:fresh_start:([A-Za-z0-9-]+)", callback_data
+    )
+    if fresh_start:
+        return _fresh_start_from_request(
+            fresh_start.group(1),
+            chat_id,
+            user_id,
+        )
+
     retry_missing = re.fullmatch(
         r"rs:retry_missing:([A-Za-z0-9-]+)", callback_data
     )
@@ -3626,6 +3721,16 @@ def _accept_update(
         background_tasks.add_task(_process, request_id)
         return {"status": "resume_accepted", "request_id": request_id}
 
+    fresh_start_match = re.fullmatch(
+        r"/fresh-start(?:@rippedshortsbot)?\s+([A-Za-z0-9-]+)", text, re.I
+    )
+    if fresh_start_match:
+        return _fresh_start_from_request(
+            fresh_start_match.group(1),
+            chat_id,
+            user_id,
+        )
+
     render_missing_match = re.fullmatch(
         r"/render-missing(?:@rippedshortsbot)?\s+([A-Za-z0-9-]+)", text, re.I
     )
@@ -3994,6 +4099,18 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
                     "rendered_at": now(),
                 }
                 latest_state["candidate_reviews"] = reviews
+                failures = list(latest_state.get("render_failure_history") or [])
+                failures.append({
+                    "at": now(),
+                    "candidate_index": index,
+                    "candidate_number": index + 1,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:4000],
+                    "stage": str(latest_state.get("stage") or ""),
+                    "rebuild_in_progress": bool(latest_state.get("rebuild_in_progress")),
+                })
+                latest_state["render_failure_history"] = failures[-50:]
+                latest_state["last_render_failure"] = failures[-1]
                 db.execute(
                     "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
                     ("awaiting_review", json.dumps(latest_state), now(), request_id),
