@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
 import threading
 import uuid
@@ -2519,6 +2520,7 @@ def _start_16_9_after_confirmation(request_id: str, chat_id: str) -> None:
 @durable_job("process")
 def _process(request_id: str) -> None:
     logger.info("Ripped Shorts job starting request_id=%s", request_id)
+    _ensure_storage_headroom()
     with _LOCK, _telegram_db() as db:
         row = db.execute("SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)).fetchone()
     if not row:
@@ -4455,6 +4457,41 @@ def _process_ripped_telegram_update_after_ack(update: dict[str, Any]) -> None:
             result.get("status", "unknown"),
             result.get("request_id", ""),
         )
+    except sqlite3.OperationalError as exc:
+        if "database or disk is full" not in str(exc).lower():
+            logger.exception(
+                "Ripped Shorts Telegram update failed after ACK update_id=%s",
+                update.get("update_id", ""),
+            )
+            return
+        logger.error(
+            "RIPPED_STORAGE_SQLITE_FULL update_id=%s; reclaiming storage and retrying once",
+            update.get("update_id", ""),
+        )
+        try:
+            _purge_expired_local_artifacts(emergency=True)
+            snapshot = _ensure_storage_headroom()
+            logger.warning(
+                "RIPPED_STORAGE_RETRY free_bytes=%s percent_free=%s",
+                snapshot["free_bytes"],
+                snapshot["percent_free"],
+            )
+            result = _accept_update(
+                update,
+                _ExecutorBackgroundTasks(),
+                trusted_source=False,
+            )
+            logger.info(
+                "RIPPED_STORAGE_RETRY_SUCCESS update_id=%s status=%s request_id=%s",
+                update.get("update_id", ""),
+                result.get("status", "unknown"),
+                result.get("request_id", ""),
+            )
+        except Exception:
+            logger.exception(
+                "RIPPED_STORAGE_RETRY_FAILED update_id=%s",
+                update.get("update_id", ""),
+            )
     except Exception:
         logger.exception(
             "Ripped Shorts Telegram update failed after ACK update_id=%s",
@@ -4688,14 +4725,41 @@ def _ensure_ripped_telegram_webhook() -> dict[str, Any]:
     return info
 
 
-def _purge_expired_local_artifacts() -> int:
-    """Keep rerun material for 48 hours, then reclaim only local cache files."""
-    retention_hours = max(1, int(os.getenv("LOCAL_ARTIFACT_RETENTION_HOURS", "48")))
+def _storage_snapshot() -> dict[str, Any]:
+    data_dir = Path(os.getenv("DATA_DIR", str(DB_PATH.parent)))
+    data_dir.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(data_dir)
+    percent_free = (usage.free / usage.total * 100.0) if usage.total else 0.0
+    return {
+        "path": str(data_dir),
+        "total_bytes": int(usage.total),
+        "used_bytes": int(usage.used),
+        "free_bytes": int(usage.free),
+        "percent_free": round(percent_free, 2),
+    }
+
+
+def _purge_expired_local_artifacts(
+    *,
+    retention_hours: int | None = None,
+    emergency: bool = False,
+) -> int:
+    """Reclaim local cache files while preserving the SQLite database."""
+    configured = int(os.getenv("LOCAL_ARTIFACT_RETENTION_HOURS", "12"))
+    retention_hours = max(
+        1,
+        int(retention_hours if retention_hours is not None else configured),
+    )
+    if emergency:
+        retention_hours = min(retention_hours, 1)
+
     cutoff = datetime.now(timezone.utc).timestamp() - retention_hours * 3600
     data_dir = Path(os.getenv("DATA_DIR", str(DB_PATH.parent)))
     removed = 0
+    removed_bytes = 0
     if not data_dir.exists():
         return 0
+
     protected = {DB_PATH.resolve()}
     for path in sorted(data_dir.rglob("*"), reverse=True):
         try:
@@ -4703,15 +4767,52 @@ def _purge_expired_local_artifacts() -> int:
                 if path.name in {DB_PATH.name + "-wal", DB_PATH.name + "-shm"}:
                     continue
                 if path.stat().st_mtime < cutoff:
+                    size = path.stat().st_size
                     path.unlink(missing_ok=True)
                     removed += 1
+                    removed_bytes += size
             elif path.is_dir() and path != data_dir and not any(path.iterdir()):
                 path.rmdir()
         except OSError:
             logger.warning("Could not purge expired artifact path=%s", path)
-    if removed:
-        logger.info("RIPPED_ARTIFACT_CLEANUP removed=%s retention_hours=%s", removed, retention_hours)
+
+    snapshot = _storage_snapshot()
+    logger.warning(
+        "RIPPED_STORAGE_CLEANUP removed_files=%s removed_bytes=%s "
+        "retention_hours=%s emergency=%s free_bytes=%s percent_free=%s",
+        removed,
+        removed_bytes,
+        retention_hours,
+        emergency,
+        snapshot["free_bytes"],
+        snapshot["percent_free"],
+    )
     return removed
+
+
+def _ensure_storage_headroom() -> dict[str, Any]:
+    """Proactively reclaim cache when the Railway volume is running low."""
+    snapshot = _storage_snapshot()
+    min_free_bytes = max(
+        256 * 1024 * 1024,
+        int(os.getenv("MIN_LOCAL_FREE_BYTES", str(1024 * 1024 * 1024))),
+    )
+    min_free_percent = max(
+        2.0,
+        float(os.getenv("MIN_LOCAL_FREE_PERCENT", "10")),
+    )
+    if (
+        snapshot["free_bytes"] < min_free_bytes
+        or snapshot["percent_free"] < min_free_percent
+    ):
+        logger.warning(
+            "RIPPED_STORAGE_PRESSURE free_bytes=%s percent_free=%s",
+            snapshot["free_bytes"],
+            snapshot["percent_free"],
+        )
+        _purge_expired_local_artifacts(emergency=True)
+        snapshot = _storage_snapshot()
+    return snapshot
 
 
 def _resume_stale_jobs() -> int:
@@ -4782,6 +4883,18 @@ def configure_ripped_telegram_webhook() -> None:
     except Exception:
         logger.exception("Could not configure Ripped Shorts Telegram webhook")
         return
+
+    try:
+        _purge_expired_local_artifacts()
+        snapshot = _ensure_storage_headroom()
+        logger.info(
+            "RIPPED_STORAGE_READY path=%s free_bytes=%s percent_free=%s",
+            snapshot["path"],
+            snapshot["free_bytes"],
+            snapshot["percent_free"],
+        )
+    except Exception:
+        logger.exception("Could not perform startup storage maintenance")
 
     readiness = _readiness()
     logger.info(
