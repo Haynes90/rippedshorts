@@ -2704,6 +2704,7 @@ def _process(request_id: str) -> None:
         final_state = {
             **state,
             "stage": "awaiting_review",
+            "rebuild_in_progress": False,
             "video_path": str(video),
             "source_reused": reused,
             "result": result,
@@ -2748,6 +2749,7 @@ def _process(request_id: str) -> None:
             latest_state.update(
                 {
                     "stage": "error",
+                    "rebuild_in_progress": False,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                     "retryable": True,
@@ -3778,6 +3780,22 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         if not row:
             raise RuntimeError(f"Ripped Shorts request not found: {request_id}")
         state = json.loads(row["state_json"])
+        result = state.get("result") or {}
+        segments = result.get("segments") or []
+        if state.get("rebuild_in_progress") or index >= len(segments):
+            logger.warning(
+                "RENDER_IGNORED_RESULT_NOT_READY request_id=%s candidate=%s rebuild_in_progress=%s",
+                request_id,
+                index + 1,
+                bool(state.get("rebuild_in_progress")),
+            )
+            send(
+                chat_id,
+                "⏳ This job is still rebuilding its fresh clip list. "
+                "Use the new review buttons after processing finishes.",
+            )
+            return
+        candidate = segments[index]
         reviews = dict(state.get("candidate_reviews") or {})
         reviews[str(index)] = {
             **reviews.get(str(index), {}),
@@ -3795,22 +3813,6 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             f"🎬 Short {index + 1} is now rendering.\n"
             f"{_render_progress_text(request_id)}",
         )
-        result = state.get("result") or {}
-        segments = result.get("segments") or []
-        if index >= len(segments):
-            logger.warning(
-                "RENDER_IGNORED_RESULT_NOT_READY request_id=%s candidate=%s rebuild_in_progress=%s",
-                request_id,
-                index + 1,
-                bool(state.get("rebuild_in_progress")),
-            )
-            send(
-                chat_id,
-                "⏳ This job is still rebuilding its fresh clip list. "
-                "Use the new review buttons after processing finishes.",
-            )
-            return
-        candidate = segments[index]
         user_id = str(
             (state.get("candidate_reviews") or {}).get(str(index), {}).get("user_id", "")
         )
