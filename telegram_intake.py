@@ -53,6 +53,13 @@ YOUTUBE_RE = re.compile(
 DRIVE_RE = re.compile(r"https?://drive\.google\.com/(?:file/d/|open\?id=|uc\?(?:[^\s]*&)?id=)([A-Za-z0-9_-]+)", re.I)
 _LOCK = threading.RLock()
 logger = logging.getLogger("ripped-shorts.telegram")
+
+_SHORT_FRAMEWORK_LIVE_DISABLED = False
+_SHORT_FRAMEWORK_LIVE_DISABLED_REASON = ""
+_SHORT_FRAMEWORK_LIVE_REFERENCE = ""
+_SHORT_FRAMEWORK_LIVE_CACHE = ""
+_SHORT_FRAMEWORK_LIVE_CACHE_AT: datetime | None = None
+_SHORT_FRAMEWORK_LOCK = threading.RLock()
 _TERMINAL_JOB_STAGES = {
     "superseded",
     "cancelled",
@@ -1902,8 +1909,32 @@ def _packaged_short_framework_prompt() -> str:
 
 
 def _configured_short_framework_prompt() -> str:
-    """Prefer the editable Google Doc and fail over to its approved snapshot."""
+    """Prefer the editable Google Doc, but stop retrying permanent permission failures."""
+    global _SHORT_FRAMEWORK_LIVE_DISABLED
+    global _SHORT_FRAMEWORK_LIVE_DISABLED_REASON
+    global _SHORT_FRAMEWORK_LIVE_REFERENCE
+    global _SHORT_FRAMEWORK_LIVE_CACHE
+    global _SHORT_FRAMEWORK_LIVE_CACHE_AT
+
     packaged = _packaged_short_framework_prompt()
+    cache_seconds = max(
+        60,
+        int(os.getenv("SHORT_FRAMEWORK_CACHE_SECONDS", "600")),
+    )
+
+    with _SHORT_FRAMEWORK_LOCK:
+        if _SHORT_FRAMEWORK_LIVE_DISABLED:
+            return packaged
+
+        if (
+            _SHORT_FRAMEWORK_LIVE_CACHE
+            and _SHORT_FRAMEWORK_LIVE_CACHE_AT is not None
+            and (
+                datetime.now(timezone.utc) - _SHORT_FRAMEWORK_LIVE_CACHE_AT
+            ).total_seconds() < cache_seconds
+        ):
+            return _SHORT_FRAMEWORK_LIVE_CACHE
+
     try:
         rows = get_rows(RIPPED_LOG_SHEET_ID, "Show Config", "A1:AF1000")
         ripped = next(
@@ -1920,22 +1951,63 @@ def _configured_short_framework_prompt() -> str:
             or (ripped or {}).get("prompt")
             or ""
         ).strip()
+
         if not reference:
+            with _SHORT_FRAMEWORK_LOCK:
+                _SHORT_FRAMEWORK_LIVE_DISABLED = True
+                _SHORT_FRAMEWORK_LIVE_DISABLED_REASON = "missing_prompt_reference"
             logger.warning(
-                "RIPPED Show Config has no prompt reference; using packaged approved framework"
+                "RIPPED Show Config has no prompt reference; live framework disabled "
+                "for this deployment and packaged approved framework will be used"
             )
             return packaged
+
         configured = read_google_doc_text(reference).strip()
         if configured:
-            logger.info("Loaded live 9:16 editorial framework from Google Docs")
+            with _SHORT_FRAMEWORK_LOCK:
+                _SHORT_FRAMEWORK_LIVE_REFERENCE = reference
+                _SHORT_FRAMEWORK_LIVE_CACHE = configured
+                _SHORT_FRAMEWORK_LIVE_CACHE_AT = datetime.now(timezone.utc)
+            logger.info(
+                "Loaded live 9:16 editorial framework from Google Docs; "
+                "caching for %ss",
+                cache_seconds,
+            )
             return configured
-        logger.warning("Live 9:16 framework was blank; using packaged approved framework")
-    except Exception as exc:
+
+        with _SHORT_FRAMEWORK_LOCK:
+            _SHORT_FRAMEWORK_LIVE_DISABLED = True
+            _SHORT_FRAMEWORK_LIVE_DISABLED_REASON = "blank_document"
+            _SHORT_FRAMEWORK_LIVE_REFERENCE = reference
         logger.warning(
-            "Live 9:16 editorial framework unavailable; using packaged approved "
-            "framework instead: %s",
-            exc,
+            "Live 9:16 framework was blank; live framework disabled for this "
+            "deployment and packaged approved framework will be used"
         )
+    except Exception as exc:
+        message = str(exc)
+        lowered = message.lower()
+        permanent_permission_failure = (
+            "403" in lowered
+            or "permission_denied" in lowered
+            or "does not have permission" in lowered
+            or "forbidden" in lowered
+        )
+        if permanent_permission_failure:
+            with _SHORT_FRAMEWORK_LOCK:
+                _SHORT_FRAMEWORK_LIVE_DISABLED = True
+                _SHORT_FRAMEWORK_LIVE_DISABLED_REASON = message[:500]
+            logger.warning(
+                "Live 9:16 editorial framework permission denied once; disabling "
+                "live Google Doc reads for this deployment and using packaged "
+                "approved framework instead"
+            )
+        else:
+            logger.warning(
+                "Live 9:16 editorial framework temporarily unavailable; using "
+                "packaged approved framework for this attempt: %s",
+                exc,
+            )
+
     if not packaged:
         raise RuntimeError(
             "Neither the live Google Doc nor the packaged approved 9:16 framework is available"
