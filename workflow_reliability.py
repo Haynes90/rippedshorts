@@ -275,6 +275,12 @@ def readiness_snapshot(db_path: Path, public_url: str, token_set: bool,
     data_dir = Path(os.getenv("DATA_DIR", str(db_path.parent))).resolve()
     persistent = str(data_dir).startswith("/data") or bool(os.getenv("RAILWAY_VOLUME_MOUNT_PATH"))
     db_ok = False
+    storage_space_ok = False
+    storage = {
+        "free_bytes": 0,
+        "total_bytes": 0,
+        "percent_free": 0.0,
+    }
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(db_path) as db:
@@ -282,9 +288,35 @@ def readiness_snapshot(db_path: Path, public_url: str, token_set: bool,
         db_ok = True
     except Exception:
         logger.exception("READINESS_DATABASE_FAILED")
+
+    try:
+        usage = shutil.disk_usage(data_dir)
+        percent_free = (usage.free / usage.total * 100.0) if usage.total else 0.0
+        min_free_bytes = max(
+            128 * 1024 * 1024,
+            int(os.getenv("HARD_LOCAL_FREE_BYTES", str(256 * 1024 * 1024))),
+        )
+        min_free_percent = max(
+            1.0,
+            float(os.getenv("READINESS_MIN_FREE_PERCENT", "5")),
+        )
+        storage = {
+            "free_bytes": int(usage.free),
+            "total_bytes": int(usage.total),
+            "percent_free": round(percent_free, 2),
+            "min_free_bytes": min_free_bytes,
+            "min_free_percent": min_free_percent,
+        }
+        storage_space_ok = (
+            usage.free >= min_free_bytes and percent_free >= min_free_percent
+        )
+    except Exception:
+        logger.exception("READINESS_STORAGE_FAILED")
+
     checks = {
         "database": db_ok,
         "persistent_storage": persistent,
+        "storage_space": storage_space_ok,
         "telegram_token": token_set,
         "telegram_group": group_id_set,
         "public_url": bool(public_url),
@@ -299,5 +331,6 @@ def readiness_snapshot(db_path: Path, public_url: str, token_set: bool,
     return {
         "ready": all(checks.values()),
         "checks": checks,
+        "storage": storage,
         "checked_at": utc_now(),
     }
