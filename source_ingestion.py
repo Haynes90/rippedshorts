@@ -496,9 +496,8 @@ def _log_source_winner(
         flush=True,
     )
     spreadsheet_id = (
-        os.getenv("DEFAULT_SHEET_ID")
-        or os.getenv("PODCAST_SHEET_ID")
-        or "1xfp-sjO9Mnvwe7-bM6htT-0RKiOig21HfP_otzO9xws"
+        os.getenv("PODCAST_SHEET_ID")
+        or "14VruBxjaaE9DyPSdBidMeuPHew3nHUC5sRNGXtLCsis"
     ).strip()
     if spreadsheet_id:
         try:
