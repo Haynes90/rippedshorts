@@ -4979,6 +4979,27 @@ def _resume_stale_jobs() -> int:
             parsed = state.get("parsed") or {}
             video_id = str(parsed.get("video_id") or "").strip()
 
+            terminal = (
+                status in _TERMINAL_JOB_STAGES
+                or stage in _TERMINAL_JOB_STAGES
+                or bool(state.get("superseded_by_request_id"))
+            )
+            if terminal:
+                # A finished/scheduled job closes older work for this source.
+                # A superseded job does not: its replacement is the active owner.
+                if video_id and (
+                    status in {"published", "complete", "completed", "scheduled"}
+                    or stage in {"published", "complete", "completed", "scheduled"}
+                ):
+                    seen_video_ids.add(video_id)
+                logger.info(
+                    "RIPPED_JOB_WATCHDOG_SKIP_TERMINAL request_id=%s status=%s stage=%s",
+                    row["request_id"],
+                    status,
+                    stage,
+                )
+                continue
+
             if video_id:
                 if video_id in seen_video_ids:
                     logger.info(
@@ -4988,19 +5009,6 @@ def _resume_stale_jobs() -> int:
                     )
                     continue
                 seen_video_ids.add(video_id)
-
-            if (
-                status in _TERMINAL_JOB_STAGES
-                or stage in _TERMINAL_JOB_STAGES
-                or state.get("superseded_by_request_id")
-            ):
-                logger.info(
-                    "RIPPED_JOB_WATCHDOG_SKIP_TERMINAL request_id=%s status=%s stage=%s",
-                    row["request_id"],
-                    status,
-                    stage,
-                )
-                continue
 
             if any(word in stage for word in ("review", "awaiting")):
                 continue
