@@ -40,8 +40,8 @@ def test_ledger_writes_all_columns(monkeypatch, existing):
     writes = values.update.call_args_list + values.append.call_args_list
     assert len(writes) == 2
     for call in writes:
-        assert ':R' in call.kwargs['range']
-        assert len(call.kwargs['body']['values'][0]) == 18
+        assert ':V' in call.kwargs['range']
+        assert len(call.kwargs['body']['values'][0]) == 22
 
 
 def test_telegram_error_traceback_does_not_expose_token(monkeypatch):

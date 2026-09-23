@@ -19,6 +19,7 @@ HEADERS = [
     "current_owner", "current_stage", "last_successful_stage", "next_action",
     "status", "attempt_count", "heartbeat_at", "error_class",
     "error_message", "chat_id", "user_id", "updated_at", "standard_state",
+    "source_provider", "source_profile", "source_acquired_at", "source_bytes",
 ]
 def _last_column() -> str:
     number = len(HEADERS)
@@ -201,6 +202,53 @@ def upsert_job(spreadsheet_id: str, request_id: str, status: str, state: dict[st
     except Exception:
         logger.exception("WORKFLOW_LEDGER_UPSERT_FAILED job_id=%s stage=%s", request_id, stage)
 
+
+
+def record_source_winner(
+    spreadsheet_id: str,
+    video_id: str,
+    provider: str,
+    profile: str,
+    source_bytes: int,
+) -> bool:
+    """Record the successful source-acquisition provider on the latest job for a video."""
+    try:
+        with _LOCK:
+            _, _, sheets = _services()
+            _ensure_tab(sheets, spreadsheet_id)
+            rows = sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{WORKFLOW_JOBS_TAB}'!A:{_last_column()}",
+            ).execute().get("values", [])
+            target = None
+            for number, values in enumerate(rows[1:], 2):
+                padded = list(values) + [""] * (len(HEADERS) - len(values))
+                if str(padded[2]) == video_id:
+                    target = number
+            if target is None:
+                logger.warning(
+                    "SOURCE_WINNER_LEDGER_ROW_NOT_FOUND video_id=%s provider=%s profile=%s",
+                    video_id, provider, profile,
+                )
+                return False
+            acquired_at = utc_now()
+            sheets.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{WORKFLOW_JOBS_TAB}'!S{target}:V{target}",
+                valueInputOption="RAW",
+                body={"values": [[provider, profile, acquired_at, int(source_bytes or 0)]]},
+            ).execute()
+            logger.info(
+                "SOURCE_WINNER_LEDGER_UPDATED video_id=%s row=%s provider=%s profile=%s bytes=%s",
+                video_id, target, provider, profile, source_bytes,
+            )
+            return True
+    except Exception:
+        logger.exception(
+            "SOURCE_WINNER_LEDGER_UPDATE_FAILED video_id=%s provider=%s profile=%s",
+            video_id, provider, profile,
+        )
+        return False
 
 def latest_incomplete(spreadsheet_id: str, chat_id: str = "", user_id: str = "") -> dict[str, str] | None:
     _, _, sheets = _services()
