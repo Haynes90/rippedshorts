@@ -18,6 +18,7 @@ from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request, 
 
 from audio_master_handoff import DB_PATH, SOURCE_DIR, connect, download_drive, drive_metadata, get_job
 from source_ingestion import (
+    download_youtube_resilient,
     ingest_with_audio_master,
     restrict_to_boundary,
     reuse_from_drive,
@@ -67,6 +68,90 @@ RIPPED_LOG_SHEET_TAB = os.getenv("RIPPED_SHORTS_LOG_SHEET_TAB", "Ripped Shorts")
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_SOURCE_RECOVERY_LOCK = threading.RLock()
+
+
+def _ensure_render_source(request_id: str, state: dict[str, Any]) -> Path:
+    """Return a usable local source file, rehydrating durable media after redeploys."""
+    current_value = str(state.get("video_path") or "").strip()
+    current = Path(current_value) if current_value else None
+    if current and current.is_file() and current.stat().st_size > 0:
+        return current
+
+    parsed = state.get("parsed") or {}
+    video_id = str(parsed.get("video_id") or "").strip()
+    source_url = str(parsed.get("source_value") or "").strip()
+    if not video_id:
+        raise RuntimeError(
+            "Render source is missing after restart and this job has no YouTube video ID "
+            "available for recovery."
+        )
+
+    recovery_dir = SOURCE_DIR / video_id
+    recovery_dir.mkdir(parents=True, exist_ok=True)
+
+    with _SOURCE_RECOVERY_LOCK:
+        # Another render may have already recovered the same source while this one waited.
+        with _LOCK, _telegram_db() as db:
+            latest = db.execute(
+                "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+        if latest:
+            latest_state = json.loads(latest["state_json"])
+            latest_value = str(latest_state.get("video_path") or "").strip()
+            latest_path = Path(latest_value) if latest_value else None
+            if latest_path and latest_path.is_file() and latest_path.stat().st_size > 0:
+                state["video_path"] = str(latest_path)
+                return latest_path
+
+        logger.warning(
+            "RENDER_SOURCE_MISSING request_id=%s video_id=%s old_path=%s; "
+            "rehydrating from Drive/cache",
+            request_id,
+            video_id,
+            current_value,
+        )
+        recovered = reuse_from_drive(video_id, recovery_dir)
+        recovered_path = recovered.get("video_path")
+        if recovered_path:
+            path = Path(recovered_path)
+        else:
+            youtube_url = (
+                source_url
+                if source_url.startswith("http")
+                else f"https://www.youtube.com/watch?v={video_id}"
+            )
+            logger.warning(
+                "RENDER_SOURCE_DRIVE_MISS request_id=%s video_id=%s; "
+                "falling back to resilient YouTube acquisition",
+                request_id,
+                video_id,
+            )
+            path = download_youtube_resilient(video_id, youtube_url, recovery_dir)
+
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise RuntimeError(
+                f"Recovered render source is unusable for video_id={video_id}: {path}"
+            )
+
+        state["video_path"] = str(path)
+        state["source_rehydrated_at"] = now()
+        with _LOCK, _telegram_db() as db:
+            db.execute(
+                "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+                (json.dumps(state), now(), request_id),
+            )
+        logger.info(
+            "RENDER_SOURCE_REHYDRATED request_id=%s video_id=%s path=%s bytes=%s",
+            request_id,
+            video_id,
+            path,
+            path.stat().st_size,
+        )
+        return path
 
 
 def _render_progress_text(request_id: str) -> str:
@@ -3586,7 +3671,7 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
             )
         send(chat_id, f"🎬 16:9 Segment {index + 1} is now rendering.")
         segment = state["topic_result"]["segments"][index]
-        video = Path(state["video_path"])
+        video = _ensure_render_source(request_id, state)
         video_id = state["parsed"].get("video_id", request_id)
         vid_title = _state_vid_title(state)
         import main
@@ -3685,7 +3770,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         user_id = str(
             (state.get("candidate_reviews") or {}).get(str(index), {}).get("user_id", "")
         )
-        video = Path(state["video_path"])
+        video = _ensure_render_source(request_id, state)
         vid_title = _state_vid_title(state)
         import main
 
