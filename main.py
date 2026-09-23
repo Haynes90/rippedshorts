@@ -274,6 +274,31 @@ def build_transcript_text(segments: List[dict]) -> str:
     return "\n".join(lines)
 
 
+
+def google_credential_identity() -> dict[str, str]:
+    """Report which configured service-account identity Google clients will use."""
+    source = ""
+    email = ""
+    if GOOGLE_CREDENTIALS:
+        source = "GOOGLE_CREDENTIALS"
+        try:
+            info = json.loads(GOOGLE_CREDENTIALS)
+            email = str(info.get("client_email") or "").strip()
+        except Exception:
+            email = "<invalid-json>"
+    elif GOOGLE_SERVICE_ACCOUNT_FILE:
+        source = "GOOGLE_SERVICE_ACCOUNT_FILE"
+        try:
+            info = json.loads(Path(GOOGLE_SERVICE_ACCOUNT_FILE).read_text(encoding="utf-8"))
+            email = str(info.get("client_email") or "").strip()
+        except Exception:
+            email = "<unreadable-file>"
+    elif GOOGLE_CLIENT_EMAIL and GOOGLE_PRIVATE_KEY:
+        source = "GOOGLE_CLIENT_EMAIL"
+        email = str(GOOGLE_CLIENT_EMAIL).strip()
+    return {"source": source, "client_email": email}
+
+
 def get_google_services():
     scopes = [
         "https://www.googleapis.com/auth/drive",
@@ -1534,4 +1559,24 @@ app.include_router(telegram_intake_router)
 
 @app.on_event("startup")
 def register_ripped_shorts_telegram_webhook():
+    identity = google_credential_identity()
+    logger.info(
+        "GOOGLE_SERVICE_ACCOUNT source=%s client_email=%s",
+        identity.get("source") or "none",
+        identity.get("client_email") or "unknown",
+    )
+    configured_email = str(GOOGLE_CLIENT_EMAIL or "").strip()
+    active_email = str(identity.get("client_email") or "").strip()
+    if (
+        GOOGLE_CREDENTIALS
+        and configured_email
+        and active_email
+        and active_email != configured_email
+    ):
+        logger.warning(
+            "GOOGLE_SERVICE_ACCOUNT_MISMATCH active=%s GOOGLE_CLIENT_EMAIL=%s "
+            "because GOOGLE_CREDENTIALS takes precedence",
+            active_email,
+            configured_email,
+        )
     configure_ripped_telegram_webhook()
