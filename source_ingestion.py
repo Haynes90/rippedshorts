@@ -302,6 +302,213 @@ def ingest_with_audio_master(video_id: str, youtube_url: str, progress=None) -> 
         f"last status={last.get('status')}, job_id={job_id}"
     )
 
+def _run_rapidapi_profile(
+    *,
+    video_id: str,
+    workdir: Path,
+    stop_event: threading.Event,
+) -> Path:
+    """Request the configured RapidAPI downloader and poll its returned file URL."""
+    api_key = (os.getenv("RAPIDAPI_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("RAPIDAPI_KEY not configured")
+
+    host = (
+        os.getenv("YOUTUBE_DL_HOST")
+        or "youtube-video-fast-downloader-24-7.p.rapidapi.com"
+    ).strip()
+    path_template = (
+        os.getenv("YOUTUBE_DL_PATH_TEMPLATE")
+        or "/download_video/{video_id}"
+    ).strip()
+    quality = (os.getenv("YOUTUBE_DL_QUALITY") or "247").strip()
+    request_url = f"https://{host}{path_template.format(video_id=video_id)}"
+    headers = {
+        "x-rapidapi-host": host,
+        "x-rapidapi-key": api_key,
+    }
+
+    lane = workdir / ".youtube-lane-rapidapi_video_download"
+    shutil.rmtree(lane, ignore_errors=True)
+    lane.mkdir(parents=True, exist_ok=True)
+    target = lane / f"{video_id}-source.mp4"
+
+    print(
+        f"RIPPED_SOURCE_PROFILE start video_id={video_id} "
+        "profile=rapidapi_video_download provider=rapidapi",
+        flush=True,
+    )
+
+    try:
+        response = requests.get(
+            request_url,
+            headers=headers,
+            params={"quality": quality},
+            timeout=(10, 60),
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+
+        content_type = (response.headers.get("content-type") or "").lower()
+        if (
+            "video/" in content_type
+            or "application/octet-stream" in content_type
+        ):
+            target.write_bytes(response.content)
+            if target.stat().st_size <= 0:
+                raise RuntimeError("RapidAPI returned an empty video response")
+            return target
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"RapidAPI downloader returned unexpected content-type={content_type!r}"
+            ) from exc
+
+        file_url = ""
+        if isinstance(payload, dict):
+            file_url = str(
+                payload.get("file")
+                or payload.get("download_url")
+                or payload.get("video_url")
+                or payload.get("url")
+                or ""
+            ).strip()
+            if not file_url and isinstance(payload.get("data"), dict):
+                data = payload["data"]
+                file_url = str(
+                    data.get("file")
+                    or data.get("download_url")
+                    or data.get("video_url")
+                    or data.get("url")
+                    or ""
+                ).strip()
+        if not file_url:
+            raise RuntimeError(f"RapidAPI downloader returned no file URL: {payload}")
+
+        deadline = time.monotonic() + max(
+            30, int(os.getenv("YOUTUBE_DL_READY_TIMEOUT_SECONDS", "360"))
+        )
+        poll_seconds = max(
+            2, int(os.getenv("YOUTUBE_DL_READY_POLL_SECONDS", "10"))
+        )
+        last_status = None
+        while time.monotonic() < deadline:
+            if stop_event.is_set():
+                raise RuntimeError("cancelled because another source provider won")
+            file_response = requests.get(
+                file_url,
+                timeout=(10, 120),
+                stream=True,
+                allow_redirects=True,
+            )
+            last_status = file_response.status_code
+            if file_response.status_code == 404:
+                file_response.close()
+                time.sleep(poll_seconds)
+                continue
+            file_response.raise_for_status()
+            download_type = (file_response.headers.get("content-type") or "").lower()
+            if "text/html" in download_type or "application/json" in download_type:
+                body = file_response.text[:500]
+                file_response.close()
+                raise RuntimeError(
+                    f"RapidAPI file URL returned non-video content "
+                    f"type={download_type!r}: {body}"
+                )
+            with target.open("wb") as handle:
+                for chunk in file_response.iter_content(chunk_size=1024 * 1024):
+                    if stop_event.is_set():
+                        raise RuntimeError("cancelled because another source provider won")
+                    if chunk:
+                        handle.write(chunk)
+            file_response.close()
+            if target.is_file() and target.stat().st_size > 0:
+                print(
+                    f"RIPPED_SOURCE_PROFILE success video_id={video_id} "
+                    f"profile=rapidapi_video_download provider=rapidapi "
+                    f"bytes={target.stat().st_size}",
+                    flush=True,
+                )
+                return target
+            time.sleep(poll_seconds)
+
+        raise RuntimeError(
+            f"RapidAPI file was not ready before timeout; last_status={last_status}"
+        )
+    except Exception as exc:
+        print(
+            f"RIPPED_SOURCE_PROFILE failed video_id={video_id} "
+            f"profile=rapidapi_video_download provider=rapidapi "
+            f"error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        raise
+
+
+def _run_source_profile(
+    *,
+    profile: dict[str, Any],
+    video_id: str,
+    youtube_url: str,
+    workdir: Path,
+    cookie_file: str,
+    pot_home: str,
+    stop_event: threading.Event,
+) -> Path:
+    if profile.get("provider") == "rapidapi":
+        return _run_rapidapi_profile(
+            video_id=video_id,
+            workdir=workdir,
+            stop_event=stop_event,
+        )
+    return _run_youtube_profile(
+        profile=profile,
+        video_id=video_id,
+        youtube_url=youtube_url,
+        workdir=workdir,
+        cookie_file=cookie_file,
+        pot_home=pot_home,
+        stop_event=stop_event,
+    )
+
+
+def _log_source_winner(
+    *,
+    video_id: str,
+    profile: dict[str, Any],
+    path: Path,
+    workdir: Path,
+) -> None:
+    provider = str(profile.get("provider") or "yt-dlp")
+    record = {
+        "event": "source_acquisition_winner",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "video_id": video_id,
+        "provider": provider,
+        "profile": profile.get("name"),
+        "bytes": path.stat().st_size if path.exists() else 0,
+    }
+    print(
+        "RIPPED_SOURCE_WINNER "
+        + " ".join(f"{key}={value}" for key, value in record.items()),
+        flush=True,
+    )
+    log_root = Path(os.getenv("DATA_DIR") or workdir)
+    try:
+        log_root.mkdir(parents=True, exist_ok=True)
+        with (log_root / "source_acquisition.jsonl").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        print(
+            f"RIPPED_SOURCE_WINNER_LOG failed video_id={video_id} error={exc}",
+            flush=True,
+        )
+
+
 def _run_youtube_profile(
     *,
     profile: dict[str, Any],
@@ -419,6 +626,14 @@ def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -
     )
 
     profiles: list[dict[str, Any]] = []
+    rapidapi_ready = bool((os.getenv("RAPIDAPI_KEY") or "").strip())
+    if rapidapi_ready:
+        profiles.append(
+            {
+                "name": "rapidapi_video_download",
+                "provider": "rapidapi",
+            }
+        )
     if has_pot:
         profiles.append(
             {
@@ -492,7 +707,7 @@ def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -
             except StopIteration:
                 break
             future = executor.submit(
-                _run_youtube_profile,
+                _run_source_profile,
                 profile=profile,
                 video_id=video_id,
                 youtube_url=youtube_url,
@@ -504,7 +719,7 @@ def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -
             futures[future] = profile
 
         winner: Path | None = None
-        winner_profile = ""
+        winner_profile: dict[str, Any] | None = None
         while futures and winner is None:
             done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
             for future in done:
@@ -518,7 +733,7 @@ def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -
                     except StopIteration:
                         continue
                     replacement_future = executor.submit(
-                        _run_youtube_profile,
+                        _run_source_profile,
                         profile=replacement_profile,
                         video_id=video_id,
                         youtube_url=youtube_url,
@@ -531,7 +746,7 @@ def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -
                     continue
 
                 winner = candidate
-                winner_profile = profile["name"]
+                winner_profile = profile
                 stop_event.set()
                 break
 
@@ -541,8 +756,18 @@ def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -
             if destination.exists():
                 destination.unlink()
             shutil.move(str(winner), str(destination))
+            if winner_profile is None:
+                raise RuntimeError("source winner profile was not recorded")
+            _log_source_winner(
+                video_id=video_id,
+                profile=winner_profile,
+                path=destination,
+                workdir=workdir,
+            )
             print(
-                f"RIPPED_SOURCE_RACE winner video_id={video_id} profile={winner_profile}",
+                f"RIPPED_SOURCE_RACE winner video_id={video_id} "
+                f"profile={winner_profile['name']} "
+                f"provider={winner_profile.get('provider', 'yt-dlp')}",
                 flush=True,
             )
             return destination
