@@ -8,6 +8,9 @@ import json
 import os
 import re
 import time
+import shutil
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
@@ -299,8 +302,83 @@ def ingest_with_audio_master(video_id: str, youtube_url: str, progress=None) -> 
         f"last status={last.get('status')}, job_id={job_id}"
     )
 
+def _run_youtube_profile(
+    *,
+    profile: dict[str, Any],
+    video_id: str,
+    youtube_url: str,
+    workdir: Path,
+    cookie_file: str,
+    pot_home: str,
+    stop_event: threading.Event,
+) -> Path:
+    """Run one isolated yt-dlp profile so parallel attempts cannot collide."""
+    lane = workdir / f".youtube-lane-{profile['name']}"
+    shutil.rmtree(lane, ignore_errors=True)
+    lane.mkdir(parents=True, exist_ok=True)
+    lane_output = lane / f"{video_id}-source.%(ext)s"
+
+    def _cancel_if_winner_exists(status: dict[str, Any]) -> None:
+        if stop_event.is_set():
+            raise RuntimeError("cancelled because another YouTube acquisition profile won")
+
+    options: dict[str, Any] = {
+        "outtmpl": str(lane_output),
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
+        "concurrent_fragment_downloads": 4,
+        "socket_timeout": 45,
+        "quiet": True,
+        "no_warnings": True,
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
+        "progress_hooks": [_cancel_if_winner_exists],
+    }
+    if profile.get("format"):
+        options["format"] = profile["format"]
+    clients = profile.get("player_client")
+    if clients:
+        options["extractor_args"] = {"youtube": {"player_client": clients}}
+    if profile.get("pot"):
+        options.setdefault("extractor_args", {})["youtubepot-bgutilscript"] = {
+            "server_home": [pot_home]
+        }
+    if profile.get("cookies"):
+        options["cookiefile"] = cookie_file
+
+    print(
+        f"RIPPED_SOURCE_PROFILE start video_id={video_id} profile={profile['name']} "
+        f"po_token={bool(profile.get('pot'))} cookies={bool(profile.get('cookies'))}",
+        flush=True,
+    )
+    try:
+        with YoutubeDL(options) as ydl:
+            ydl.extract_info(youtube_url, download=True)
+        if stop_event.is_set():
+            raise RuntimeError("cancelled because another YouTube acquisition profile won")
+        matches = sorted(lane.glob(f"{video_id}-source.*"))
+        usable = next((item for item in matches if item.is_file() and item.stat().st_size > 0), None)
+        if not usable:
+            raise RuntimeError("profile completed without a usable source video")
+        print(
+            f"RIPPED_SOURCE_PROFILE success video_id={video_id} profile={profile['name']} "
+            f"bytes={usable.stat().st_size}",
+            flush=True,
+        )
+        return usable
+    except Exception as exc:
+        print(
+            f"RIPPED_SOURCE_PROFILE failed video_id={video_id} profile={profile['name']} "
+            f"error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        raise
+
+
 def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -> Path:
-    """Acquire a full video using Audio Master's ordered YouTube provider profiles."""
+    """Acquire a full video with two concurrent fallback lanes; first valid download wins."""
     workdir.mkdir(parents=True, exist_ok=True)
     destination = workdir / f"{video_id}-source.mp4"
     cookie_file = (
@@ -309,7 +387,6 @@ def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -
         or os.getenv("YOUTUBE_COOKIES_FILE")
         or os.getenv("YOUTUBE_COOKIE_FILE")
         or os.getenv("YT_DLP_COOKIE_FILE")
-        or os.getenv("YTDLP_COOKIES_FILE")
         or ""
     ).strip()
     generated_cookie_file = workdir / "youtube-cookies.txt"
@@ -336,44 +413,53 @@ def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -
         or "/opt/bgutil-ytdlp-pot-provider/server"
     ).strip()
     has_pot = bool(pot_home and Path(pot_home).is_dir())
-    profiles: list[dict[str, Any]] = [
-        {
-            "name": "public_original_selector",
-            "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
-            "player_client": ["default", "tv_simply"],
-        },
-        {
-            "name": "public_auto_format",
-            "format": None,
-            "player_client": ["default", "tv_simply"],
-        },
-        {
-            "name": "public_android_vr",
-            "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
-            "player_client": ["android_vr"],
-        },
-        {
-            "name": "public_web_safari",
-            "format": None,
-            "player_client": ["web_safari"],
-        },
-    ]
+    print(
+        f"PO_TOKEN_PROVIDER ready={str(has_pot).lower()} home={pot_home}",
+        flush=True,
+    )
+
+    profiles: list[dict[str, Any]] = []
     if has_pot:
-        profiles.extend(
-            [
-                {
-                    "name": "automatic_po_token_mweb",
-                    "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
-                    "player_client": ["mweb"],
-                    "pot": True,
-                },
-                {
-                    "name": "automatic_po_token_web_safari",
-                    "format": None,
-                    "player_client": ["web_safari"],
-                    "pot": True,
-                },
-            ]
+        profiles.append(
+            {
+                "name": "automatic_po_token_mweb",
+                "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+                "player_client": ["mweb"],
+                "pot": True,
+            }
+        )
+    profiles.extend(
+        [
+            {
+                "name": "public_original_selector",
+                "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+                "player_client": ["default", "tv_simply"],
+            },
+            {
+                "name": "public_auto_format",
+                "format": None,
+                "player_client": ["default", "tv_simply"],
+            },
+            {
+                "name": "public_android_vr",
+                "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+                "player_client": ["android_vr"],
+            },
+            {
+                "name": "public_web_safari",
+                "format": None,
+                "player_client": ["web_safari"],
+            },
+        ]
+    )
+    if has_pot:
+        profiles.append(
+            {
+                "name": "automatic_po_token_web_safari",
+                "format": None,
+                "player_client": ["web_safari"],
+                "pot": True,
+            }
         )
     if cookie_file and Path(cookie_file).is_file():
         profiles.extend(
@@ -395,61 +481,71 @@ def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -
         )
 
     failures: list[str] = []
-    for profile in profiles:
-        for old in workdir.glob(f"{video_id}-source.*"):
+    stop_event = threading.Event()
+    pending_profiles = iter(profiles)
+    futures: dict[Any, dict[str, Any]] = {}
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="youtube-acquire") as executor:
+        for _ in range(2):
             try:
-                old.unlink()
-            except OSError:
-                pass
-        options: dict[str, Any] = {
-            "outtmpl": str(destination),
-            "merge_output_format": "mp4",
-            "noplaylist": True,
-            "retries": 5,
-            "fragment_retries": 5,
-            "extractor_retries": 3,
-            "concurrent_fragment_downloads": 4,
-            "socket_timeout": 45,
-            "quiet": True,
-            "no_warnings": True,
-            "http_headers": {"User-Agent": "Mozilla/5.0"},
-        }
-        if profile.get("format"):
-            options["format"] = profile["format"]
-        clients = profile.get("player_client")
-        if clients:
-            options["extractor_args"] = {"youtube": {"player_client": clients}}
-        if profile.get("pot"):
-            options.setdefault("extractor_args", {})["youtubepot-bgutilscript"] = {
-                "server_home": [pot_home]
-            }
-        if profile.get("cookies"):
-            options["cookiefile"] = cookie_file
-        try:
+                profile = next(pending_profiles)
+            except StopIteration:
+                break
+            future = executor.submit(
+                _run_youtube_profile,
+                profile=profile,
+                video_id=video_id,
+                youtube_url=youtube_url,
+                workdir=workdir,
+                cookie_file=cookie_file,
+                pot_home=pot_home,
+                stop_event=stop_event,
+            )
+            futures[future] = profile
+
+        winner: Path | None = None
+        winner_profile = ""
+        while futures and winner is None:
+            done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+            for future in done:
+                profile = futures.pop(future)
+                try:
+                    candidate = future.result()
+                except Exception as exc:
+                    failures.append(f"{profile['name']}: {type(exc).__name__}: {exc}")
+                    try:
+                        replacement_profile = next(pending_profiles)
+                    except StopIteration:
+                        continue
+                    replacement_future = executor.submit(
+                        _run_youtube_profile,
+                        profile=replacement_profile,
+                        video_id=video_id,
+                        youtube_url=youtube_url,
+                        workdir=workdir,
+                        cookie_file=cookie_file,
+                        pot_home=pot_home,
+                        stop_event=stop_event,
+                    )
+                    futures[replacement_future] = replacement_profile
+                    continue
+
+                winner = candidate
+                winner_profile = profile["name"]
+                stop_event.set()
+                break
+
+        if winner is not None:
+            for future in futures:
+                future.cancel()
+            if destination.exists():
+                destination.unlink()
+            shutil.move(str(winner), str(destination))
             print(
-                f"RIPPED_SOURCE_PROFILE start video_id={video_id} profile={profile['name']} "
-                f"po_token={bool(profile.get('pot'))} cookies={bool(profile.get('cookies'))}",
+                f"RIPPED_SOURCE_RACE winner video_id={video_id} profile={winner_profile}",
                 flush=True,
             )
-            with YoutubeDL(options) as ydl:
-                ydl.extract_info(youtube_url, download=True)
-            matches = sorted(workdir.glob(f"{video_id}-source.*"))
-            usable = next((item for item in matches if item.is_file() and item.stat().st_size > 0), None)
-            if usable:
-                print(
-                    f"RIPPED_SOURCE_PROFILE success video_id={video_id} profile={profile['name']} "
-                    f"bytes={usable.stat().st_size}",
-                    flush=True,
-                )
-                return usable
-            raise RuntimeError("profile completed without a usable source video")
-        except Exception as exc:
-            failures.append(f"{profile['name']}: {type(exc).__name__}: {exc}")
-            print(
-                f"RIPPED_SOURCE_PROFILE failed video_id={video_id} profile={profile['name']} "
-                f"error={type(exc).__name__}: {exc}",
-                flush=True,
-            )
+            return destination
 
     raise RuntimeError(
         "All Ripped Shorts full-video acquisition profiles failed for "
