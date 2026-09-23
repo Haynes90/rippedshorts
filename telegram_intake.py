@@ -53,6 +53,16 @@ YOUTUBE_RE = re.compile(
 DRIVE_RE = re.compile(r"https?://drive\.google\.com/(?:file/d/|open\?id=|uc\?(?:[^\s]*&)?id=)([A-Za-z0-9_-]+)", re.I)
 _LOCK = threading.RLock()
 logger = logging.getLogger("ripped-shorts.telegram")
+_TERMINAL_JOB_STAGES = {
+    "superseded",
+    "cancelled",
+    "canceled",
+    "complete",
+    "completed",
+    "published",
+    "scheduled",
+    "permanent_failure",
+}
 RIPPED_SHORTS_RENDER_WORKERS = max(
     1, int(os.getenv("RIPPED_SHORTS_RENDER_WORKERS", "3"))
 )
@@ -2520,13 +2530,64 @@ def _start_16_9_after_confirmation(request_id: str, chat_id: str) -> None:
 @durable_job("process")
 def _process(request_id: str) -> None:
     logger.info("Ripped Shorts job starting request_id=%s", request_id)
-    _ensure_storage_headroom()
+    snapshot = _ensure_storage_headroom()
+    hard_floor = max(
+        128 * 1024 * 1024,
+        int(os.getenv("HARD_LOCAL_FREE_BYTES", str(256 * 1024 * 1024))),
+    )
+    if snapshot["free_bytes"] < hard_floor:
+        logger.error(
+            "RIPPED_PROCESS_PAUSED_STORAGE request_id=%s free_bytes=%s hard_floor=%s",
+            request_id,
+            snapshot["free_bytes"],
+            hard_floor,
+        )
+        return
     with _LOCK, _telegram_db() as db:
         row = db.execute("SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)).fetchone()
     if not row:
         logger.error("Ripped Shorts job missing from database request_id=%s", request_id)
         return
     state, chat_id = json.loads(row["state_json"]), row["chat_id"]
+    status = str(row["status"] or "").lower()
+    stage = str(state.get("stage") or status).lower()
+    if status in _TERMINAL_JOB_STAGES or stage in _TERMINAL_JOB_STAGES or state.get("superseded_by_request_id"):
+        logger.info(
+            "RIPPED_PROCESS_SKIP_TERMINAL request_id=%s status=%s stage=%s superseded_by=%s",
+            request_id,
+            status,
+            stage,
+            state.get("superseded_by_request_id") or "",
+        )
+        return
+
+    parsed = state.get("parsed") or {}
+    video_id_for_guard = str(parsed.get("video_id") or "").strip()
+    if video_id_for_guard:
+        with _LOCK, _telegram_db() as db:
+            peers = db.execute(
+                "SELECT request_id,status,state_json,updated_at FROM telegram_requests "
+                "WHERE request_id<>? ORDER BY updated_at DESC",
+                (request_id,),
+            ).fetchall()
+        for peer in peers:
+            peer_state = json.loads(peer["state_json"])
+            peer_status = str(peer["status"] or "").lower()
+            peer_stage = str(peer_state.get("stage") or peer_status).lower()
+            peer_video_id = str((peer_state.get("parsed") or {}).get("video_id") or "").strip()
+            if peer_video_id != video_id_for_guard:
+                continue
+            if peer_status in _TERMINAL_JOB_STAGES or peer_stage in _TERMINAL_JOB_STAGES:
+                continue
+            if str(peer["updated_at"] or "") > str(row["updated_at"] or ""):
+                logger.warning(
+                    "RIPPED_PROCESS_SKIP_OLDER_DUPLICATE request_id=%s newer_request_id=%s video_id=%s",
+                    request_id,
+                    peer["request_id"],
+                    video_id_for_guard,
+                )
+                return
+            break
     try:
         state["rebuild_in_progress"] = True
         _save(request_id, "processing", {**state, "stage": "source_resolution", "rebuild_in_progress": True})
@@ -4739,12 +4800,60 @@ def _storage_snapshot() -> dict[str, Any]:
     }
 
 
+def _active_local_source_dirs() -> set[Path]:
+    """Return local source directories that belong to currently active jobs."""
+    protected: set[Path] = set()
+    try:
+        with _LOCK, _telegram_db() as db:
+            rows = db.execute(
+                "SELECT request_id,status,state_json FROM telegram_requests"
+            ).fetchall()
+        for row in rows:
+            state = json.loads(row["state_json"])
+            status = str(row["status"] or "").lower()
+            stage = str(state.get("stage") or status).lower()
+            if (
+                status in _TERMINAL_JOB_STAGES
+                or stage in _TERMINAL_JOB_STAGES
+                or state.get("superseded_by_request_id")
+            ):
+                continue
+            protected.add((SOURCE_DIR / f"telegram-{row['request_id']}").resolve())
+            video_path = str(state.get("video_path") or "").strip()
+            if video_path:
+                protected.add(Path(video_path).resolve().parent)
+    except Exception:
+        logger.exception("RIPPED_STORAGE_ACTIVE_DIR_DISCOVERY_FAILED")
+    try:
+        with _LOCK, connect() as db:
+            source_rows = db.execute(
+                "SELECT source_job_id,status FROM source_jobs"
+            ).fetchall()
+        for row in source_rows:
+            if str(row["status"] or "").lower() not in _TERMINAL_JOB_STAGES:
+                protected.add((SOURCE_DIR / str(row["source_job_id"])).resolve())
+    except Exception:
+        logger.exception("RIPPED_STORAGE_SOURCE_JOB_DISCOVERY_FAILED")
+    return protected
+
+
+def _path_is_under(path: Path, parents: set[Path]) -> bool:
+    resolved = path.resolve()
+    for parent in parents:
+        try:
+            resolved.relative_to(parent)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def _purge_expired_local_artifacts(
     *,
     retention_hours: int | None = None,
     emergency: bool = False,
 ) -> int:
-    """Reclaim local cache files while preserving the SQLite database."""
+    """Reclaim local cache while preserving the database and active job sources."""
     configured = int(os.getenv("LOCAL_ARTIFACT_RETENTION_HOURS", "12"))
     retention_hours = max(
         1,
@@ -4760,21 +4869,44 @@ def _purge_expired_local_artifacts(
     if not data_dir.exists():
         return 0
 
-    protected = {DB_PATH.resolve()}
-    for path in sorted(data_dir.rglob("*"), reverse=True):
+    protected_files = {DB_PATH.resolve()}
+    protected_dirs = _active_local_source_dirs() if emergency else set()
+    candidates: list[Path] = []
+    for path in data_dir.rglob("*"):
         try:
-            if path.is_file() and path.resolve() not in protected:
-                if path.name in {DB_PATH.name + "-wal", DB_PATH.name + "-shm"}:
-                    continue
-                if path.stat().st_mtime < cutoff:
-                    size = path.stat().st_size
-                    path.unlink(missing_ok=True)
-                    removed += 1
-                    removed_bytes += size
-            elif path.is_dir() and path != data_dir and not any(path.iterdir()):
-                path.rmdir()
+            if not path.is_file() or path.resolve() in protected_files:
+                continue
+            if path.name in {DB_PATH.name + "-wal", DB_PATH.name + "-shm"}:
+                continue
+            old_enough = path.stat().st_mtime < cutoff
+            emergency_reclaimable = emergency and not _path_is_under(path, protected_dirs)
+            if old_enough or emergency_reclaimable:
+                candidates.append(path)
+        except OSError:
+            logger.warning("Could not inspect artifact path=%s", path)
+
+    candidates.sort(key=lambda item: item.stat().st_mtime if item.exists() else 0)
+    target_free_bytes = max(
+        512 * 1024 * 1024,
+        int(os.getenv("EMERGENCY_TARGET_FREE_BYTES", str(1024 * 1024 * 1024))),
+    )
+    for path in candidates:
+        try:
+            size = path.stat().st_size
+            path.unlink(missing_ok=True)
+            removed += 1
+            removed_bytes += size
+            if emergency and _storage_snapshot()["free_bytes"] >= target_free_bytes:
+                break
         except OSError:
             logger.warning("Could not purge expired artifact path=%s", path)
+
+    for path in sorted((p for p in data_dir.rglob("*") if p.is_dir()), reverse=True):
+        try:
+            if path != data_dir and not any(path.iterdir()):
+                path.rmdir()
+        except OSError:
+            pass
 
     snapshot = _storage_snapshot()
     logger.warning(
@@ -4816,19 +4948,63 @@ def _ensure_storage_headroom() -> dict[str, Any]:
 
 
 def _resume_stale_jobs() -> int:
-    """Lease-recover machine-owned jobs while leaving human review stages alone."""
+    """Recover only the newest machine-owned job per source; never revive retired jobs."""
+    snapshot = _ensure_storage_headroom()
+    hard_floor = max(
+        128 * 1024 * 1024,
+        int(os.getenv("HARD_LOCAL_FREE_BYTES", str(256 * 1024 * 1024))),
+    )
+    if snapshot["free_bytes"] < hard_floor:
+        logger.warning(
+            "RIPPED_JOB_WATCHDOG_PAUSED_STORAGE free_bytes=%s hard_floor=%s",
+            snapshot["free_bytes"],
+            hard_floor,
+        )
+        return 0
+
     now_value = datetime.now(timezone.utc)
     resumed = 0
+    seen_video_ids: set[str] = set()
     with _LOCK, _telegram_db() as db:
         rows = db.execute(
-            "SELECT request_id,status,state_json,updated_at,chat_id FROM telegram_requests"
+            "SELECT request_id,status,state_json,updated_at,chat_id FROM telegram_requests "
+            "ORDER BY updated_at DESC"
         ).fetchall()
+
     for row in rows:
         try:
             state = json.loads(row["state_json"])
-            stage = str(state.get("stage") or row["status"] or "").lower()
-            if any(word in stage for word in ("review", "awaiting", "scheduled", "complete")):
+            status = str(row["status"] or "").lower()
+            stage = str(state.get("stage") or status).lower()
+            parsed = state.get("parsed") or {}
+            video_id = str(parsed.get("video_id") or "").strip()
+
+            if video_id:
+                if video_id in seen_video_ids:
+                    logger.info(
+                        "RIPPED_JOB_WATCHDOG_SKIP_OLDER_DUPLICATE request_id=%s video_id=%s",
+                        row["request_id"],
+                        video_id,
+                    )
+                    continue
+                seen_video_ids.add(video_id)
+
+            if (
+                status in _TERMINAL_JOB_STAGES
+                or stage in _TERMINAL_JOB_STAGES
+                or state.get("superseded_by_request_id")
+            ):
+                logger.info(
+                    "RIPPED_JOB_WATCHDOG_SKIP_TERMINAL request_id=%s status=%s stage=%s",
+                    row["request_id"],
+                    status,
+                    stage,
+                )
                 continue
+
+            if any(word in stage for word in ("review", "awaiting")):
+                continue
+
             updated = datetime.fromisoformat(str(row["updated_at"]).replace("Z", "+00:00"))
             if not updated.tzinfo:
                 updated = updated.replace(tzinfo=timezone.utc)
@@ -4838,6 +5014,7 @@ def _resume_stale_jobs() -> int:
             attempts = int(state.get("watchdog_resume_count") or 0)
             if attempts >= 3:
                 continue
+
             state["watchdog_resume_count"] = attempts + 1
             state["watchdog_resumed_at"] = now()
             _save(row["request_id"], "retrying", state)
@@ -4855,7 +5032,10 @@ def _resume_stale_jobs() -> int:
                 row["request_id"], stage, attempts + 1,
             )
         except Exception:
-            logger.exception("RIPPED_JOB_WATCHDOG could not inspect request_id=%s", row["request_id"])
+            logger.exception(
+                "RIPPED_JOB_WATCHDOG could not inspect request_id=%s",
+                row["request_id"],
+            )
     return resumed
 
 
