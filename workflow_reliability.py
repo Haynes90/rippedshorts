@@ -41,7 +41,7 @@ _READY_STAGES = {
 
 def standard_state(stage: str, status: str) -> str:
     value = f"{stage} {status}".lower()
-    if any(x in value for x in ("permanent_failure", "cancelled")):
+    if any(x in value for x in ("permanent_failure", "cancelled", "superseded")):
         return "PERMANENT_FAILURE"
     if any(x in value for x in ("configuration_blocked", "auth")):
         return "CONFIGURATION_BLOCKED"
@@ -260,7 +260,7 @@ def latest_incomplete(spreadsheet_id: str, chat_id: str = "", user_id: str = "")
     records = []
     for values in rows[1:]:
         padded = list(values) + [""] * (len(HEADERS) - len(values))
-        if padded[9].lower() in {"published", "complete", "cancelled"}:
+        if padded[9].lower() in {"published", "complete", "cancelled", "superseded", "permanent_failure"}:
             continue
         if chat_id and padded[14] and padded[14] != chat_id:
             continue
