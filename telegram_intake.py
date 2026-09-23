@@ -1539,7 +1539,16 @@ def _log_candidate_decision(
     """Upsert one candidate decision into the Podcast/Ripped Shorts worksheet."""
     import main
 
-    candidate = state["result"]["segments"][index]
+    result = state.get("result") or {}
+    segments = result.get("segments") or []
+    if index >= len(segments):
+        logger.info(
+            "DECISION_LOG_SKIPPED_RESULT_NOT_READY request_id=%s candidate=%s",
+            request_id,
+            index + 1,
+        )
+        return
+    candidate = segments[index]
     log_request_id = candidate.get("_sheet_request_id") or request_id
     candidate_number = int(candidate.get("candidate_number") or index + 1)
     analysis = state["result"].get("analysis") or {}
@@ -2294,7 +2303,8 @@ def _process(request_id: str) -> None:
         return
     state, chat_id = json.loads(row["state_json"]), row["chat_id"]
     try:
-        _save(request_id, "processing", {**state, "stage": "source_resolution"})
+        state["rebuild_in_progress"] = True
+        _save(request_id, "processing", {**state, "stage": "source_resolution", "rebuild_in_progress": True})
         send(chat_id, f"⬇️ Retrieving source\nJob ID: {request_id}")
         work = SOURCE_DIR / f"telegram-{request_id}"
         work.mkdir(parents=True, exist_ok=True)
@@ -2694,6 +2704,7 @@ def _process(request_id: str) -> None:
         final_state = {
             **state,
             "stage": "awaiting_review",
+            "rebuild_in_progress": False,
             "video_path": str(video),
             "source_reused": reused,
             "result": result,
@@ -2738,6 +2749,7 @@ def _process(request_id: str) -> None:
             latest_state.update(
                 {
                     "stage": "error",
+                    "rebuild_in_progress": False,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                     "retryable": True,
@@ -3006,9 +3018,28 @@ def _accept_update(
             if not row:
                 return {"status": "not_found"}
             state = json.loads(row["state_json"])
+            current_status = str(row["status"] or "").lower()
+            if current_status in {"processing", "source_resolution"} or state.get("rebuild_in_progress"):
+                logger.info(
+                    "RERIP_REUSE_IGNORED_ALREADY_PROCESSING request_id=%s choice=%s status=%s",
+                    request_id,
+                    choice,
+                    current_status,
+                )
+                return {
+                    "status": "already_processing",
+                    "request_id": request_id,
+                    "choice": choice,
+                }
             state["force_rerip"] = choice == "rerip"
             state["reuse_existing"] = choice == "reuse"
+            state["rebuild_in_progress"] = True
             state["stage"] = "accepted"
+            # Old result/review payloads must not be used while rebuilding.
+            state.pop("result", None)
+            state.pop("topic_result", None)
+            state["candidate_reviews"] = {}
+            state["topic_reviews"] = {}
             db.execute(
                 "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? "
                 "WHERE request_id=?",
@@ -3749,6 +3780,22 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         if not row:
             raise RuntimeError(f"Ripped Shorts request not found: {request_id}")
         state = json.loads(row["state_json"])
+        result = state.get("result") or {}
+        segments = result.get("segments") or []
+        if state.get("rebuild_in_progress") or index >= len(segments):
+            logger.warning(
+                "RENDER_IGNORED_RESULT_NOT_READY request_id=%s candidate=%s rebuild_in_progress=%s",
+                request_id,
+                index + 1,
+                bool(state.get("rebuild_in_progress")),
+            )
+            send(
+                chat_id,
+                "⏳ This job is still rebuilding its fresh clip list. "
+                "Use the new review buttons after processing finishes.",
+            )
+            return
+        candidate = segments[index]
         reviews = dict(state.get("candidate_reviews") or {})
         reviews[str(index)] = {
             **reviews.get(str(index), {}),
@@ -3766,7 +3813,6 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             f"🎬 Short {index + 1} is now rendering.\n"
             f"{_render_progress_text(request_id)}",
         )
-        candidate = state["result"]["segments"][index]
         user_id = str(
             (state.get("candidate_reviews") or {}).get(str(index), {}).get("user_id", "")
         )
