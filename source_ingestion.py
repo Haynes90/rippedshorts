@@ -495,18 +495,26 @@ def _log_source_winner(
         + " ".join(f"{key}={value}" for key, value in record.items()),
         flush=True,
     )
-    log_root = Path(os.getenv("DATA_DIR") or workdir)
-    try:
-        log_root.mkdir(parents=True, exist_ok=True)
-        with (log_root / "source_acquisition.jsonl").open(
-            "a", encoding="utf-8"
-        ) as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except OSError as exc:
-        print(
-            f"RIPPED_SOURCE_WINNER_LOG failed video_id={video_id} error={exc}",
-            flush=True,
-        )
+    spreadsheet_id = (
+        os.getenv("DEFAULT_SHEET_ID")
+        or os.getenv("PODCAST_SHEET_ID")
+        or "1xfp-sjO9Mnvwe7-bM6htT-0RKiOig21HfP_otzO9xws"
+    ).strip()
+    if spreadsheet_id:
+        try:
+            import workflow_reliability
+            workflow_reliability.record_source_winner(
+                spreadsheet_id=spreadsheet_id,
+                video_id=video_id,
+                provider=provider,
+                profile=str(profile.get("name") or ""),
+                source_bytes=int(record["bytes"] or 0),
+            )
+        except Exception as exc:
+            print(
+                f"RIPPED_SOURCE_WINNER_SHEET failed video_id={video_id} error={exc}",
+                flush=True,
+            )
 
 
 def _run_youtube_profile(
