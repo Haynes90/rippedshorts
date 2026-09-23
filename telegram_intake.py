@@ -154,6 +154,81 @@ def _ensure_render_source(request_id: str, state: dict[str, Any]) -> Path:
         return path
 
 
+def _queue_missing_approved_renders(request_id: str, chat_id: str) -> dict[str, Any]:
+    """Rebuild exact approved-but-unrendered Shorts from the Podcast sheet."""
+    with _LOCK, _telegram_db() as db:
+        row = db.execute(
+            "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
+        ).fetchone()
+    if not row:
+        return {"status": "not_found", "request_id": request_id}
+
+    state = json.loads(row["state_json"])
+    parsed = state.get("parsed") or {}
+    video_id = str(parsed.get("video_id") or "").strip()
+    if not video_id:
+        return {"status": "not_youtube", "request_id": request_id}
+
+    approval_history = _approved_clip_history_from_sheet(video_id)
+    missing = list(approval_history.get("unfinished") or [])
+    if not missing:
+        send(
+            chat_id,
+            f"✅ No approved missing Shorts remain for YouTube ID {video_id}.",
+        )
+        return {
+            "status": "nothing_missing",
+            "request_id": request_id,
+            "video_id": video_id,
+        }
+
+    source = _ensure_render_source(request_id, state)
+    reviews = {
+        str(index): {
+            "status": "queued",
+            "reviewed_at": clip.get("_reviewed_at") or now(),
+            "user_id": clip.get("_reviewer_user_id", ""),
+            "recovered_from_sheet": True,
+            "retry_missing_render": True,
+        }
+        for index, clip in enumerate(missing)
+    }
+    recovered_result = {
+        "analysis": {
+            "content_type": "",
+            "main_theme": "",
+            "key_ideas": [],
+            "keywords": [],
+        },
+        "segments": missing,
+    }
+    state.update(
+        {
+            "stage": "awaiting_review",
+            "rebuild_in_progress": False,
+            "video_path": str(source),
+            "result": recovered_result,
+            "candidate_reviews": reviews,
+            "recovered_approvals_from_sheet": True,
+            "retry_missing_renders_at": now(),
+        }
+    )
+    _save(request_id, "awaiting_review", state)
+    send(
+        chat_id,
+        f"♻️ Recovered {len(missing)} approved Short(s) that never finished rendering "
+        f"for YouTube ID {video_id}. Re-rendering those exact originals now.",
+    )
+    for index in range(len(missing)):
+        RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
+    return {
+        "status": "missing_renders_queued",
+        "request_id": request_id,
+        "video_id": video_id,
+        "count": len(missing),
+    }
+
+
 def _render_progress_text(request_id: str) -> str:
     with _LOCK, _telegram_db() as db:
         row = db.execute(
@@ -241,13 +316,28 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
             if folder_id
             else ""
         )
-        send(
-            chat_id,
+        message = (
             "✅ Current Ripped Shorts render queue complete"
             f"\nRendered: {rendered}"
             f"\nFailed: {failed}"
-            f"{folder_line}",
+            f"{folder_line}"
         )
+        if failed:
+            telegram(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": message,
+                    "reply_markup": {
+                        "inline_keyboard": [[{
+                            "text": "♻️ Retry Missing Renders",
+                            "callback_data": f"rs:retry_missing:{request_id}",
+                        }]]
+                    },
+                },
+            )
+        else:
+            send(chat_id, message)
         with _LOCK, _telegram_db() as db:
             latest = db.execute(
                 "SELECT state_json FROM telegram_requests WHERE request_id=?",
@@ -3057,6 +3147,13 @@ def _accept_update(
         background_tasks.add_task(_process, request_id)
         return {"status": choice, "request_id": request_id}
 
+    retry_missing = re.fullmatch(
+        r"rs:retry_missing:([A-Za-z0-9-]+)", callback_data
+    )
+    if retry_missing:
+        request_id = retry_missing.group(1)
+        return _queue_missing_approved_renders(request_id, chat_id)
+
     schedule_now = re.fullmatch(
         r"rs:schedule_now:([A-Za-z0-9-]+)", callback_data
     )
@@ -3528,6 +3625,15 @@ def _accept_update(
         )
         background_tasks.add_task(_process, request_id)
         return {"status": "resume_accepted", "request_id": request_id}
+
+    render_missing_match = re.fullmatch(
+        r"/render-missing(?:@rippedshortsbot)?\s+([A-Za-z0-9-]+)", text, re.I
+    )
+    if render_missing_match:
+        return _queue_missing_approved_renders(
+            render_missing_match.group(1),
+            chat_id,
+        )
 
     retry_match = re.fullmatch(
         r"/retry(?:@rippedshortsbot)?\s+([A-Za-z0-9-]+)", text, re.I
