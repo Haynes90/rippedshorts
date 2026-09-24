@@ -104,7 +104,26 @@ def read_google_doc_text(doc_id_or_url_or_name: str) -> str:
             raise RuntimeError(f"Could not find Google Doc named {value!r}")
         doc_id = found["id"]
 
-    docs_error = None
+    # Prefer Drive export for prompt documents. The same service account already relies
+    # on Drive for source/media workflows, and Drive export avoids recurring Docs API
+    # permission failures seen for otherwise-accessible shared native Docs.
+    drive_error = None
+    try:
+        exported = _export_google_doc_text_via_drive(doc_id)
+        if exported:
+            print(
+                f"GOOGLE_DOC_READ path=drive_export status=success doc_id={doc_id}",
+                flush=True,
+            )
+            return exported
+    except Exception as exc:
+        drive_error = exc
+        print(
+            f"GOOGLE_DOC_READ path=drive_export status=failed doc_id={doc_id} "
+            f"error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
     try:
         doc = docs_service().documents().get(documentId=doc_id).execute()
         parts = []
@@ -115,29 +134,25 @@ def read_google_doc_text(doc_id_or_url_or_name: str) -> str:
                     parts.append(text_run.get("content", ""))
         text = "".join(parts).strip()
         if text:
-            return text
-    except Exception as exc:
-        docs_error = exc
-
-    try:
-        exported = _export_google_doc_text_via_drive(doc_id)
-        if exported:
             print(
-                f"GOOGLE_DOC_DRIVE_EXPORT_FALLBACK success doc_id={doc_id}",
+                f"GOOGLE_DOC_READ path=docs_api status=success doc_id={doc_id}",
                 flush=True,
             )
-            return exported
-    except Exception as drive_exc:
-        if docs_error is not None:
+            return text
+    except Exception as docs_exc:
+        if drive_error is not None:
             raise RuntimeError(
-                f"Google Docs read failed ({docs_error}); "
-                f"Drive export fallback also failed ({drive_exc})"
-            ) from drive_exc
+                f"Drive export failed ({drive_error}); "
+                f"Google Docs read also failed ({docs_exc})"
+            ) from docs_exc
         raise
 
-    if docs_error is not None:
-        raise docs_error
-    raise RuntimeError(f"Google Doc {doc_id} was empty through both Docs and Drive APIs")
+    if drive_error is not None:
+        raise RuntimeError(
+            f"Google Doc {doc_id} was empty through Docs API after Drive export failed "
+            f"({drive_error})"
+        )
+    raise RuntimeError(f"Google Doc {doc_id} was empty through both Drive and Docs APIs")
 
 
 def download_drive_file(file_id: str, destination: Path) -> Path:
