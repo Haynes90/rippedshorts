@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -12,6 +13,8 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 class CompletionReviewRequired(RuntimeError):
@@ -72,10 +75,16 @@ def transcribe_window(video, start, end):
                 words = validate_words(response.json(), end - start)
                 return [{**w, "start": float(w["start"]) + start,
                          "end": float(w["end"]) + start} for w in words]
-        except (requests.RequestException, ValueError, KeyError, TypeError, CompletionReviewRequired):
+        except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            logger.warning("RIPPED_TRANSCRIPTION_RETRY attempt=%s status=%s error=%s", attempt + 1, status, type(exc).__name__)
             if attempt == 2:
                 raise CompletionReviewRequired("Word transcription failed after three attempts") from None
-            time.sleep(attempt + 1)
+            time.sleep(min(60, 5 * (2 ** attempt)))
+        except (ValueError, KeyError, TypeError, CompletionReviewRequired):
+            if attempt == 2:
+                raise CompletionReviewRequired("Word transcription failed after three attempts") from None
+            time.sleep(min(30, 2 * (attempt + 1)))
 
 
 def transcribe_source(video, progress=None):
@@ -95,7 +104,7 @@ def transcribe_source(video, progress=None):
         raise CompletionReviewRequired("Transcript chunk has no usable speech after retries; needs review")
 
     words = []
-    workers = max(1, min(4, int(os.getenv("RIPPED_TRANSCRIPTION_WORKERS", "4"))))
+    workers = max(1, min(2, int(os.getenv("RIPPED_TRANSCRIPTION_WORKERS", "1"))))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(one, window) for window in windows]
         for completed, future in enumerate(as_completed(futures), 1):
