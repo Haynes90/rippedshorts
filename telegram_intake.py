@@ -23,6 +23,7 @@ from source_ingestion import (
     ingest_with_audio_master,
     restrict_to_boundary,
     reuse_from_drive,
+    _has_audio_stream,
     select_non_overlapping,
 )
 from google_drive import read_google_doc_text
@@ -95,8 +96,10 @@ def _ensure_render_source(request_id: str, state: dict[str, Any]) -> Path:
     """Return a usable local source file, rehydrating durable media after redeploys."""
     current_value = str(state.get("video_path") or "").strip()
     current = Path(current_value) if current_value else None
-    if current and current.is_file() and current.stat().st_size > 0:
+    if current and current.is_file() and current.stat().st_size > 0 and _has_audio_stream(current):
         return current
+    if current and current.is_file() and not _has_audio_stream(current):
+        logger.warning("RIPPED_RENDER_SOURCE_REJECT request_id=%s reason=no_audio_stream path=%s", request_id, current)
 
     parsed = state.get("parsed") or {}
     video_id = str(parsed.get("video_id") or "").strip()
