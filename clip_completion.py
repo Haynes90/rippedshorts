@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 logger = logging.getLogger(__name__)
+_TRANSCRIPTION_GATE = threading.Semaphore(1)
 
 
 class CompletionReviewRequired(RuntimeError):
@@ -65,12 +67,15 @@ def transcribe_window(video, start, end):
                     "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", str(audio)])
                 if not audio.is_file() or not 0 < audio.stat().st_size < 24 * 1024 * 1024:
                     raise CompletionReviewRequired("Verification audio missing or too large")
-                with audio.open("rb") as stream:
-                    response = requests.post("https://api.openai.com/v1/audio/transcriptions",
-                        headers={"Authorization": f"Bearer {key}"},
-                        data=[("model", "whisper-1"), ("response_format", "verbose_json"),
-                              ("timestamp_granularities[]", "word")],
-                        files={"file": (audio.name, stream, "audio/mpeg")}, timeout=(15, 900))
+                with _TRANSCRIPTION_GATE:
+                    with audio.open("rb") as stream:
+                        response = requests.post("https://api.openai.com/v1/audio/transcriptions",
+                            headers={"Authorization": f"Bearer {key}"},
+                            data=[("model", "whisper-1"), ("response_format", "verbose_json"),
+                                  ("timestamp_granularities[]", "word")],
+                            files={"file": (audio.name, stream, "audio/mpeg")}, timeout=(15, 900))
+                    if response.status_code >= 400:
+                        logger.warning("RIPPED_TRANSCRIPTION_RESPONSE status=%s body=%s", response.status_code, response.text[:240])
                 response.raise_for_status()
                 words = validate_words(response.json(), end - start)
                 return [{**w, "start": float(w["start"]) + start,
