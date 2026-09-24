@@ -2546,6 +2546,7 @@ def _process_topics(
     )
     suggestions = _topic_break_suggestions(segments)
     topics = _build_contiguous_topic_segments(segments, suggestions)
+    topics = _preflight_candidates(video, topics)
     if not topics:
         send(
             chat_id,
