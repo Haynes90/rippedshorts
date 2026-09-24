@@ -78,6 +78,21 @@ def find_file_by_name(name: str, mime_type: Optional[str] = None) -> Optional[di
     return files[0] if files else None
 
 
+def _export_google_doc_text_via_drive(doc_id: str) -> str:
+    """Read a native Google Doc through Drive export when Docs API access misbehaves."""
+    service = drive_service()
+    request = service.files().export_media(
+        fileId=doc_id,
+        mimeType="text/plain",
+    )
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buffer.getvalue().decode("utf-8", errors="replace").strip()
+
+
 def read_google_doc_text(doc_id_or_url_or_name: str) -> str:
     value = (doc_id_or_url_or_name or "").strip()
     if not value:
@@ -88,14 +103,41 @@ def read_google_doc_text(doc_id_or_url_or_name: str) -> str:
         if not found:
             raise RuntimeError(f"Could not find Google Doc named {value!r}")
         doc_id = found["id"]
-    doc = docs_service().documents().get(documentId=doc_id).execute()
-    parts = []
-    for item in doc.get("body", {}).get("content", []):
-        for element in item.get("paragraph", {}).get("elements", []):
-            text_run = element.get("textRun")
-            if text_run:
-                parts.append(text_run.get("content", ""))
-    return "".join(parts).strip()
+
+    docs_error = None
+    try:
+        doc = docs_service().documents().get(documentId=doc_id).execute()
+        parts = []
+        for item in doc.get("body", {}).get("content", []):
+            for element in item.get("paragraph", {}).get("elements", []):
+                text_run = element.get("textRun")
+                if text_run:
+                    parts.append(text_run.get("content", ""))
+        text = "".join(parts).strip()
+        if text:
+            return text
+    except Exception as exc:
+        docs_error = exc
+
+    try:
+        exported = _export_google_doc_text_via_drive(doc_id)
+        if exported:
+            print(
+                f"GOOGLE_DOC_DRIVE_EXPORT_FALLBACK success doc_id={doc_id}",
+                flush=True,
+            )
+            return exported
+    except Exception as drive_exc:
+        if docs_error is not None:
+            raise RuntimeError(
+                f"Google Docs read failed ({docs_error}); "
+                f"Drive export fallback also failed ({drive_exc})"
+            ) from drive_exc
+        raise
+
+    if docs_error is not None:
+        raise docs_error
+    raise RuntimeError(f"Google Doc {doc_id} was empty through both Docs and Drive APIs")
 
 
 def download_drive_file(file_id: str, destination: Path) -> Path:
