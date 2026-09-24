@@ -71,7 +71,7 @@ _TERMINAL_JOB_STAGES = {
     "permanent_failure",
 }
 RIPPED_SHORTS_RENDER_WORKERS = max(
-    1, int(os.getenv("RIPPED_SHORTS_RENDER_WORKERS", "3"))
+    1, min(2, int(os.getenv("RIPPED_SHORTS_RENDER_WORKERS", "1")))
 )
 RENDER_EXECUTOR = ThreadPoolExecutor(max_workers=RIPPED_SHORTS_RENDER_WORKERS)
 STATUS_EXECUTOR = ThreadPoolExecutor(max_workers=1)
