@@ -7,6 +7,7 @@ import binascii
 import json
 import os
 import re
+import subprocess
 import time
 import shutil
 import threading
@@ -150,6 +151,19 @@ def _sermon_boundary(payload: Any) -> dict[str, float] | None:
             return {"start": start, "end": float(end)}
     return None
 
+
+
+def _has_audio_stream(path: Path) -> bool:
+    """Reject cached/downloaded video-only files before transcription or rendering."""
+    try:
+        result = subprocess.run(
+            [os.getenv("FFPROBE_BINARY", "ffprobe"), "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type", "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        return result.returncode == 0 and "audio" in result.stdout.lower()
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 def reuse_from_drive(video_id: str, workdir: Path) -> dict[str, Any]:
     """Find source video, timed transcript, and approved sermon bounds by ID."""
@@ -575,7 +589,7 @@ def _run_youtube_profile(
         matches = sorted(lane.glob(f"{video_id}-source.*"))
         usable = next((item for item in matches if item.is_file() and item.stat().st_size > 0), None)
         if not usable:
-            raise RuntimeError("profile completed without a usable source video")
+            if usable:\n                raise RuntimeError("profile produced a video-only source without an audio stream")\n            raise RuntimeError("profile completed without a usable source video")
         print(
             f"RIPPED_SOURCE_PROFILE success video_id={video_id} profile={profile['name']} "
             f"bytes={usable.stat().st_size}",
@@ -645,7 +659,7 @@ def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -
         profiles.append(
             {
                 "name": "automatic_po_token_mweb",
-                "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+                "format": "bv*[height<=1080]+ba/b[height<=1080][acodec!=none]",
                 "player_client": ["mweb"],
                 "pot": True,
             }
@@ -654,7 +668,7 @@ def download_youtube_resilient(video_id: str, youtube_url: str, workdir: Path) -
         [
             {
                 "name": "public_original_selector",
-                "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+                "format": "bv*[height<=1080]+ba/b[height<=1080][acodec!=none]",
                 "player_client": ["default", "tv_simply"],
             },
             {
