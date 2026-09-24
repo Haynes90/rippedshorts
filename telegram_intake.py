@@ -2165,6 +2165,20 @@ def _safe_log_candidate(*args, **kwargs) -> None:
         logger.exception("Ripped Shorts decision log failed: %s", exc)
 
 
+
+def _preflight_candidates(video: Path, clips: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Only expose candidates whose source and transcript can support review."""
+    if not _has_audio_stream(video):
+        raise RuntimeError("Source has no audio stream; candidates withheld until media is reacquired")
+    accepted = []
+    for clip in clips:
+        transcript = str(clip.get("transcript") or "").strip()
+        if not transcript or not re.search(r"[.!?][\\\"\\u201d\\u2019')\\]]*$", transcript):
+            logger.warning("RIPPED_PREFLIGHT_REJECT candidate=%s reason=incomplete_transcript", clip.get("candidate_number"))
+            continue
+        accepted.append(clip)
+    return accepted
+
 def _send_candidates(
     chat_id: str, request_id: str, result: dict, *, start_index: int = 0
 ) -> None:
@@ -3052,6 +3066,7 @@ def _process(request_id: str) -> None:
         for offset, clip in enumerate(new_segments):
             clip["candidate_number"] = next_number + offset
 
+        new_segments = _preflight_candidates(video, new_segments)
         combined = approved_clips + new_segments
         result["segments"] = combined
         reviews = {
