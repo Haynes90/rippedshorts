@@ -589,7 +589,9 @@ def _run_youtube_profile(
         matches = sorted(lane.glob(f"{video_id}-source.*"))
         usable = next((item for item in matches if item.is_file() and item.stat().st_size > 0), None)
         if not usable:
-            if usable:\n                raise RuntimeError("profile produced a video-only source without an audio stream")\n            raise RuntimeError("profile completed without a usable source video")
+            if usable:
+                raise RuntimeError("profile produced a video-only source without an audio stream")
+            raise RuntimeError("profile completed without a usable source video")
         print(
             f"RIPPED_SOURCE_PROFILE success video_id={video_id} profile={profile['name']} "
             f"bytes={usable.stat().st_size}",
