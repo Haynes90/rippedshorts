@@ -26,7 +26,7 @@ class CompletionReviewRequired(RuntimeError):
 def _run(args):
     result = subprocess.run(args, capture_output=True, text=True, timeout=1800)
     if result.returncode:
-        raise CompletionReviewRequired("Audio boundary analysis failed; retry required")
+        raise CompletionReviewRequired("Media processing failed: " + (result.stderr or "")[-1500:])
     return result
 
 
@@ -231,36 +231,39 @@ def verify_render(output, selected, start, end):
 
 
 def render_complete_clip(video, segment, output, renderer, aspect):
-    """Two bounded rebuild attempts; upload callers only receive verified exports."""
-    original_start = float(segment.get("start", 0))
-    original_end = float(segment.get("end", original_start + float(segment.get("duration", 0))))
+    """Render stored transcript bounds without repeating speech transcription."""
+    start = float(segment.get("start", 0))
+    end = float(segment.get("end", start + float(segment.get("duration", 0))))
     source_duration = media_duration(video)
-    if not 0 <= original_start < original_end <= source_duration + .1:
+    if not all(math.isfinite(value) for value in (start, end)):
+        raise CompletionReviewRequired("Selected bounds must be finite")
+    if not 0 <= start < end <= source_duration + .1:
         raise CompletionReviewRequired("Selected bounds exceed the available source")
-    last_reason = "Completion verification failed"
-    for attempt, context in enumerate((30, 90), 1):
-        try:
-            words = transcribe_window(video, max(0, original_start - context),
-                                      min(source_duration, original_end + context))
-            review = review_thought(words, original_start, original_end, aspect)
-            first, last = checked_selection(words, review, original_start, original_end, aspect)
-            selected = words[first:last + 1]
-            previous_end = words[first - 1]["end"] if first else max(0, original_start - context)
-            start = max(previous_end, selected[0]["start"] - .15)
-            ceiling = min(source_duration, selected[-1]["end"] + 1.5,
-                          words[last + 1]["start"] if last + 1 < len(words) else source_duration)
-            end = pause_end(video, selected[-1]["end"], ceiling)
-            if aspect == "9:16" and end - start > 90:
-                raise CompletionReviewRequired("Completed Short plus speech padding exceeds 90 seconds")
-            renderer(video, start, end - start, output)
-            verify_render(output, selected, start, end)
-            return {**segment, "start": start, "end": end, "duration": end - start,
-                    "transcript": " ".join(w["word"] for w in selected),
-                    "completion_check": {"status": "verified", "version": 1, "attempt": attempt,
-                        "original_start": original_start, "original_end": original_end,
-                        "reason": str(review.get("reason", ""))[:1000],
-                        "word_alignment": True, "audio_pause": True, "export_edges": True}}
-        except (CompletionReviewRequired, requests.RequestException, ValueError, KeyError, TypeError) as exc:
-            Path(output).unlink(missing_ok=True)
-            last_reason = str(exc) if isinstance(exc, CompletionReviewRequired) else "Completion service unavailable or invalid response"
-    raise CompletionReviewRequired(f"Needs boundary review after two attempts: {last_reason}")
+    end = min(end, source_duration)
+    if aspect == "9:16" and end - start > 90:
+        raise CompletionReviewRequired("Selected Short exceeds the 90-second limit")
+    transcript = str(segment.get("transcript") or "").strip()
+    if not transcript or transcript.rstrip("\"”’')]}").rstrip()[-1:] not in (".", "!", "?"):
+        raise CompletionReviewRequired("Stored transcript ends mid-sentence; review the selected bounds")
+    try:
+        renderer(video, start, end - start, output)
+        if not Path(output).is_file() or Path(output).stat().st_size == 0:
+            raise CompletionReviewRequired("Renderer produced no video")
+        actual_duration = media_duration(output)
+        if abs(actual_duration - (end - start)) > .25:
+            raise CompletionReviewRequired("Export duration differs from selected bounds")
+        probe = _run([os.getenv("FFPROBE_BINARY", "ffprobe"), "-v", "error",
+                      "-select_streams", "v:0", "-show_entries", "stream=codec_type",
+                      "-of", "default=nw=1:nk=1", str(output)])
+        if "video" not in probe.stdout.lower():
+            raise CompletionReviewRequired("Export has no video stream")
+    except Exception:
+        Path(output).unlink(missing_ok=True)
+        raise
+    return {**segment, "start": start, "end": end, "duration": end - start,
+            "completion_check": {"status": "verified", "version": 2,
+                "basis": "stored_transcript_and_media_bounds",
+                "transcript_sentence_end": True, "media_duration": True,
+                "video_stream": True, "word_alignment": False,
+                "audio_pause": False, "export_edges": False}}
+
