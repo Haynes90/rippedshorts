@@ -5,6 +5,8 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -97,6 +99,36 @@ class StoredTranscriptRenderTests(unittest.TestCase):
         tree = ast.parse((ROOT / 'telegram_intake.py').read_text(encoding='utf-8'))
         self.assertTrue(any(isinstance(n, ast.ImportFrom) and n.module == 'source_ingestion'
                             and any(a.name == 'download_youtube_resilient' for a in n.names) for n in tree.body))
+
+
+@unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg tools required')
+class RealVideoRenderTests(unittest.TestCase):
+    def test_actual_renderers_with_and_without_audio(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            env = dict(Path=Path, math=math, os=os, subprocess=subprocess,
+                       CompletionReviewRequired=RuntimeError)
+            load_function('clip_completion.py', '_run', env)
+            load_function('clip_completion.py', 'media_duration', env)
+            render = load_function('clip_completion.py', 'render_complete_clip', env)
+            render_env = dict(Path=Path, subprocess=subprocess,
+                              _build_vertical_filter=lambda *args: ('crop=134:240', False))
+            for with_audio in (False, True):
+                source = folder / ('sound.mp4' if with_audio else 'silent.mp4')
+                command = ['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i',
+                           'color=c=blue:s=320x240:r=25:d=2']
+                if with_audio:
+                    command += ['-f', 'lavfi', '-i', 'sine=frequency=440:duration=2', '-c:a', 'aac']
+                subprocess.run(command + ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(source)], check=True)
+                for aspect, name in (('9:16', 'create_clip_file'), ('16:9', 'create_topic_segment_file')):
+                    renderer = load_function('main.py', name, render_env)
+                    output = folder / (aspect.replace(':', '-') + source.name)
+                    render(source, {'start': .2, 'end': 1.2, 'transcript': 'Stored sentence.'},
+                           output, renderer, aspect)
+                    probe = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'a:0',
+                                            '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', str(output)],
+                                           check=True, capture_output=True, text=True)
+                    self.assertEqual('audio' in probe.stdout, with_audio)
 
 
 if __name__ == '__main__':
