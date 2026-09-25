@@ -483,38 +483,42 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
         active = sum(status in {"queued", "rendering"} for status in statuses.values())
         rendered = sum(status == "rendered" for status in statuses.values())
         failed = sum(status == "render_failed" for status in statuses.values())
+
         if active:
             if str(state.get("stage") or "") != "awaiting_render_completion":
                 state["stage"] = "awaiting_render_completion"
+                db.execute(
+                    "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
+                    (
+                        "awaiting_render_completion",
+                        json.dumps(state),
+                        now(),
+                        request_id,
+                    ),
+                )
                 checkpoint_state = dict(state)
                 checkpoint_status = "awaiting_render_completion"
-            return
-        if not statuses and not state.get("schedule_requested_at"):
-            return
-        signature = json.dumps(statuses, sort_keys=True)
-        state["render_queue_completion_signature"] = signature
-        state["render_queue_completed_at"] = now()
-        state["rendered_count"] = rendered
-        state["render_failed_count"] = failed
-        if failed:
-            state["stage"] = "awaiting_render_retry"
-            checkpoint_status = "awaiting_render_retry"
-        else:
-            state["stage"] = "awaiting_review"
-            checkpoint_status = "awaiting_review"
-            should_handoff = bool(state.get("schedule_requested_at"))
-        db.execute(
-            "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
-            (checkpoint_status, json.dumps(state), now(), request_id),
-        )
-        if state.get("render_queue_completion_signature_notified") != signature:
-            state["render_queue_completion_signature_notified"] = signature
+        elif statuses or state.get("schedule_requested_at"):
+            signature = json.dumps(statuses, sort_keys=True)
+            state["render_queue_completion_signature"] = signature
+            state["render_queue_completed_at"] = now()
+            state["rendered_count"] = rendered
+            state["render_failed_count"] = failed
+            if failed:
+                state["stage"] = "awaiting_render_retry"
+                checkpoint_status = "awaiting_render_retry"
+            else:
+                state["stage"] = "awaiting_review"
+                checkpoint_status = "awaiting_review"
+                should_handoff = bool(state.get("schedule_requested_at"))
+            if state.get("render_queue_completion_signature_notified") != signature:
+                state["render_queue_completion_signature_notified"] = signature
+                summary = (rendered, failed)
             db.execute(
-                "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
-                (json.dumps(state), now(), request_id),
+                "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
+                (checkpoint_status, json.dumps(state), now(), request_id),
             )
-            summary = (rendered, failed)
-        checkpoint_state = dict(state)
+            checkpoint_state = dict(state)
 
     # Keep Workflow Jobs aligned with the local render state. This was previously
     # omitted, leaving durable jobs stuck at human_review after render failures.
