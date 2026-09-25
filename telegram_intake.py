@@ -175,6 +175,34 @@ def _ensure_render_source(request_id: str, state: dict[str, Any]) -> Path:
         return path
 
 
+def _active_request_for_video(video_id: str, preferred_request_id: str = "") -> tuple[str, sqlite3.Row | None]:
+    """Return the current non-superseded owner for a YouTube video."""
+    with _LOCK, _telegram_db() as db:
+        rows = db.execute(
+            "SELECT * FROM telegram_requests ORDER BY updated_at DESC"
+        ).fetchall()
+    preferred = None
+    for row in rows:
+        state = json.loads(row["state_json"])
+        parsed = state.get("parsed") or {}
+        if str(parsed.get("video_id") or "").strip() != video_id:
+            continue
+        status = str(row["status"] or "").lower()
+        stage = str(state.get("stage") or status).lower()
+        retired = (
+            status in _TERMINAL_JOB_STAGES
+            or stage in _TERMINAL_JOB_STAGES
+            or bool(state.get("superseded_by_request_id"))
+        )
+        if row["request_id"] == preferred_request_id:
+            preferred = row
+            if not retired:
+                return str(row["request_id"]), row
+        if not retired:
+            return str(row["request_id"]), row
+    return preferred_request_id, preferred
+
+
 def _queue_missing_approved_renders(request_id: str, chat_id: str) -> dict[str, Any]:
     """Rebuild exact approved-but-unrendered Shorts from the Podcast sheet."""
     with _LOCK, _telegram_db() as db:
@@ -184,11 +212,30 @@ def _queue_missing_approved_renders(request_id: str, chat_id: str) -> dict[str, 
     if not row:
         return {"status": "not_found", "request_id": request_id}
 
+    original_request_id = request_id
     state = json.loads(row["state_json"])
     parsed = state.get("parsed") or {}
     video_id = str(parsed.get("video_id") or "").strip()
     if not video_id:
         return {"status": "not_youtube", "request_id": request_id}
+
+    request_id, active_row = _active_request_for_video(video_id, request_id)
+    if active_row is not None:
+        row = active_row
+        state = json.loads(row["state_json"])
+        if request_id != original_request_id:
+            logger.info(
+                "RENDER_RECOVERY_REDIRECT old_request_id=%s active_request_id=%s video_id=%s",
+                original_request_id,
+                request_id,
+                video_id,
+            )
+            send(
+                chat_id,
+                "♻️ That review card belongs to an older job. "
+                "I found the current active job for this video and will recover "
+                "the missing approved renders there instead.",
+            )
 
     approval_history = _approved_clip_history_from_sheet(video_id)
     missing = list(approval_history.get("unfinished") or [])
@@ -203,7 +250,52 @@ def _queue_missing_approved_renders(request_id: str, chat_id: str) -> dict[str, 
             "video_id": video_id,
         }
 
-    source = _ensure_render_source(request_id, state)
+    # Checkpoint recovery before any network/source work so Workflow Jobs no longer
+    # incorrectly reports this as waiting for human review.
+    state.update(
+        {
+            "stage": "render_recovery",
+            "rebuild_in_progress": False,
+            "render_recovery_in_progress": True,
+            "render_recovery_requested_at": now(),
+            "render_recovery_count": int(state.get("render_recovery_count") or 0) + 1,
+        }
+    )
+    state.pop("error", None)
+    state.pop("notification_error", None)
+    _save(request_id, "render_recovery", state)
+
+    try:
+        source = _ensure_render_source(request_id, state)
+    except Exception as exc:
+        state.update(
+            {
+                "stage": "awaiting_render_retry",
+                "render_recovery_in_progress": False,
+                "render_recovery_error": str(exc),
+                "error": str(exc),
+            }
+        )
+        _save(request_id, "awaiting_render_retry", state)
+        logger.exception(
+            "RENDER_RECOVERY_SOURCE_FAILED request_id=%s video_id=%s",
+            request_id,
+            video_id,
+        )
+        send(
+            chat_id,
+            "⚠️ I recovered your approved clip decisions, but the full source "
+            "video still could not be restored. Nothing was discarded. "
+            "Use Retry Missing Renders after the source is available again.\n"
+            f"Job ID: {request_id}\n{str(exc)[:1200]}",
+        )
+        return {
+            "status": "source_recovery_failed",
+            "request_id": request_id,
+            "video_id": video_id,
+            "count": len(missing),
+        }
+
     reviews = {
         str(index): {
             "status": "queued",
@@ -225,8 +317,9 @@ def _queue_missing_approved_renders(request_id: str, chat_id: str) -> dict[str, 
     }
     state.update(
         {
-            "stage": "awaiting_review",
+            "stage": "awaiting_render_completion",
             "rebuild_in_progress": False,
+            "render_recovery_in_progress": False,
             "video_path": str(source),
             "result": recovered_result,
             "candidate_reviews": reviews,
@@ -234,7 +327,9 @@ def _queue_missing_approved_renders(request_id: str, chat_id: str) -> dict[str, 
             "retry_missing_renders_at": now(),
         }
     )
-    _save(request_id, "awaiting_review", state)
+    state.pop("error", None)
+    state.pop("render_recovery_error", None)
+    _save(request_id, "awaiting_render_completion", state)
     send(
         chat_id,
         f"♻️ Recovered {len(missing)} approved Short(s) that never finished rendering "
@@ -360,6 +455,9 @@ def _render_progress_text(request_id: str) -> str:
 def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
     """Wait for every approved 9:16 and 16:9 render before scheduling."""
     summary = None
+    checkpoint_state = None
+    checkpoint_status = None
+    should_handoff = False
     with _LOCK, _telegram_db() as db:
         row = db.execute(
             "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
@@ -385,25 +483,43 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
         active = sum(status in {"queued", "rendering"} for status in statuses.values())
         rendered = sum(status == "rendered" for status in statuses.values())
         failed = sum(status == "render_failed" for status in statuses.values())
-        # Schedule Now closes selection, but handoff is gated until every approved
-        # 9:16 Short and 16:9 highlight has left the queued/rendering states.
         if active:
+            if str(state.get("stage") or "") != "awaiting_render_completion":
+                state["stage"] = "awaiting_render_completion"
+                checkpoint_state = dict(state)
+                checkpoint_status = "awaiting_render_completion"
             return
         if not statuses and not state.get("schedule_requested_at"):
             return
         signature = json.dumps(statuses, sort_keys=True)
-        if state.get("render_queue_completion_signature") == signature:
-            if state.get("schedule_requested_at"):
-                RENDER_EXECUTOR.submit(
-                    _handoff_shorts_to_schedule_master, request_id, chat_id
-                )
-            return
         state["render_queue_completion_signature"] = signature
+        state["render_queue_completed_at"] = now()
+        state["rendered_count"] = rendered
+        state["render_failed_count"] = failed
+        if failed:
+            state["stage"] = "awaiting_render_retry"
+            checkpoint_status = "awaiting_render_retry"
+        else:
+            state["stage"] = "awaiting_review"
+            checkpoint_status = "awaiting_review"
+            should_handoff = bool(state.get("schedule_requested_at"))
         db.execute(
-            "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
-            (json.dumps(state), now(), request_id),
+            "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
+            (checkpoint_status, json.dumps(state), now(), request_id),
         )
-        summary = (rendered, failed)
+        if state.get("render_queue_completion_signature_notified") != signature:
+            state["render_queue_completion_signature_notified"] = signature
+            db.execute(
+                "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+                (json.dumps(state), now(), request_id),
+            )
+            summary = (rendered, failed)
+        checkpoint_state = dict(state)
+
+    # Keep Workflow Jobs aligned with the local render state. This was previously
+    # omitted, leaving durable jobs stuck at human_review after render failures.
+    if checkpoint_state is not None and checkpoint_status is not None:
+        _save(request_id, checkpoint_status, checkpoint_state)
 
     if summary:
         rendered, failed = summary
@@ -443,16 +559,13 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
             )
         else:
             send(chat_id, message)
-        with _LOCK, _telegram_db() as db:
-            latest = db.execute(
-                "SELECT state_json FROM telegram_requests WHERE request_id=?",
-                (request_id,),
-            ).fetchone()
-        latest_state = json.loads(latest["state_json"]) if latest else {}
-        if latest_state.get("schedule_requested_at"):
-            RENDER_EXECUTOR.submit(
-                _handoff_shorts_to_schedule_master, request_id, chat_id
-            )
+
+    # Never hand off while an approved render is missing.
+    if should_handoff:
+        RENDER_EXECUTOR.submit(
+            _handoff_shorts_to_schedule_master, request_id, chat_id
+        )
+
 
 
 def _copy_review_assets(state: dict[str, Any], request_id: str) -> list[dict[str, Any]]:
