@@ -23,7 +23,6 @@ from source_ingestion import (
     ingest_with_audio_master,
     restrict_to_boundary,
     reuse_from_drive,
-    _has_audio_stream,
     select_non_overlapping,
 )
 from google_drive import read_google_doc_text
@@ -96,10 +95,8 @@ def _ensure_render_source(request_id: str, state: dict[str, Any]) -> Path:
     """Return a usable local source file, rehydrating durable media after redeploys."""
     current_value = str(state.get("video_path") or "").strip()
     current = Path(current_value) if current_value else None
-    if current and current.is_file() and current.stat().st_size > 0 and _has_audio_stream(current):
+    if current and current.is_file() and current.stat().st_size > 0:
         return current
-    if current and current.is_file() and not _has_audio_stream(current):
-        logger.warning("RIPPED_RENDER_SOURCE_REJECT request_id=%s reason=no_audio_stream path=%s", request_id, current)
 
     parsed = state.get("parsed") or {}
     video_id = str(parsed.get("video_id") or "").strip()
@@ -2284,13 +2281,11 @@ def _safe_log_candidate(*args, **kwargs) -> None:
 
 
 def _preflight_candidates(video: Path, clips: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Only expose candidates whose source and transcript can support review."""
-    if not _has_audio_stream(video):
-        raise RuntimeError("Source has no audio stream; candidates withheld until media is reacquired")
+    """Check the stored transcript; audio is not needed to present candidates."""
     accepted = []
     for clip in clips:
         transcript = str(clip.get("transcript") or "").strip()
-        if not transcript or not re.search(r"[.!?][\\\"\\u201d\\u2019')\\]]*$", transcript):
+        if not transcript or transcript.rstrip("\"”’')]}").rstrip()[-1:] not in (".", "!", "?"):
             logger.warning("RIPPED_PREFLIGHT_REJECT candidate=%s reason=incomplete_transcript", clip.get("candidate_number"))
             continue
         accepted.append(clip)
@@ -2839,6 +2834,9 @@ def _process(request_id: str) -> None:
                 video = video or reusable["video_path"]
                 segments = segments or _segments(reusable["transcript_path"])
                 reused = True
+            if segments and not video:
+                send(chat_id, "⬇️ Reusing the existing transcript; downloading the source video.")
+                video = download_youtube_resilient(video_id, parsed["source_value"], work)
             if not video or not segments:
                 missing = []
                 if not video:
@@ -5352,3 +5350,4 @@ def configure_ripped_telegram_webhook() -> None:
         )
         thread.start()
         _RIPPED_WEBHOOK_WATCHDOG_STARTED = True
+
