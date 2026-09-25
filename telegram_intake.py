@@ -5193,8 +5193,6 @@ def _resume_stale_jobs() -> int:
                 or bool(state.get("superseded_by_request_id"))
             )
             if terminal:
-                # A finished/scheduled job closes older work for this source.
-                # A superseded job does not: its replacement is the active owner.
                 if video_id and (
                     status in {"published", "complete", "completed", "scheduled"}
                     or stage in {"published", "complete", "completed", "scheduled"}
@@ -5218,12 +5216,47 @@ def _resume_stale_jobs() -> int:
                     continue
                 seen_video_ids.add(video_id)
 
-            if any(word in stage for word in ("review", "awaiting")):
-                continue
-
             updated = datetime.fromisoformat(str(row["updated_at"]).replace("Z", "+00:00"))
             if not updated.tzinfo:
                 updated = updated.replace(tzinfo=timezone.utc)
+
+            reviews = dict(state.get("candidate_reviews") or {})
+            has_failed_approved_render = any(
+                str(review.get("status") or "") == "render_failed"
+                for review in reviews.values()
+            )
+            render_recovery_stage = stage in {
+                "render_recovery",
+                "awaiting_render_completion",
+            } or (stage == "awaiting_review" and has_failed_approved_render)
+
+            if render_recovery_stage:
+                stale_minutes = 5 if (stage == "awaiting_review" and has_failed_approved_render) else 30
+                if now_value - updated.astimezone(timezone.utc) < timedelta(minutes=stale_minutes):
+                    continue
+                attempts = int(state.get("watchdog_resume_count") or 0)
+                if attempts >= 3:
+                    continue
+                state["watchdog_resume_count"] = attempts + 1
+                state["watchdog_resumed_at"] = now()
+                state["stage"] = "render_recovery"
+                _save(row["request_id"], "render_recovery", state)
+                RENDER_EXECUTOR.submit(
+                    _queue_missing_approved_renders,
+                    row["request_id"],
+                    str(row["chat_id"] or ""),
+                )
+                resumed += 1
+                logger.warning(
+                    "RIPPED_JOB_WATCHDOG_RENDER_RECOVERY request_id=%s stage=%s attempt=%s",
+                    row["request_id"], stage, attempts + 1,
+                )
+                continue
+
+            # Human-controlled waiting states are intentionally not auto-resumed.
+            if any(word in stage for word in ("review", "awaiting")):
+                continue
+
             stale_minutes = 30 if "render" in stage else (5 if "handoff" in stage else 15)
             if now_value - updated.astimezone(timezone.utc) < timedelta(minutes=stale_minutes):
                 continue
@@ -5253,6 +5286,7 @@ def _resume_stale_jobs() -> int:
                 row["request_id"],
             )
     return resumed
+
 
 
 def _ripped_webhook_watchdog() -> None:
