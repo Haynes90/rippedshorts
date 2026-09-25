@@ -53,7 +53,7 @@ def test_transcript_retries_empty_response_and_reextracts(monkeypatch):
     monkeypatch.setenv('OPENAI_API_KEY','test')
     monkeypatch.setattr(c,'_run',extract)
     monkeypatch.setattr(c.time,'sleep',lambda _:None)
-    monkeypatch.setattr(c.requests,'post',lambda *a,**k:SimpleNamespace(raise_for_status=lambda:None,json=lambda:next(payloads)))
+    monkeypatch.setattr(c.requests,'post',lambda *a,**k:SimpleNamespace(status_code=200,raise_for_status=lambda:None,json=lambda:next(payloads)))
     result=c.transcribe_window(Path('source'),100,110)
     assert len(calls)==2 and result[0]['start']==100
 
@@ -95,33 +95,32 @@ def test_real_audio_pause_detection(monkeypatch,tmp_path):
     assert 1 < c.pause_end(audio,1,1.8) < 1.8
 
 
-@pytest.mark.parametrize('aspect',['16:9','9:16'])
-def test_failed_export_rebuilds_and_rechecks_before_success(monkeypatch,tmp_path,aspect):
-    ws=words(); calls=[]; renders=[]; verifications=[]
-    monkeypatch.setattr(c,'media_duration',lambda _:200)
-    monkeypatch.setattr(c,'transcribe_window',lambda *args:calls.append(args) or ws)
-    monkeypatch.setattr(c,'review_thought',lambda *args:review(ws))
-    monkeypatch.setattr(c,'pause_end',lambda *args:14.9)
-    def verify(*args):
-        verifications.append(args)
-        if len(verifications)==1: raise c.CompletionReviewRequired('last word missing')
-    monkeypatch.setattr(c,'verify_render',verify)
-    result=c.render_complete_clip(Path('source'),{'start':10,'end':14.6},tmp_path/'clip.mp4',lambda *a:renders.append(a),aspect)
-    assert len(calls)==len(renders)==len(verifications)==2
-    assert calls[1][2]>calls[0][2]
-    assert result['completion_check']['status']=='verified'
-    assert result['completion_check']['attempt']==2
+@pytest.mark.parametrize('aspect', ['16:9', '9:16'])
+def test_stored_transcript_render_does_not_retranscribe(monkeypatch, tmp_path, aspect):
+    output = tmp_path / 'clip.mp4'
+    monkeypatch.setattr(c, 'media_duration', lambda path: 5 if path == output else 200)
+    monkeypatch.setattr(c, '_run', lambda _: SimpleNamespace(stdout='video'))
+    def forbidden(*args):
+        raise AssertionError('No speech service should run during rendering')
+    monkeypatch.setattr(c, 'transcribe_window', forbidden)
+    monkeypatch.setattr(c, 'review_thought', forbidden)
+    monkeypatch.setattr(c, 'pause_end', forbidden)
+    monkeypatch.setattr(c, 'verify_render', forbidden)
+    def renderer(video, start, duration, destination):
+        assert (start, duration) == (10, 5)
+        destination.write_bytes(b'fixture')
+    result = c.render_complete_clip(Path('source'),
+        {'start': 10, 'end': 15, 'transcript': 'A complete sentence.'},
+        output, renderer, aspect)
+    assert result['completion_check']['basis'] == 'stored_transcript_and_media_bounds'
+    assert result['completion_check']['audio_pause'] is False
 
 
-def test_persistent_failure_stops_after_two_attempts(monkeypatch,tmp_path):
-    calls=[]
-    monkeypatch.setattr(c,'media_duration',lambda _:200)
-    def fail(*args):
-        calls.append(args); raise c.CompletionReviewRequired('Missing transcript')
-    monkeypatch.setattr(c,'transcribe_window',fail)
-    with pytest.raises(c.CompletionReviewRequired,match='two attempts'):
-        c.render_complete_clip(Path('source'),{'start':10,'end':20},tmp_path/'clip',None,'9:16')
-    assert len(calls)==2
+def test_missing_stored_transcript_fails_before_render(monkeypatch, tmp_path):
+    monkeypatch.setattr(c, 'media_duration', lambda _: 200)
+    with pytest.raises(c.CompletionReviewRequired, match='Stored transcript'):
+        c.render_complete_clip(Path('source'), {'start': 10, 'end': 20},
+                               tmp_path / 'clip', None, '9:16')
 
 
 @pytest.mark.parametrize('text', ['This is a complete', 'This is a complete thought. Next'])
