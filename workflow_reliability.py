@@ -33,8 +33,9 @@ def _last_column() -> str:
 _LOCK = threading.RLock()
 _READY_STAGES = {
     "source_resolution", "source_ready", "transcript_ready", "awaiting_review",
-    "processing_16_9", "awaiting_render_completion", "copy_review",
-    "schedule_handoff", "scheduled", "publishing", "published",
+    "processing_16_9", "render_recovery", "awaiting_render_completion",
+    "awaiting_render_retry", "copy_review", "schedule_handoff", "scheduled",
+    "publishing", "published",
 }
 
 
@@ -104,7 +105,9 @@ def next_action_for(stage: str, status: str) -> str:
         "transcript_ready": "select_candidates",
         "awaiting_review": "human_review",
         "processing_16_9": "select_16_9_highlights",
+        "render_recovery": "restore_source_and_retry_approved_renders",
         "awaiting_render_completion": "finish_renders",
+        "awaiting_render_retry": "retry_missing_approved_renders",
         "copy_review": "approve_copy",
         "schedule_handoff": "schedule_assets",
         "scheduled": "publish_when_due",
