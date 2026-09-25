@@ -24,3 +24,7 @@ Ten isolated standard-library regression tests passed locally, covering both asp
 
 These tests inject media probes and a renderer; they are not a real FFmpeg render or a live Telegram/Drive delivery. No production job or transcription was triggered. Production deployment revision and successful approval-video delivery remain unverified. Do not describe the incident as resolved until a real render succeeds on the deployed revision.
 
+
+## CI result
+
+[Run 36086213653](https://github.com/Haynes90/rippedshorts/actions/runs/36086213653) passed all 11 tests, with no skips. The real FFmpeg smoke test produced four exports using the production renderer functions: 9:16 and 16:9, each with sound and without audio. Audio presence was checked in each export. Vertical framing selection was replaced with a fixed crop for this encoding smoke test; face tracking and live source acquisition were not exercised. Production deployment and delivery remain unverified.
