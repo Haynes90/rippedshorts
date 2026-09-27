@@ -90,9 +90,17 @@ class StoredTranscriptRenderTests(unittest.TestCase):
             self.assertEqual(preflight(Path('no-audio.mp4'), [clip]), [clip])
         self.assertEqual(preflight(Path('source'), [{'transcript': 'unfinished'}]), [])
 
-    def test_existing_render_source_does_not_require_audio(self):
+    def test_existing_render_source_requires_usable_audio(self):
         self.output.write_bytes(b'existing source')
-        recover = load_function('telegram_intake.py', '_ensure_render_source', dict(Path=Path, Any=object))
+        recover = load_function(
+            'telegram_intake.py',
+            '_ensure_render_source',
+            dict(
+                Path=Path,
+                Any=object,
+                _has_usable_audio=lambda path: True,
+            ),
+        )
         self.assertEqual(recover('job', {'video_path': str(self.output)}), self.output)
 
     def test_download_fallback_is_imported(self):
