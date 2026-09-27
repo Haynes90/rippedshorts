@@ -2700,11 +2700,10 @@ def _topic_break_suggestions(
             "contains no self-contained discussion of that minimum length."
         )
     else:
-        minimum = (
-        max(60.0, float(minimum_seconds))
-        if minimum_seconds is not None
-        else max(180.0, float(os.getenv("TOPIC_SEGMENT_MIN_SECONDS", "180")))
-    )
+        minimum = max(
+            180.0,
+            float(os.getenv("TOPIC_SEGMENT_MIN_SECONDS", "180")),
+        )
         selection_rules = (
             "Select the strongest substantial standalone portions for YouTube and Facebook: "
             "a complete point or lesson, meaningful discussion, compelling story, useful "
@@ -2787,7 +2786,14 @@ def _build_contiguous_topic_segments(
     ordered = sorted(transcript_segments, key=lambda item: float(item.get("start", 0)))
     if not ordered:
         return []
-    minimum = max(180.0, float(os.getenv("TOPIC_SEGMENT_MIN_SECONDS", "180")))
+    minimum = (
+        max(60.0, float(minimum_seconds))
+        if minimum_seconds is not None
+        else max(
+            180.0,
+            float(os.getenv("TOPIC_SEGMENT_MIN_SECONDS", "180")),
+        )
+    )
     tolerance = 0.75
     transcript_starts = [float(item.get("start", 0)) for item in ordered]
     transcript_ends = [
