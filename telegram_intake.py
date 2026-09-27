@@ -624,6 +624,27 @@ def _copy_review_assets(state: dict[str, Any], request_id: str) -> list[dict[str
     return assets
 
 
+def _next_pending_copy_index(
+    drafts: list[dict[str, Any]], current_index: int
+) -> int:
+    """Advance to the next copy draft that still needs a decision."""
+    if not drafts:
+        return 0
+    pending = [
+        index
+        for index, draft in enumerate(drafts)
+        if str(draft.get("copy_status") or "") not in {"approved", "edited"}
+        and not bool(draft.get("user_edited"))
+    ]
+    after = [index for index in pending if index > current_index]
+    if after:
+        return after[0]
+    before = [index for index in pending if index < current_index]
+    if before:
+        return before[0]
+    return max(0, min(len(drafts) - 1, current_index))
+
+
 def _copy_review_payload(
     request_id: str, drafts: list[dict[str, Any]], index: int
 ) -> tuple[str, dict[str, Any]]:
@@ -3833,22 +3854,46 @@ def _accept_update(
     if not trusted_source and not _authorized(chat_id, user_id):
         return {"status": "unauthorized"}
     if text and not callback_data:
+        reply_to_message_id = str(
+            ((message.get("reply_to_message") or {}).get("message_id") or "")
+        )
+        edit_row = None
+        edit_state = None
+        waiting = None
         with _LOCK, _telegram_db() as db:
             rows = db.execute(
                 "SELECT * FROM telegram_requests WHERE chat_id=? AND user_id=? "
                 "ORDER BY updated_at DESC LIMIT 20",
                 (chat_id, user_id),
             ).fetchall()
-            edit_row = None
-            edit_state = None
+
+            # Prefer the exact force-reply prompt so simultaneous jobs/edits cannot
+            # steal one another's replies. Fall back for prompts created before this fix.
+            fallback = None
             for candidate_row in rows:
                 candidate_state = json.loads(candidate_row["state_json"])
-                waiting = candidate_state.get("awaiting_copy_input") or {}
-                if str(waiting.get("user_id") or "") == user_id:
-                    edit_row, edit_state = candidate_row, candidate_state
+                candidate_waiting = candidate_state.get("awaiting_copy_input") or {}
+                if str(candidate_waiting.get("user_id") or "") != user_id:
+                    continue
+                prompt_id = str(candidate_waiting.get("prompt_message_id") or "")
+                if reply_to_message_id and prompt_id == reply_to_message_id:
+                    edit_row, edit_state, waiting = (
+                        candidate_row,
+                        candidate_state,
+                        candidate_waiting,
+                    )
                     break
-            if edit_row and edit_state:
-                waiting = edit_state.pop("awaiting_copy_input")
+                if fallback is None and not prompt_id:
+                    fallback = (
+                        candidate_row,
+                        candidate_state,
+                        candidate_waiting,
+                    )
+            if edit_row is None and fallback is not None:
+                edit_row, edit_state, waiting = fallback
+
+            if edit_row and edit_state and waiting:
+                edit_state.pop("awaiting_copy_input", None)
                 index = int(waiting["index"])
                 field = str(waiting["field"])
                 drafts = list(edit_state.get("copy_drafts") or [])
@@ -3865,20 +3910,54 @@ def _accept_update(
                 drafts[index]["edited_fields"] = sorted(
                     set(drafts[index].get("edited_fields") or []) | {field}
                 )
+                next_index = _next_pending_copy_index(drafts, index)
                 edit_state["copy_drafts"] = drafts
+                edit_state["copy_review_index"] = next_index
+                request_id = edit_row["request_id"]
+                prompt_message_id = waiting.get("prompt_message_id")
                 db.execute(
                     "UPDATE telegram_requests SET state_json=?, updated_at=? "
                     "WHERE request_id=?",
-                    (json.dumps(edit_state), now(), edit_row["request_id"]),
+                    (json.dumps(edit_state), now(), request_id),
                 )
-                request_id = edit_row["request_id"]
-                _refresh_copy_review(chat_id, request_id, index=index)
-                return {
-                    "status": "copy_updated",
-                    "request_id": request_id,
-                    "field": field,
-                    "asset_index": index,
-                }
+            else:
+                request_id = ""
+                next_index = 0
+                prompt_message_id = None
+
+        # The edit transaction is committed before refreshing the persistent card.
+        if request_id:
+            _refresh_copy_review(chat_id, request_id, index=next_index)
+            if prompt_message_id:
+                try:
+                    telegram(
+                        "editMessageText",
+                        {
+                            "chat_id": chat_id,
+                            "message_id": prompt_message_id,
+                            "text": (
+                                f"✅ {field.title()} saved. "
+                                + (
+                                    f"Moved to copy {next_index + 1}/{len(drafts)}."
+                                    if next_index != index
+                                    else "Copy review is ready for your next action."
+                                )
+                            ),
+                        },
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not update copy edit prompt request_id=%s",
+                        request_id,
+                    )
+            return {
+                "status": "copy_updated",
+                "request_id": request_id,
+                "field": field,
+                "asset_index": index,
+                "next_asset_index": next_index,
+            }
+
 
     shorts_page = re.fullmatch(
         r"rs:shorts_page:([A-Za-z0-9-]+):(\d+)", callback_data
@@ -4131,16 +4210,8 @@ def _accept_update(
             drafts = list(state.get("copy_drafts") or [])
             if index >= len(drafts):
                 return {"status": "copy_draft_not_found"}
-            state["awaiting_copy_input"] = {
-                "field": field,
-                "index": index,
-                "user_id": user_id,
-            }
-            db.execute(
-                "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
-                (json.dumps(state), now(), request_id),
-            )
-        telegram(
+
+        prompt_result = telegram(
             "sendMessage",
             {
                 "chat_id": chat_id,
@@ -4155,7 +4226,35 @@ def _accept_update(
                 },
             },
         )
-        return {"status": "awaiting_copy_input", "request_id": request_id, "field": field}
+        prompt_message_id = (prompt_result.get("result") or {}).get("message_id")
+
+        with _LOCK, _telegram_db() as db:
+            latest = db.execute(
+                "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if not latest:
+                return {"status": "not_found"}
+            latest_state = json.loads(latest["state_json"])
+            latest_state["awaiting_copy_input"] = {
+                "field": field,
+                "index": index,
+                "user_id": user_id,
+                "prompt_message_id": prompt_message_id,
+            }
+            latest_state["copy_review_index"] = index
+            db.execute(
+                "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
+                (json.dumps(latest_state), now(), request_id),
+            )
+        return {
+            "status": "awaiting_copy_input",
+            "request_id": request_id,
+            "field": field,
+            "asset_index": index,
+            "prompt_message_id": prompt_message_id,
+        }
+
 
     copy_finish = re.fullmatch(
         r"rs:copy_finish:([A-Za-z0-9-]+)", callback_data

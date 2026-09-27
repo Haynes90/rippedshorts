@@ -243,6 +243,18 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("rs:shorts_page:", SOURCE)
         self.assertIn("Rendering continues in the background", SOURCE)
 
+    def test_copy_reply_is_bound_to_exact_prompt_and_preserves_route(self):
+        self.assertIn('"prompt_message_id": prompt_message_id', SOURCE)
+        self.assertIn("reply_to_message_id", SOURCE)
+        self.assertIn("prompt_id == reply_to_message_id", SOURCE)
+        self.assertIn("The edit transaction is committed before refreshing", SOURCE)
+        self.assertIn("_next_pending_copy_index(drafts, index)", SOURCE)
+        self.assertIn('"next_asset_index": next_index', SOURCE)
+
+    def test_copy_reply_updates_existing_prompt_instead_of_sending_status_spam(self):
+        self.assertIn("Could not update copy edit prompt", SOURCE)
+        self.assertIn("Moved to copy", SOURCE)
+
     def test_copy_review_uses_one_reusable_message(self):
         self.assertIn("def _refresh_copy_review", SOURCE)
         self.assertIn('"copy_review_message_id"', SOURCE)
