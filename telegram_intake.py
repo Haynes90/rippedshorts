@@ -2698,7 +2698,11 @@ def _topic_break_suggestions(
             "discussion of that minimum length."
         )
     else:
-        minimum = max(180.0, float(os.getenv("TOPIC_SEGMENT_MIN_SECONDS", "180")))
+        minimum = (
+        max(60.0, float(minimum_seconds))
+        if minimum_seconds is not None
+        else max(180.0, float(os.getenv("TOPIC_SEGMENT_MIN_SECONDS", "180")))
+    )
         selection_rules = (
             "Select the strongest substantial standalone portions for YouTube and Facebook: "
             "a complete point or lesson, meaningful discussion, compelling story, useful "
@@ -2772,7 +2776,10 @@ def _topic_break_suggestions(
 
 
 def _build_contiguous_topic_segments(
-    transcript_segments: list[dict], suggestions: list[dict]
+    transcript_segments: list[dict],
+    suggestions: list[dict],
+    *,
+    minimum_seconds: float | None = None,
 ) -> list[dict]:
     """Validate selected standalone highlights without forcing full-timeline coverage."""
     ordered = sorted(transcript_segments, key=lambda item: float(item.get("start", 0)))
@@ -2998,13 +3005,38 @@ def _process_topics(
     suggestions = _topic_break_suggestions(segments)
     topics = _build_contiguous_topic_segments(segments, suggestions)
     topics = _preflight_candidates(video, topics)
+    selection_mode = "preferred_3min_semantic_highlights"
+
+    if not topics:
+        fallback_minimum = max(
+            60.0,
+            float(os.getenv("TOPIC_FALLBACK_MIN_SECONDS", "90")),
+        )
+        logger.warning(
+            "16:9 preferred pass returned no usable highlights; "
+            "running semantic fallback request_id=%s minimum_seconds=%s",
+            request_id,
+            fallback_minimum,
+        )
+        fallback_suggestions = _topic_break_suggestions(
+            segments, semantic_fallback=True
+        )
+        topics = _build_contiguous_topic_segments(
+            segments,
+            fallback_suggestions,
+            minimum_seconds=fallback_minimum,
+        )
+        topics = _preflight_candidates(video, topics)
+        selection_mode = "semantic_fallback"
+
     if not topics:
         send(
             chat_id,
-            "ℹ️ No standalone 16:9 highlight of at least three minutes met "
-            "the quality and completeness requirements.",
+            "ℹ️ I checked both the substantial-highlight pass and the semantic "
+            "question/topic fallback, but did not find a complete standalone 16:9 "
+            "section that passed the transcript-boundary checks.",
         )
-    topic_result = {"segments": topics, "selection": "best_standalone_highlights"}
+    topic_result = {"segments": topics, "selection": selection_mode}
     state.update(
         {
             "video_path": str(video),
