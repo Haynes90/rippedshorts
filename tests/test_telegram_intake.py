@@ -249,6 +249,23 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("rs:copy_page:", SOURCE)
         self.assertIn("✅ Finish & Schedule", SOURCE)
 
+    def test_16_9_runs_semantic_fallback_when_long_pass_is_empty(self):
+        self.assertIn("semantic_fallback: bool = False", SOURCE)
+        self.assertIn('TOPIC_FALLBACK_MIN_SECONDS", "90"', SOURCE)
+        self.assertIn("questions with their full answers", SOURCE)
+        self.assertIn("follow-up exchanges that stay on one subject", SOURCE)
+        self.assertIn("topic discussions", SOURCE)
+        self.assertIn("stories with setup and payoff", SOURCE)
+        self.assertIn("This is a minimum only, never a target or maximum", SOURCE)
+        self.assertIn("5, 8, 12, or more minutes", SOURCE)
+        self.assertIn("semantic_fallback=True", SOURCE)
+        self.assertIn('selection_mode = "semantic_fallback"', SOURCE)
+
+    def test_16_9_builder_accepts_lower_minimum_only_for_fallback(self):
+        self.assertIn("minimum_seconds: float | None = None", SOURCE)
+        self.assertIn("max(60.0, float(minimum_seconds))", SOURCE)
+        self.assertIn('TOPIC_SEGMENT_MIN_SECONDS", "180"', SOURCE)
+
     def test_topic_review_uses_one_reusable_message(self):
         self.assertIn("def _refresh_topic_review", SOURCE)
         self.assertIn('"topic_review_message_id"', SOURCE)

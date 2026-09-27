@@ -2668,8 +2668,10 @@ def _transcribe(video_path: Path, progress=None) -> list[dict]:
     return transcribe_source(video_path, progress)
 
 
-def _topic_break_suggestions(transcript_segments: list[dict]) -> list[dict]:
-    """Select the strongest standalone 16:9 highlights from the full transcript."""
+def _topic_break_suggestions(
+    transcript_segments: list[dict], *, semantic_fallback: bool = False
+) -> list[dict]:
+    """Select semantic 16:9 highlights from the complete timestamped transcript."""
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         return []
@@ -2679,30 +2681,58 @@ def _topic_break_suggestions(transcript_segments: list[dict]) -> list[dict]:
         end = float(item.get("end", start + float(item.get("duration", 0))))
         text = str(item.get("text", "")).replace("\n", " ").strip()
         lines.append(f"[{start:.2f}-{end:.2f}] {text}")
+
+    if semantic_fallback:
+        minimum = max(60.0, float(os.getenv("TOPIC_FALLBACK_MIN_SECONDS", "90")))
+        selection_rules = (
+            "The normal long-highlight pass found no usable section. Recover meaningful "
+            "semantic sections instead of returning nothing. Identify complete interview "
+            "questions with their full answers, follow-up exchanges that stay on one subject, "
+            "topic discussions, stories with setup and payoff, explanations, lessons, "
+            "arguments or opinions with supporting reasoning, demonstrations, or other "
+            "complete standalone conversations. A section may be shorter than a typical "
+            "long highlight but should normally be at least "
+            f"{minimum:.0f} seconds. This is a minimum only, never a target or maximum. "
+            "If one complete subject naturally runs 5, 8, 12, or more minutes, return the "
+            "whole coherent section rather than shortening or discarding it. Do not pad with "
+            "unrelated material just to reach a duration. Prefer a natural complete section "
+            "over an arbitrary block. Return an empty array only when the transcript genuinely "
+            "contains no self-contained discussion of that minimum length."
+        )
+    else:
+        minimum = (
+        max(60.0, float(minimum_seconds))
+        if minimum_seconds is not None
+        else max(180.0, float(os.getenv("TOPIC_SEGMENT_MIN_SECONDS", "180")))
+    )
+        selection_rules = (
+            "Select the strongest substantial standalone portions for YouTube and Facebook: "
+            "a complete point or lesson, meaningful discussion, compelling story, useful "
+            "explanation, strong argument or opinion, memorable exchange, focused tangent, "
+            "interview question with its complete answer, or connected sequence of ideas. "
+            "Do NOT divide the video into arbitrary blocks and do NOT try to cover the full "
+            "timeline. Gaps are allowed. Every preferred highlight should be at least "
+            f"{minimum:.0f} seconds. Eight minutes is only a loose reference, never a target "
+            "or maximum. Select quality over quantity."
+        )
+
     prompt = (
         "You are the 16:9 Highlight Editor for Ripped Shorts. Review the ENTIRE "
-        "timestamped transcript before selecting anything. Select only the strongest "
-        "standalone portions for YouTube and Facebook: a complete point or lesson, "
-        "meaningful discussion, compelling story, useful explanation, strong argument "
-        "or opinion, memorable exchange, focused tangent, or connected sequence of ideas.\n\n"
-        "Do NOT divide the video into arbitrary blocks and do NOT try to cover the full "
-        "timeline. Gaps are allowed. Each highlight must contain its central point plus "
-        "the adjoining setup, supporting explanation, examples, questions and responses, "
-        "story details, conclusion, lesson, or payoff needed to understand it. Do not add "
-        "unrelated material merely to make it longer.\n\n"
-        "Every highlight must be at least 180 seconds. Eight minutes is only a loose "
-        "reference, never a target or maximum. Start at the natural beginning of the "
-        "subject or setup, end after the point or payoff is complete, and use only exact "
-        "transcript boundaries. Never cut a sentence, speaker, example, prayer, "
-        "declaration, or conclusion. Highlights must be distinct, non-overlapping, "
-        "chronological, understandable without the full source, and strong enough to "
-        "publish separately. Select quality over quantity and return an empty segments "
-        "array if nothing qualifies.\n\n"
-        "Return strict JSON only as "
-        '{"analysis":{"content_type":"other","main_theme":"","major_points":[]},'
-        '"segments":[{"start":0,"end":180,"duration":180,"title":"...",'
-        '"summary":"...","highlight_type":"point","reason":"..."}]}. '
-        "Do not include Markdown or commentary.\n\nTRANSCRIPT:\n"
+        "timestamped transcript before selecting anything.\n\n"
+        + selection_rules
+        + "\n\nEach highlight must contain its central subject plus the adjoining setup, "
+        "supporting explanation, examples, questions and responses, story details, "
+        "conclusion, lesson, or payoff needed to understand it. Start at the natural "
+        "beginning of the subject, question, or setup and end after the answer, point, "
+        "or payoff is complete. Use only exact transcript boundaries. Never cut a sentence, "
+        "speaker, example, prayer, declaration, answer, or conclusion. Highlights must be "
+        "distinct, non-overlapping, chronological, understandable without the full source, "
+        "and strong enough to publish separately.\n\n"
+        "Return strict JSON only with analysis plus a segments array. Each segment must "
+        "include start, end, duration, title, summary, highlight_type, reason, and score. "
+        "highlight_type may be question_answer, discussion, story, explanation, lesson, "
+        "argument, opinion, demonstration, tangent, or other. Do not include Markdown or "
+        "commentary.\n\nTRANSCRIPT:\n"
         + "\n".join(lines)
         + _boundary_learning_prompt()
     )
@@ -2739,12 +2769,19 @@ def _topic_break_suggestions(transcript_segments: list[dict]) -> list[dict]:
         if attempt < 2:
             import time
             time.sleep(3)
-    logger.warning("16:9 highlight selection failed: %s", last_error)
+    logger.warning(
+        "16:9 highlight selection failed fallback=%s error=%s",
+        semantic_fallback,
+        last_error,
+    )
     return []
 
 
 def _build_contiguous_topic_segments(
-    transcript_segments: list[dict], suggestions: list[dict]
+    transcript_segments: list[dict],
+    suggestions: list[dict],
+    *,
+    minimum_seconds: float | None = None,
 ) -> list[dict]:
     """Validate selected standalone highlights without forcing full-timeline coverage."""
     ordered = sorted(transcript_segments, key=lambda item: float(item.get("start", 0)))
@@ -2970,13 +3007,38 @@ def _process_topics(
     suggestions = _topic_break_suggestions(segments)
     topics = _build_contiguous_topic_segments(segments, suggestions)
     topics = _preflight_candidates(video, topics)
+    selection_mode = "preferred_3min_semantic_highlights"
+
+    if not topics:
+        fallback_minimum = max(
+            60.0,
+            float(os.getenv("TOPIC_FALLBACK_MIN_SECONDS", "90")),
+        )
+        logger.warning(
+            "16:9 preferred pass returned no usable highlights; "
+            "running semantic fallback request_id=%s minimum_seconds=%s",
+            request_id,
+            fallback_minimum,
+        )
+        fallback_suggestions = _topic_break_suggestions(
+            segments, semantic_fallback=True
+        )
+        topics = _build_contiguous_topic_segments(
+            segments,
+            fallback_suggestions,
+            minimum_seconds=fallback_minimum,
+        )
+        topics = _preflight_candidates(video, topics)
+        selection_mode = "semantic_fallback"
+
     if not topics:
         send(
             chat_id,
-            "ℹ️ No standalone 16:9 highlight of at least three minutes met "
-            "the quality and completeness requirements.",
+            "ℹ️ I checked both the substantial-highlight pass and the semantic "
+            "question/topic fallback, but did not find a complete standalone 16:9 "
+            "section that passed the transcript-boundary checks.",
         )
-    topic_result = {"segments": topics, "selection": "best_standalone_highlights"}
+    topic_result = {"segments": topics, "selection": selection_mode}
     state.update(
         {
             "video_path": str(video),
