@@ -19,3 +19,10 @@ def test_short_and_topic_renders_use_source_recovery():
 def test_recovered_path_is_persisted_back_to_job_state():
     assert 'state["video_path"] = str(path)' in SOURCE
     assert 'state["source_rehydrated_at"] = now()' in SOURCE
+
+
+def test_render_recovery_rejects_silent_local_sources():
+    assert "_has_audio_stream(current)" in SOURCE
+    assert "RENDER_SOURCE_LOCAL_REJECT" in SOURCE
+    assert "_has_audio_stream(latest_path)" in SOURCE
+    assert "Recovered render source has no audio stream" in SOURCE
