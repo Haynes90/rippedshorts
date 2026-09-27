@@ -603,73 +603,164 @@ def _copy_review_assets(state: dict[str, Any], request_id: str) -> list[dict[str
     return assets
 
 
-def _send_copy_review(chat_id: str, request_id: str, drafts: list[dict[str, Any]]) -> None:
-    for index, draft in enumerate(drafts):
-        if draft["asset_type"] == "9:16_SHORT":
-            text = (
-                f"✍️ 9:16 Caption Draft {draft.get('candidate_number', index + 1)}\n\n"
-                f"{draft.get('social_caption', '')}\n\n{draft.get('hashtags', '')}"
-            )
-            buttons = [
-                [
-                    {
-                        "text": "✅ Keep Caption",
-                        "callback_data": f"rs:copy_keep:{request_id}:{index}",
-                    },
-                    {
-                        "text": "✏️ Write My Caption",
-                        "callback_data": f"rs:copy_edit_caption:{request_id}:{index}",
-                    },
-                ],
-                [{
-                    "text": "🔄 Generate Another",
-                    "callback_data": f"rs:copy_regenerate:{request_id}:{index}",
-                }],
-            ]
-        else:
-            text = (
-                f"📺 16:9 Metadata Draft {draft.get('candidate_number', index + 1)}\n\n"
-                f"TITLE\n{draft.get('video_title', '')}\n\n"
-                f"DESCRIPTION\n{draft.get('video_description', '')}\n\n"
-                f"SEO TAGS\n{draft.get('hashtags', '')}"
-            )
-            buttons = [
-                [{
-                    "text": "✅ Keep Title & Description",
+def _copy_review_payload(
+    request_id: str, drafts: list[dict[str, Any]], index: int
+) -> tuple[str, dict[str, Any]]:
+    if not drafts:
+        return (
+            "No copy drafts are available.",
+            {"inline_keyboard": [[{
+                "text": "✅ Finish & Schedule",
+                "callback_data": f"rs:copy_finish:{request_id}",
+            }]]},
+        )
+    index = max(0, min(len(drafts) - 1, int(index or 0)))
+    draft = drafts[index]
+    approved = sum(
+        str(item.get("copy_status") or "") in {"approved", "edited"}
+        or bool(item.get("user_edited"))
+        for item in drafts
+    )
+    regenerated = sum(
+        int(item.get("regeneration_count") or 0) > 0 for item in drafts
+    )
+    header = (
+        f"✍️ COPY REVIEW • {index + 1}/{len(drafts)}\n"
+        f"Approved/edited: {approved}/{len(drafts)} • "
+        f"Regenerated: {regenerated}"
+    )
+    if draft["asset_type"] == "9:16_SHORT":
+        body = (
+            f"\n\n9:16 Caption • Short "
+            f"{draft.get('candidate_number', index + 1)}\n\n"
+            f"{draft.get('social_caption', '')}\n\n"
+            f"{draft.get('hashtags', '')}"
+        )
+        buttons = [
+            [
+                {
+                    "text": "✅ Keep Caption",
                     "callback_data": f"rs:copy_keep:{request_id}:{index}",
-                }],
-                [
-                    {
-                        "text": "✏️ Edit Title",
-                        "callback_data": f"rs:copy_edit_title:{request_id}:{index}",
-                    },
-                    {
-                        "text": "✏️ Edit Description",
-                        "callback_data": f"rs:copy_edit_description:{request_id}:{index}",
-                    },
-                ],
-                [{
-                    "text": "🔄 Generate Another",
-                    "callback_data": f"rs:copy_regenerate:{request_id}:{index}",
-                }],
-            ]
-        telegram("sendMessage", {
-            "chat_id": chat_id,
-            "text": text[:4000],
-            "disable_web_page_preview": True,
-            "reply_markup": {"inline_keyboard": buttons},
+                },
+                {
+                    "text": "✏️ Edit Caption",
+                    "callback_data": f"rs:copy_edit_caption:{request_id}:{index}",
+                },
+            ],
+            [{
+                "text": "🔄 Generate Another",
+                "callback_data": f"rs:copy_regenerate:{request_id}:{index}",
+            }],
+        ]
+    else:
+        body = (
+            f"\n\n16:9 Metadata • Segment "
+            f"{draft.get('candidate_number', index + 1)}\n\n"
+            f"TITLE\n{draft.get('video_title', '')}\n\n"
+            f"DESCRIPTION\n{draft.get('video_description', '')}\n\n"
+            f"SEO TAGS\n{draft.get('hashtags', '')}"
+        )
+        buttons = [
+            [{
+                "text": "✅ Keep Title & Description",
+                "callback_data": f"rs:copy_keep:{request_id}:{index}",
+            }],
+            [
+                {
+                    "text": "✏️ Edit Title",
+                    "callback_data": f"rs:copy_edit_title:{request_id}:{index}",
+                },
+                {
+                    "text": "✏️ Edit Description",
+                    "callback_data": f"rs:copy_edit_description:{request_id}:{index}",
+                },
+            ],
+            [{
+                "text": "🔄 Generate Another",
+                "callback_data": f"rs:copy_regenerate:{request_id}:{index}",
+            }],
+        ]
+    nav = []
+    if index > 0:
+        nav.append({
+            "text": "◀️ Previous",
+            "callback_data": f"rs:copy_page:{request_id}:{index - 1}",
         })
-    telegram("sendMessage", {
-        "chat_id": chat_id,
-        "text": (
-            "Review the drafts above. Edit anything you want; unchanged drafts are "
-            "treated as approved. When finished, release the complete batch."
-        ),
-        "reply_markup": {"inline_keyboard": [[{
-            "text": "✅ Approve Copy & Schedule",
-            "callback_data": f"rs:copy_finish:{request_id}",
-        }]]},
-    })
+    if index < len(drafts) - 1:
+        nav.append({
+            "text": "Next ▶️",
+            "callback_data": f"rs:copy_page:{request_id}:{index + 1}",
+        })
+    if nav:
+        buttons.append(nav)
+    buttons.append([{
+        "text": "✅ Finish & Schedule",
+        "callback_data": f"rs:copy_finish:{request_id}",
+    }])
+    return (header + body)[:4000], {"inline_keyboard": buttons}
+
+
+def _refresh_copy_review(
+    chat_id: str, request_id: str, *, index: int | None = None
+) -> None:
+    with _LOCK, _telegram_db() as db:
+        row = db.execute(
+            "SELECT state_json FROM telegram_requests WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+    if not row:
+        return
+    state = json.loads(row["state_json"])
+    drafts = list(state.get("copy_drafts") or [])
+    if index is None:
+        index = int(state.get("copy_review_index") or 0)
+    text, markup = _copy_review_payload(request_id, drafts, index)
+    message_id = state.get("copy_review_message_id")
+    if message_id:
+        try:
+            telegram("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "disable_web_page_preview": True,
+                "reply_markup": markup,
+            })
+        except Exception as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.warning(
+                    "Copy review edit failed; replacing request_id=%s", request_id
+                )
+                message_id = None
+    if not message_id:
+        result = telegram("sendMessage", {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+            "reply_markup": markup,
+        })
+        message_id = (result.get("result") or {}).get("message_id")
+    if message_id:
+        with _LOCK, _telegram_db() as db:
+            latest = db.execute(
+                "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if latest:
+                latest_state = json.loads(latest["state_json"])
+                latest_state["copy_review_message_id"] = message_id
+                latest_state["copy_review_index"] = index
+                db.execute(
+                    "UPDATE telegram_requests SET state_json=?, updated_at=? "
+                    "WHERE request_id=?",
+                    (json.dumps(latest_state), now(), request_id),
+                )
+
+
+def _send_copy_review(
+    chat_id: str, request_id: str, drafts: list[dict[str, Any]]
+) -> None:
+    """Present copy review as one evolving Telegram message."""
+    _refresh_copy_review(chat_id, request_id, index=0)
 
 
 def _regenerate_copy_draft(request_id: str, index: int, chat_id: str) -> None:
@@ -701,8 +792,7 @@ def _regenerate_copy_draft(request_id: str, index: int, chat_id: str) -> None:
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(state), now(), request_id),
             )
-        send(chat_id, f"✅ Draft {index + 1} was regenerated. Here is the refreshed review set:")
-        _send_copy_review(chat_id, request_id, drafts)
+        _refresh_copy_review(chat_id, request_id, index=index)
     except Exception:
         logger.exception("Could not regenerate copy request_id=%s index=%s", request_id, index)
         send(chat_id, f"❌ I couldn't regenerate draft {index + 1}. Your previous draft is still saved.")
@@ -3625,18 +3715,7 @@ def _accept_update(
                     (json.dumps(edit_state), now(), edit_row["request_id"]),
                 )
                 request_id = edit_row["request_id"]
-                send(
-                    chat_id,
-                    f"✅ Your {field} replaced the AI draft and will be learned.\n\n{text[:3200]}",
-                )
-                telegram("sendMessage", {
-                    "chat_id": chat_id,
-                    "text": "Make another edit above or finish the copy review.",
-                    "reply_markup": {"inline_keyboard": [[{
-                        "text": "✅ Approve Copy & Schedule",
-                        "callback_data": f"rs:copy_finish:{request_id}",
-                    }]]},
-                })
+                _refresh_copy_review(chat_id, request_id, index=index)
                 return {
                     "status": "copy_updated",
                     "request_id": request_id,
@@ -3828,6 +3907,18 @@ def _accept_update(
         _send_copy_review(chat_id, request_id, drafts)
         return {"status": "copy_review_requested", "request_id": request_id}
 
+    copy_page = re.fullmatch(
+        r"rs:copy_page:([A-Za-z0-9-]+):(\d+)", callback_data
+    )
+    if copy_page:
+        request_id, index_text = copy_page.groups()
+        _refresh_copy_review(chat_id, request_id, index=int(index_text))
+        return {
+            "status": "copy_review_page",
+            "request_id": request_id,
+            "asset_index": int(index_text),
+        }
+
     copy_action = re.fullmatch(
         r"rs:copy_(keep|regenerate):([A-Za-z0-9-]+):(\d+)",
         callback_data,
@@ -3852,10 +3943,7 @@ def _accept_update(
                     "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                     (json.dumps(state), now(), request_id),
                 )
-                send(
-                    chat_id,
-                    f"✅ Draft {index + 1} approved. You can review another draft or finish scheduling.",
-                )
+                _refresh_copy_review(chat_id, request_id, index=index)
                 return {"status": "copy_approved", "request_id": request_id, "asset_index": index}
             drafts[index]["copy_status"] = "regenerating"
             state["copy_drafts"] = drafts
@@ -3863,7 +3951,7 @@ def _accept_update(
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(state), now(), request_id),
             )
-        send(chat_id, f"🔄 Creating a fresh version of draft {index + 1}…")
+        _refresh_copy_review(chat_id, request_id, index=index)
         background_tasks.add_task(
             _regenerate_copy_draft, request_id, index, chat_id
         )
