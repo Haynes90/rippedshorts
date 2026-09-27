@@ -236,6 +236,24 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn('_persist_schedule_outbox(payload, "ACCEPTED")', SOURCE)
         self.assertIn('_persist_schedule_outbox(payload, "RETRY")', SOURCE)
 
+    def test_short_review_uses_one_reusable_page_and_control_card(self):
+        self.assertIn("def _refresh_short_review_message", SOURCE)
+        self.assertIn('"short_review_message_id"', SOURCE)
+        self.assertIn('"short_control_message_id"', SOURCE)
+        self.assertIn("rs:shorts_page:", SOURCE)
+        self.assertIn("Rendering continues in the background", SOURCE)
+
+    def test_copy_review_uses_one_reusable_message(self):
+        self.assertIn("def _refresh_copy_review", SOURCE)
+        self.assertIn('"copy_review_message_id"', SOURCE)
+        self.assertIn("rs:copy_page:", SOURCE)
+        self.assertIn("✅ Finish & Schedule", SOURCE)
+
+    def test_topic_review_uses_one_reusable_message(self):
+        self.assertIn("def _refresh_topic_review", SOURCE)
+        self.assertIn('"topic_review_message_id"', SOURCE)
+        self.assertIn("rs:topic_page:", SOURCE)
+
     def test_schedule_now_waits_for_both_render_lanes(self):
         self.assertIn("rs:schedule_now:", SOURCE)
         self.assertIn('"schedule_requested_at"', SOURCE)
