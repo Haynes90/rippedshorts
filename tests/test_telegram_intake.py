@@ -256,6 +256,8 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("follow-up exchanges that stay on one subject", SOURCE)
         self.assertIn("topic discussions", SOURCE)
         self.assertIn("stories with setup and payoff", SOURCE)
+        self.assertIn("This is a minimum only, never a target or maximum", SOURCE)
+        self.assertIn("5, 8, 12, or more minutes", SOURCE)
         self.assertIn("semantic_fallback=True", SOURCE)
         self.assertIn('selection_mode = "semantic_fallback"', SOURCE)
 
