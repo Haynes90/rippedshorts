@@ -1654,6 +1654,9 @@ from schedule_route_gate import install_route_gate
 install_route_gate()
 app.include_router(telegram_intake_router)
 
+from caption_review_web import router as caption_review_web_router
+app.include_router(caption_review_web_router)
+
 
 @app.on_event("startup")
 def register_ripped_shorts_telegram_webhook():
