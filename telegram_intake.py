@@ -859,6 +859,134 @@ def _regenerate_copy_draft(request_id: str, index: int, chat_id: str) -> None:
         send(chat_id, f"❌ I couldn't regenerate draft {index + 1}. Your previous draft is still saved.")
 
 
+def _copy_learning_row_values(
+    request_id: str,
+    state: dict[str, Any],
+    draft: dict[str, Any],
+    user_id: str,
+) -> list[Any]:
+    """Build the durable Caption Learning row for one reviewed copy asset."""
+    edited = bool(draft.get("user_edited"))
+    return [
+        now(),
+        request_id,
+        str(draft.get("asset_id") or ""),
+        str(state.get("show_id") or ""),
+        str(draft.get("asset_type") or ""),
+        _state_vid_title(state),
+        str(draft.get("transcript") or ""),
+        str(draft.get("ai_social_caption") or draft.get("social_caption") or ""),
+        str(draft.get("social_caption") or ""),
+        str(draft.get("ai_video_title") or draft.get("video_title") or ""),
+        str(draft.get("video_title") or ""),
+        str(draft.get("ai_video_description") or draft.get("video_description") or ""),
+        str(draft.get("video_description") or ""),
+        str(draft.get("hashtags") or ""),
+        "EDITED" if edited else "ACCEPTED",
+        user_id,
+    ]
+
+
+def _checkpoint_copy_edit(
+    request_id: str,
+    state: dict[str, Any],
+    draft: dict[str, Any],
+    user_id: str,
+) -> None:
+    """Upsert one copy edit immediately so Telegram review survives restarts."""
+    import main
+
+    _, _, sheets = main.get_google_services()
+    asset_id = str(draft.get("asset_id") or "").strip()
+    if not asset_id:
+        raise RuntimeError("Edited copy draft is missing asset_id")
+
+    result = sheets.spreadsheets().values().get(
+        spreadsheetId=RIPPED_LOG_SHEET_ID,
+        range="'Caption Learning'!A1:P5000",
+    ).execute()
+    values = result.get("values", [])
+    target_row = None
+    if values:
+        header = [
+            str(value or "").strip().lower().replace(" ", "_")
+            for value in values[0]
+        ]
+        request_col = header.index("request_id") if "request_id" in header else 1
+        asset_col = header.index("asset_id") if "asset_id" in header else 2
+        for row_number, row in enumerate(values[1:], start=2):
+            request_value = str(
+                row[request_col] if request_col < len(row) else ""
+            ).strip()
+            asset_value = str(
+                row[asset_col] if asset_col < len(row) else ""
+            ).strip()
+            if request_value == request_id and asset_value == asset_id:
+                target_row = row_number
+
+    row_values = _copy_learning_row_values(
+        request_id,
+        state,
+        draft,
+        user_id,
+    )
+    if target_row:
+        sheets.spreadsheets().values().update(
+            spreadsheetId=RIPPED_LOG_SHEET_ID,
+            range=f"'Caption Learning'!A{target_row}:P{target_row}",
+            valueInputOption="RAW",
+            body={"values": [row_values]},
+        ).execute()
+    else:
+        sheets.spreadsheets().values().append(
+            spreadsheetId=RIPPED_LOG_SHEET_ID,
+            range="'Caption Learning'!A:P",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row_values]},
+        ).execute()
+
+    logger.info(
+        "COPY_EDIT_CHECKPOINTED request_id=%s asset_id=%s",
+        request_id,
+        asset_id,
+    )
+
+
+def _caption_learning_checkpoint_map(request_id: str) -> dict[str, dict[str, str]]:
+    """Read final reviewed copy from the durable sheet for Schedule Master handoff."""
+    try:
+        rows = get_rows(
+            RIPPED_LOG_SHEET_ID,
+            "Caption Learning",
+        )
+    except Exception:
+        logger.exception(
+            "Could not read Caption Learning checkpoints request_id=%s",
+            request_id,
+        )
+        return {}
+
+    result: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if str(row.get("request_id") or "").strip() != request_id:
+            continue
+        asset_id = str(row.get("asset_id") or "").strip()
+        if not asset_id:
+            continue
+        decision = str(row.get("decision") or "").strip().upper()
+        if decision not in {"EDITED", "ACCEPTED"}:
+            continue
+        result[asset_id] = {
+            "social_caption": str(row.get("final_caption") or ""),
+            "video_title": str(row.get("final_title") or ""),
+            "video_description": str(row.get("final_description") or ""),
+            "hashtags": str(row.get("hashtags") or ""),
+            "copy_source": "CAPTION_LEARNING_CHECKPOINT",
+        }
+    return result
+
+
 def _log_copy_learning(
     request_id: str, state: dict[str, Any], drafts: list[dict[str, Any]], user_id: str
 ) -> None:
@@ -868,27 +996,10 @@ def _log_copy_learning(
         _, _, sheets = main.get_google_services()
         source_title = _state_vid_title(state)
         brand_id = str(state.get("show_id") or "")
-        values = []
-        for draft in drafts:
-            edited = bool(draft.get("user_edited"))
-            values.append([
-                now(),
-                request_id,
-                str(draft.get("asset_id") or ""),
-                brand_id,
-                str(draft.get("asset_type") or ""),
-                source_title,
-                str(draft.get("transcript") or ""),
-                str(draft.get("ai_social_caption") or draft.get("social_caption") or ""),
-                str(draft.get("social_caption") or ""),
-                str(draft.get("ai_video_title") or draft.get("video_title") or ""),
-                str(draft.get("video_title") or ""),
-                str(draft.get("ai_video_description") or draft.get("video_description") or ""),
-                str(draft.get("video_description") or ""),
-                str(draft.get("hashtags") or ""),
-                "EDITED" if edited else "ACCEPTED",
-                user_id,
-            ])
+        values = [
+            _copy_learning_row_values(request_id, state, draft, user_id)
+            for draft in drafts
+        ]
         if values:
             sheets.spreadsheets().values().append(
                 spreadsheetId=RIPPED_LOG_SHEET_ID,
@@ -1451,6 +1562,15 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
             {**asset, **reviewed_copy.get(str(asset.get("asset_id") or ""), {})}
             for asset in assets
         ]
+        checkpoint_copy = _caption_learning_checkpoint_map(request_id)
+        if checkpoint_copy:
+            assets = [
+                {
+                    **asset,
+                    **checkpoint_copy.get(str(asset.get("asset_id") or ""), {}),
+                }
+                for asset in assets
+            ]
     else:
         # Compatibility fallback for jobs created before the copy-review release.
         assets = _generate_schedule_copy(
@@ -3963,14 +4083,102 @@ def _accept_update(
                 request_id = ""
                 prompt_message_id = None
 
-        # Commit first, then render the authoritative saved draft back into the
-        # same persistent review card.
+        # The edited draft is not considered complete until it is also
+        # checkpointed to the durable sheet that later feeds Schedule Master.
         if request_id:
+            checkpoint_error = ""
+            for checkpoint_attempt in range(1, 4):
+                try:
+                    _checkpoint_copy_edit(
+                        request_id,
+                        edit_state,
+                        drafts[index],
+                        user_id,
+                    )
+                    checkpoint_error = ""
+                    break
+                except Exception as exc:
+                    checkpoint_error = str(exc)
+                    logger.exception(
+                        "Copy checkpoint failed request_id=%s index=%s attempt=%s",
+                        request_id,
+                        index,
+                        checkpoint_attempt,
+                    )
+                    if checkpoint_attempt < 3:
+                        threading.Event().wait(checkpoint_attempt)
+
+            if checkpoint_error:
+                # Keep the exact edit route open so the user does not lose place
+                # and can safely retry the same caption after Sheets recovers.
+                with _LOCK, _telegram_db() as db:
+                    latest = db.execute(
+                        "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                        (request_id,),
+                    ).fetchone()
+                    if latest:
+                        latest_state = json.loads(latest["state_json"])
+                        latest_state["awaiting_copy_input"] = waiting
+                        latest_state["copy_checkpoint_error"] = checkpoint_error[:1000]
+                        latest_state["copy_review_index"] = index
+                        db.execute(
+                            "UPDATE telegram_requests SET state_json=?, updated_at=? "
+                            "WHERE request_id=?",
+                            (json.dumps(latest_state), now(), request_id),
+                        )
+                failure_text = (
+                    f"⚠️ I received your {field}, but the durable caption sheet "
+                    "did not confirm the save yet. You are still on this same caption; "
+                    "reply again once the sheet is available."
+                )
+                try:
+                    telegram(
+                        "sendMessage",
+                        {
+                            "chat_id": chat_id,
+                            "text": failure_text,
+                            "reply_to_message_id": (
+                                int(incoming_message_id)
+                                if incoming_message_id.isdigit()
+                                else None
+                            ),
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not report copy checkpoint failure request_id=%s",
+                        request_id,
+                    )
+                return {
+                    "status": "copy_checkpoint_failed",
+                    "request_id": request_id,
+                    "field": field,
+                    "asset_index": index,
+                }
+
+            with _LOCK, _telegram_db() as db:
+                latest = db.execute(
+                    "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                    (request_id,),
+                ).fetchone()
+                if latest:
+                    latest_state = json.loads(latest["state_json"])
+                    latest_state.pop("copy_checkpoint_error", None)
+                    latest_state["copy_checkpointed_at"] = now()
+                    latest_state["copy_checkpoint_asset_id"] = str(
+                        drafts[index].get("asset_id") or ""
+                    )
+                    db.execute(
+                        "UPDATE telegram_requests SET state_json=?, updated_at=? "
+                        "WHERE request_id=?",
+                        (json.dumps(latest_state), now(), request_id),
+                    )
+
             _refresh_copy_review(chat_id, request_id, index=index)
             confirmation_text = (
-                f"✅ {field.title()} saved as the final reviewed copy. "
-                "The caption review card now shows the exact text that will be sent "
-                "to Schedule Master."
+                f"✅ {field.title()} saved and synced. "
+                "The caption review card now shows the exact final text, and the "
+                "durable copy sheet is ready for Schedule Master."
             )
             confirmation_done = False
             if prompt_message_id:
@@ -4014,7 +4222,7 @@ def _accept_update(
                 "request_id": request_id,
                 "field": field,
                 "asset_index": index,
-                "confirmation": "saved",
+                "confirmation": "saved_and_checkpointed",
             }
 
 
