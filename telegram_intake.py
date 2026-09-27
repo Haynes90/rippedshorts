@@ -859,6 +859,134 @@ def _regenerate_copy_draft(request_id: str, index: int, chat_id: str) -> None:
         send(chat_id, f"❌ I couldn't regenerate draft {index + 1}. Your previous draft is still saved.")
 
 
+def _copy_learning_row_values(
+    request_id: str,
+    state: dict[str, Any],
+    draft: dict[str, Any],
+    user_id: str,
+) -> list[Any]:
+    """Build the durable Caption Learning row for one reviewed copy asset."""
+    edited = bool(draft.get("user_edited"))
+    return [
+        now(),
+        request_id,
+        str(draft.get("asset_id") or ""),
+        str(state.get("show_id") or ""),
+        str(draft.get("asset_type") or ""),
+        _state_vid_title(state),
+        str(draft.get("transcript") or ""),
+        str(draft.get("ai_social_caption") or draft.get("social_caption") or ""),
+        str(draft.get("social_caption") or ""),
+        str(draft.get("ai_video_title") or draft.get("video_title") or ""),
+        str(draft.get("video_title") or ""),
+        str(draft.get("ai_video_description") or draft.get("video_description") or ""),
+        str(draft.get("video_description") or ""),
+        str(draft.get("hashtags") or ""),
+        "EDITED" if edited else "ACCEPTED",
+        user_id,
+    ]
+
+
+def _checkpoint_copy_edit(
+    request_id: str,
+    state: dict[str, Any],
+    draft: dict[str, Any],
+    user_id: str,
+) -> None:
+    """Upsert one copy edit immediately so Telegram review survives restarts."""
+    import main
+
+    _, _, sheets = main.get_google_services()
+    asset_id = str(draft.get("asset_id") or "").strip()
+    if not asset_id:
+        raise RuntimeError("Edited copy draft is missing asset_id")
+
+    result = sheets.spreadsheets().values().get(
+        spreadsheetId=RIPPED_LOG_SHEET_ID,
+        range="'Caption Learning'!A1:P5000",
+    ).execute()
+    values = result.get("values", [])
+    target_row = None
+    if values:
+        header = [
+            str(value or "").strip().lower().replace(" ", "_")
+            for value in values[0]
+        ]
+        request_col = header.index("request_id") if "request_id" in header else 1
+        asset_col = header.index("asset_id") if "asset_id" in header else 2
+        for row_number, row in enumerate(values[1:], start=2):
+            request_value = str(
+                row[request_col] if request_col < len(row) else ""
+            ).strip()
+            asset_value = str(
+                row[asset_col] if asset_col < len(row) else ""
+            ).strip()
+            if request_value == request_id and asset_value == asset_id:
+                target_row = row_number
+
+    row_values = _copy_learning_row_values(
+        request_id,
+        state,
+        draft,
+        user_id,
+    )
+    if target_row:
+        sheets.spreadsheets().values().update(
+            spreadsheetId=RIPPED_LOG_SHEET_ID,
+            range=f"'Caption Learning'!A{target_row}:P{target_row}",
+            valueInputOption="RAW",
+            body={"values": [row_values]},
+        ).execute()
+    else:
+        sheets.spreadsheets().values().append(
+            spreadsheetId=RIPPED_LOG_SHEET_ID,
+            range="'Caption Learning'!A:P",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row_values]},
+        ).execute()
+
+    logger.info(
+        "COPY_EDIT_CHECKPOINTED request_id=%s asset_id=%s",
+        request_id,
+        asset_id,
+    )
+
+
+def _caption_learning_checkpoint_map(request_id: str) -> dict[str, dict[str, str]]:
+    """Read final reviewed copy from the durable sheet for Schedule Master handoff."""
+    try:
+        rows = get_rows(
+            RIPPED_LOG_SHEET_ID,
+            "Caption Learning",
+        )
+    except Exception:
+        logger.exception(
+            "Could not read Caption Learning checkpoints request_id=%s",
+            request_id,
+        )
+        return {}
+
+    result: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if str(row.get("request_id") or "").strip() != request_id:
+            continue
+        asset_id = str(row.get("asset_id") or "").strip()
+        if not asset_id:
+            continue
+        decision = str(row.get("decision") or "").strip().upper()
+        if decision not in {"EDITED", "ACCEPTED"}:
+            continue
+        result[asset_id] = {
+            "social_caption": str(row.get("final_caption") or ""),
+            "video_title": str(row.get("final_title") or ""),
+            "video_description": str(row.get("final_description") or ""),
+            "hashtags": str(row.get("hashtags") or ""),
+            "copy_source": "CAPTION_LEARNING_CHECKPOINT",
+        }
+    return result
+
+
 def _log_copy_learning(
     request_id: str, state: dict[str, Any], drafts: list[dict[str, Any]], user_id: str
 ) -> None:
@@ -868,27 +996,10 @@ def _log_copy_learning(
         _, _, sheets = main.get_google_services()
         source_title = _state_vid_title(state)
         brand_id = str(state.get("show_id") or "")
-        values = []
-        for draft in drafts:
-            edited = bool(draft.get("user_edited"))
-            values.append([
-                now(),
-                request_id,
-                str(draft.get("asset_id") or ""),
-                brand_id,
-                str(draft.get("asset_type") or ""),
-                source_title,
-                str(draft.get("transcript") or ""),
-                str(draft.get("ai_social_caption") or draft.get("social_caption") or ""),
-                str(draft.get("social_caption") or ""),
-                str(draft.get("ai_video_title") or draft.get("video_title") or ""),
-                str(draft.get("video_title") or ""),
-                str(draft.get("ai_video_description") or draft.get("video_description") or ""),
-                str(draft.get("video_description") or ""),
-                str(draft.get("hashtags") or ""),
-                "EDITED" if edited else "ACCEPTED",
-                user_id,
-            ])
+        values = [
+            _copy_learning_row_values(request_id, state, draft, user_id)
+            for draft in drafts
+        ]
         if values:
             sheets.spreadsheets().values().append(
                 spreadsheetId=RIPPED_LOG_SHEET_ID,
@@ -1451,6 +1562,15 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
             {**asset, **reviewed_copy.get(str(asset.get("asset_id") or ""), {})}
             for asset in assets
         ]
+        checkpoint_copy = _caption_learning_checkpoint_map(request_id)
+        if checkpoint_copy:
+            assets = [
+                {
+                    **asset,
+                    **checkpoint_copy.get(str(asset.get("asset_id") or ""), {}),
+                }
+                for asset in assets
+            ]
     else:
         # Compatibility fallback for jobs created before the copy-review release.
         assets = _generate_schedule_copy(
