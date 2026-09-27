@@ -2459,11 +2459,7 @@ def _short_review_page_payload(
         )
         buttons.append([
             {
-                "text": (
-                    f"↩️ {short_number}"
-                    if review_status in {"queued", "rendering", "rendered"}
-                    else f"✅ {short_number}"
-                ),
+                "text": f"✅ {short_number}",
                 "callback_data": f"rs:approve:{request_id}:{zero_index}",
             },
             {
@@ -2572,16 +2568,22 @@ def _short_control_payload(request_id: str, row, state: dict[str, Any]):
         "Rendering continues in the background while you move through review."
     )
     if row["mode"] == "both":
-        buttons = [
-            [{
-                "text": "▶️ Continue to 16:9",
-                "callback_data": f"rs:shorts_confirm:{request_id}",
-            }],
-            [{
+        if state.get("shorts_confirmed_at"):
+            buttons = [[{
                 "text": "📅 Finish & Schedule",
                 "callback_data": f"rs:schedule_now:{request_id}",
-            }],
-        ]
+            }]]
+        else:
+            buttons = [
+                [{
+                    "text": "▶️ Continue to 16:9",
+                    "callback_data": f"rs:shorts_confirm:{request_id}",
+                }],
+                [{
+                    "text": "📅 Finish & Schedule",
+                    "callback_data": f"rs:schedule_now:{request_id}",
+                }],
+            ]
     else:
         buttons = [[{
             "text": "📅 Finish & Schedule",
