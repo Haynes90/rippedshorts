@@ -248,6 +248,12 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("next_index = index", SOURCE)
         self.assertIn("shows exactly what will be sent to Schedule Master", SOURCE)
 
+    def test_copy_reply_uses_durable_prompt_session_before_group_filter(self):
+        self.assertIn("CREATE TABLE IF NOT EXISTS telegram_copy_inputs", SOURCE)
+        self.assertIn("WHERE prompt_message_id=? AND chat_id=? AND user_id=?", SOURCE)
+        self.assertIn("INSERT OR REPLACE INTO telegram_copy_inputs", SOURCE)
+        self.assertIn("COPY_REPLY_APPLIED", SOURCE)
+
     def test_copy_reply_accepts_review_card_or_single_pending_edit(self):
         self.assertIn("candidate_matches = []", SOURCE)
         self.assertIn("reply_to_message_id in {prompt_id, review_id}", SOURCE)
