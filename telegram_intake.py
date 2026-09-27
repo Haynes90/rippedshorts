@@ -4083,14 +4083,102 @@ def _accept_update(
                 request_id = ""
                 prompt_message_id = None
 
-        # Commit first, then render the authoritative saved draft back into the
-        # same persistent review card.
+        # The edited draft is not considered complete until it is also
+        # checkpointed to the durable sheet that later feeds Schedule Master.
         if request_id:
+            checkpoint_error = ""
+            for checkpoint_attempt in range(1, 4):
+                try:
+                    _checkpoint_copy_edit(
+                        request_id,
+                        edit_state,
+                        drafts[index],
+                        user_id,
+                    )
+                    checkpoint_error = ""
+                    break
+                except Exception as exc:
+                    checkpoint_error = str(exc)
+                    logger.exception(
+                        "Copy checkpoint failed request_id=%s index=%s attempt=%s",
+                        request_id,
+                        index,
+                        checkpoint_attempt,
+                    )
+                    if checkpoint_attempt < 3:
+                        threading.Event().wait(checkpoint_attempt)
+
+            if checkpoint_error:
+                # Keep the exact edit route open so the user does not lose place
+                # and can safely retry the same caption after Sheets recovers.
+                with _LOCK, _telegram_db() as db:
+                    latest = db.execute(
+                        "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                        (request_id,),
+                    ).fetchone()
+                    if latest:
+                        latest_state = json.loads(latest["state_json"])
+                        latest_state["awaiting_copy_input"] = waiting
+                        latest_state["copy_checkpoint_error"] = checkpoint_error[:1000]
+                        latest_state["copy_review_index"] = index
+                        db.execute(
+                            "UPDATE telegram_requests SET state_json=?, updated_at=? "
+                            "WHERE request_id=?",
+                            (json.dumps(latest_state), now(), request_id),
+                        )
+                failure_text = (
+                    f"⚠️ I received your {field}, but the durable caption sheet "
+                    "did not confirm the save yet. You are still on this same caption; "
+                    "reply again once the sheet is available."
+                )
+                try:
+                    telegram(
+                        "sendMessage",
+                        {
+                            "chat_id": chat_id,
+                            "text": failure_text,
+                            "reply_to_message_id": (
+                                int(incoming_message_id)
+                                if incoming_message_id.isdigit()
+                                else None
+                            ),
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not report copy checkpoint failure request_id=%s",
+                        request_id,
+                    )
+                return {
+                    "status": "copy_checkpoint_failed",
+                    "request_id": request_id,
+                    "field": field,
+                    "asset_index": index,
+                }
+
+            with _LOCK, _telegram_db() as db:
+                latest = db.execute(
+                    "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                    (request_id,),
+                ).fetchone()
+                if latest:
+                    latest_state = json.loads(latest["state_json"])
+                    latest_state.pop("copy_checkpoint_error", None)
+                    latest_state["copy_checkpointed_at"] = now()
+                    latest_state["copy_checkpoint_asset_id"] = str(
+                        drafts[index].get("asset_id") or ""
+                    )
+                    db.execute(
+                        "UPDATE telegram_requests SET state_json=?, updated_at=? "
+                        "WHERE request_id=?",
+                        (json.dumps(latest_state), now(), request_id),
+                    )
+
             _refresh_copy_review(chat_id, request_id, index=index)
             confirmation_text = (
-                f"✅ {field.title()} saved as the final reviewed copy. "
-                "The caption review card now shows the exact text that will be sent "
-                "to Schedule Master."
+                f"✅ {field.title()} saved and synced. "
+                "The caption review card now shows the exact final text, and the "
+                "durable copy sheet is ready for Schedule Master."
             )
             confirmation_done = False
             if prompt_message_id:
@@ -4134,7 +4222,7 @@ def _accept_update(
                 "request_id": request_id,
                 "field": field,
                 "asset_index": index,
-                "confirmation": "saved",
+                "confirmation": "saved_and_checkpointed",
             }
 
 
