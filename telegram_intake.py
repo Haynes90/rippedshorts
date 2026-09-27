@@ -1315,6 +1315,8 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
         "show_id": str(state.get("show_id") or "") or None,
         "source_url": str(parsed.get("source_value") or "") or None,
         "source_title": _state_vid_title(state),
+        # Ripped Shorts only hands off after "Approve Copy & Schedule".
+        "copy_approved": True,
         "assets": assets,
     }
     try:
@@ -1363,6 +1365,13 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
                 f"Schedule Master returned {response.status_code}: {response.text[:1000]}"
             )
         result = response.json()
+        try:
+            _persist_schedule_outbox(payload, "ACCEPTED")
+        except Exception:
+            logger.exception(
+                "Schedule Handoff Outbox ACK update failed request_id=%s",
+                request_id,
+            )
         with _LOCK, _telegram_db() as db:
             row = db.execute(
                 "SELECT state_json FROM telegram_requests WHERE request_id=?",
@@ -1395,6 +1404,13 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
         return True
     except Exception as exc:
         logger.exception("Schedule Master Shorts handoff failed request_id=%s", request_id)
+        try:
+            _persist_schedule_outbox(payload, "RETRY")
+        except Exception:
+            logger.exception(
+                "Schedule Handoff Outbox RETRY update failed request_id=%s",
+                request_id,
+            )
         with _LOCK, _telegram_db() as db:
             row = db.execute(
                 "SELECT state_json FROM telegram_requests WHERE request_id=?",

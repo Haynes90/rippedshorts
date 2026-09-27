@@ -232,6 +232,9 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("SCHEDULE_MASTER_URL", SOURCE)
         self.assertIn('"shorts_status": "accepted"', SOURCE)
         self.assertIn("Schedule Master received", SOURCE)
+        self.assertIn('"copy_approved": True', SOURCE)
+        self.assertIn('_persist_schedule_outbox(payload, "ACCEPTED")', SOURCE)
+        self.assertIn('_persist_schedule_outbox(payload, "RETRY")', SOURCE)
 
     def test_schedule_now_waits_for_both_render_lanes(self):
         self.assertIn("rs:schedule_now:", SOURCE)
