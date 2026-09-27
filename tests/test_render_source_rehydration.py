@@ -22,7 +22,7 @@ def test_recovered_path_is_persisted_back_to_job_state():
 
 
 def test_render_recovery_rejects_silent_local_sources():
-    assert "_has_audio_stream(current)" in SOURCE
+    assert "_has_usable_audio(current)" in SOURCE
     assert "RENDER_SOURCE_LOCAL_REJECT" in SOURCE
-    assert "_has_audio_stream(latest_path)" in SOURCE
+    assert "_has_usable_audio(latest_path)" in SOURCE
     assert "Recovered render source has no audio stream" in SOURCE
