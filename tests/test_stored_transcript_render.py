@@ -103,32 +103,79 @@ class StoredTranscriptRenderTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg tools required')
 class RealVideoRenderTests(unittest.TestCase):
-    def test_actual_renderers_with_and_without_audio(self):
+    def _render_env(self):
+        env = dict(
+            Path=Path,
+            subprocess=subprocess,
+            os=os,
+            re=re,
+            logger=logging.getLogger('render-audio-test'),
+            _build_vertical_filter=lambda *args: ('crop=134:240', False),
+        )
+        env['_audio_max_volume_db'] = load_function(
+            'main.py', '_audio_max_volume_db', env
+        )
+        env['_assert_render_audio'] = load_function(
+            'main.py', '_assert_render_audio', env
+        )
+        return env
+
+    def test_actual_renderers_preserve_audible_audio(self):
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
-            env = dict(Path=Path, math=math, os=os, subprocess=subprocess,
-                       CompletionReviewRequired=RuntimeError)
-            load_function('clip_completion.py', '_run', env)
-            load_function('clip_completion.py', 'media_duration', env)
-            render = load_function('clip_completion.py', 'render_complete_clip', env)
-            render_env = dict(Path=Path, subprocess=subprocess,
-                              _build_vertical_filter=lambda *args: ('crop=134:240', False))
-            for with_audio in (False, True):
-                source = folder / ('sound.mp4' if with_audio else 'silent.mp4')
-                command = ['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i',
-                           'color=c=blue:s=320x240:r=25:d=2']
-                if with_audio:
-                    command += ['-f', 'lavfi', '-i', 'sine=frequency=440:duration=2', '-c:a', 'aac']
-                subprocess.run(command + ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(source)], check=True)
-                for aspect, name in (('9:16', 'create_clip_file'), ('16:9', 'create_topic_segment_file')):
-                    renderer = load_function('main.py', name, render_env)
-                    output = folder / (aspect.replace(':', '-') + source.name)
-                    render(source, {'start': .2, 'end': 1.2, 'transcript': 'Stored sentence.'},
-                           output, renderer, aspect)
-                    probe = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'a:0',
-                                            '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', str(output)],
-                                           check=True, capture_output=True, text=True)
-                    self.assertEqual('audio' in probe.stdout, with_audio)
+            source = folder / 'sound.mp4'
+            subprocess.run(
+                [
+                    'ffmpeg', '-v', 'error', '-y',
+                    '-f', 'lavfi', '-i', 'color=c=blue:s=320x240:r=25:d=2',
+                    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2',
+                    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac',
+                    str(source),
+                ],
+                check=True,
+            )
+            render_env = self._render_env()
+            for aspect, name in (
+                ('9:16', 'create_clip_file'),
+                ('16:9', 'create_topic_segment_file'),
+            ):
+                renderer = load_function('main.py', name, render_env)
+                output = folder / (aspect.replace(':', '-') + '-sound.mp4')
+                renderer(source, .2, 1.0, output)
+                probe = subprocess.run(
+                    [
+                        'ffprobe', '-v', 'error', '-select_streams', 'a:0',
+                        '-show_entries', 'stream=codec_type', '-of', 'csv=p=0',
+                        str(output),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertIn('audio', probe.stdout)
+
+    def test_silent_source_is_rejected_before_upload(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            source = folder / 'silent.mp4'
+            subprocess.run(
+                [
+                    'ffmpeg', '-v', 'error', '-y',
+                    '-f', 'lavfi', '-i', 'color=c=blue:s=320x240:r=25:d=2',
+                    '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                    str(source),
+                ],
+                check=True,
+            )
+            render_env = self._render_env()
+            for aspect, name in (
+                ('9:16', 'create_clip_file'),
+                ('16:9', 'create_topic_segment_file'),
+            ):
+                renderer = load_function('main.py', name, render_env)
+                output = folder / (aspect.replace(':', '-') + '-silent.mp4')
+                with self.assertRaisesRegex(RuntimeError, 'no usable audio stream'):
+                    renderer(source, .2, 1.0, output)
 
 
 if __name__ == '__main__':
