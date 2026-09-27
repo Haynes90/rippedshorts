@@ -736,6 +736,20 @@ def _copy_review_payload(
         })
     if nav:
         buttons.append(nav)
+    try:
+        from caption_review_web import review_url_for_request
+        web_review_url = review_url_for_request(request_id)
+    except Exception:
+        logger.exception(
+            "Could not create temporary mobile copy review link request_id=%s",
+            request_id,
+        )
+        web_review_url = ""
+    if web_review_url:
+        buttons.append([{
+            "text": "🌐 Open Mobile Copy Review",
+            "url": web_review_url,
+        }])
     buttons.append([{
         "text": "✅ Finish & Schedule",
         "callback_data": f"rs:copy_finish:{request_id}",
@@ -4448,11 +4462,27 @@ def _accept_update(
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(latest_state), now(), request_id),
             )
+        try:
+            from caption_review_web import ensure_review_session
+            review_session = ensure_review_session(request_id)
+            review_expiry = str(review_session.get("expires_at") or "")[:10]
+        except Exception:
+            logger.exception(
+                "Could not prepare mobile copy review session request_id=%s",
+                request_id,
+            )
+            review_expiry = ""
         send(
             chat_id,
             f"📅 Video selection closed. Skipped {skipped_shorts} untouched Short(s) "
             f"and {skipped_topics} untouched 16:9 highlight(s). Now review your "
-            "captions, titles, and descriptions.",
+            "captions, titles, and descriptions."
+            + (
+                f"\n\n🌐 A mobile review page is available from the review card "
+                f"and expires {review_expiry}. Your Drive videos and saved copy stay permanent."
+                if review_expiry
+                else ""
+            ),
         )
         _send_copy_review(chat_id, request_id, drafts)
         return {"status": "copy_review_requested", "request_id": request_id}
