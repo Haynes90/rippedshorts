@@ -666,8 +666,9 @@ def _copy_review_payload(
     regenerated = sum(
         int(item.get("regeneration_count") or 0) > 0 for item in drafts
     )
+    edited_label = " • ✏️ EDITED FINAL COPY" if draft.get("user_edited") else ""
     header = (
-        f"✍️ COPY REVIEW • {index + 1}/{len(drafts)}\n"
+        f"✍️ COPY REVIEW • {index + 1}/{len(drafts)}{edited_label}\n"
         f"Approved/edited: {approved}/{len(drafts)} • "
         f"Regenerated: {regenerated}"
     )
@@ -3910,9 +3911,9 @@ def _accept_update(
                 drafts[index]["edited_fields"] = sorted(
                     set(drafts[index].get("edited_fields") or []) | {field}
                 )
-                next_index = _next_pending_copy_index(drafts, index)
+                next_index = index
                 edit_state["copy_drafts"] = drafts
-                edit_state["copy_review_index"] = next_index
+                edit_state["copy_review_index"] = index
                 request_id = edit_row["request_id"]
                 prompt_message_id = waiting.get("prompt_message_id")
                 db.execute(
@@ -3936,12 +3937,9 @@ def _accept_update(
                             "chat_id": chat_id,
                             "message_id": prompt_message_id,
                             "text": (
-                                f"✅ {field.title()} saved. "
-                                + (
-                                    f"Moved to copy {next_index + 1}/{len(drafts)}."
-                                    if next_index != index
-                                    else "Copy review is ready for your next action."
-                                )
+                                f"✅ {field.title()} saved as the final reviewed copy. "
+                                "The review card above now shows exactly what will be sent "
+                                "to Schedule Master. Use Next when you're ready."
                             ),
                         },
                     )
