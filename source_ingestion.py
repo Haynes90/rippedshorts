@@ -154,7 +154,7 @@ def _sermon_boundary(payload: Any) -> dict[str, float] | None:
 
 
 def _has_audio_stream(path: Path) -> bool:
-    """Reject cached/downloaded video-only files before transcription or rendering."""
+    """Return whether media contains at least one audio stream."""
     try:
         result = subprocess.run(
             [os.getenv("FFPROBE_BINARY", "ffprobe"), "-v", "error", "-select_streams", "a:0",
@@ -163,6 +163,33 @@ def _has_audio_stream(path: Path) -> bool:
         )
         return result.returncode == 0 and "audio" in result.stdout.lower()
     except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _has_usable_audio(path: Path) -> bool:
+    """Require an audio stream with actual signal, not a silent audio track."""
+    if not _has_audio_stream(path):
+        return False
+    try:
+        result = subprocess.run(
+            [
+                os.getenv("FFMPEG_BINARY", "ffmpeg"),
+                "-hide_banner", "-nostats", "-v", "info",
+                "-i", str(path),
+                "-vn", "-af", "volumedetect",
+                "-f", "null", "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        output = (result.stderr or "") + "\n" + (result.stdout or "")
+        match = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", output)
+        if not match:
+            return False
+        minimum_db = float(os.getenv("SOURCE_AUDIO_MIN_MAX_DB", "-55"))
+        return float(match.group(1)) >= minimum_db
+    except (OSError, subprocess.SubprocessError, ValueError):
         return False
 
 def reuse_from_drive(video_id: str, workdir: Path) -> dict[str, Any]:
@@ -215,7 +242,7 @@ def reuse_from_drive(video_id: str, workdir: Path) -> dict[str, Any]:
             video_asset["id"],
             workdir / f"{video_id}-source{suffix}",
         )
-        if _has_audio_stream(candidate):
+        if _has_usable_audio(candidate):
             video_path = candidate
         else:
             print(
@@ -383,7 +410,7 @@ def _run_rapidapi_profile(
             target.write_bytes(response.content)
             if target.stat().st_size <= 0:
                 raise RuntimeError("RapidAPI returned an empty video response")
-            if not _has_audio_stream(target):
+            if not _has_usable_audio(target):
                 raise RuntimeError(
                     "RapidAPI returned a source without an audio stream"
                 )
@@ -613,7 +640,7 @@ def _run_youtube_profile(
                 for item in matches
                 if item.is_file()
                 and item.stat().st_size > 0
-                and _has_audio_stream(item)
+                and _has_usable_audio(item)
             ),
             None,
         )
