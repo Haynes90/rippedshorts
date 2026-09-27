@@ -799,6 +799,24 @@ def _refresh_copy_review(
                 )
 
 
+def _resume_saved_copy_review(row) -> bool:
+    """Restore human-owned copy work without restarting source processing."""
+    state = json.loads(row["state_json"])
+    if (
+        str(row["status"] or "").lower() in _TERMINAL_JOB_STAGES
+        or str(state.get("stage") or "").lower() in _TERMINAL_JOB_STAGES
+        or state.get("superseded_by_request_id")
+        or state.get("schedule_requested_at")
+        or state.get("copy_review_completed_at")
+        or not state.get("copy_drafts")
+    ):
+        return False
+    # Refresh reads the durable cursor and edits in place (or replaces a lost
+    # Telegram card). Never regenerate copy or clear awaiting_copy_input here.
+    _refresh_copy_review(str(row["chat_id"]), str(row["request_id"]))
+    return True
+
+
 def _send_copy_review(
     chat_id: str, request_id: str, drafts: list[dict[str, Any]]
 ) -> None:
@@ -3185,6 +3203,9 @@ def _process(request_id: str) -> None:
         )
         return
 
+    if _resume_saved_copy_review(row):
+        return
+
     parsed = state.get("parsed") or {}
     video_id_for_guard = str(parsed.get("video_id") or "").strip()
     if video_id_for_guard:
@@ -4064,6 +4085,7 @@ def _accept_update(
             if state.get("schedule_requested_at"):
                 return {"status": "already_scheduling", "request_id": request_id}
             if state.get("copy_review_requested_at"):
+                _resume_saved_copy_review(row)
                 return {"status": "copy_review_pending", "request_id": request_id}
 
             clips = (state.get("result") or {}).get("segments", [])
@@ -4489,6 +4511,20 @@ def _accept_update(
         r"/resume(?:@rippedshortsbot)?(?:\s+latest)?", text, re.I
     )
     if resume_match:
+        # The sheet ledger may lag interactive edits or point at a render
+        # recovery job. Saved local copy is authoritative for caption resume.
+        with _LOCK, _telegram_db() as db:
+            copy_rows = db.execute(
+                "SELECT * FROM telegram_requests WHERE chat_id=? AND user_id=? "
+                "ORDER BY updated_at DESC",
+                (chat_id, user_id),
+            ).fetchall()
+        for copy_row in copy_rows:
+            if _resume_saved_copy_review(copy_row):
+                return {
+                    "status": "copy_review_resumed",
+                    "request_id": copy_row["request_id"],
+                }
         try:
             durable = latest_incomplete(
                 RIPPED_LOG_SHEET_ID,
@@ -5860,4 +5896,5 @@ def configure_ripped_telegram_webhook() -> None:
         )
         thread.start()
         _RIPPED_WEBHOOK_WATCHDOG_STARTED = True
+
 
