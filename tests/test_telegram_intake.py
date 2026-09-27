@@ -243,6 +243,11 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("rs:shorts_page:", SOURCE)
         self.assertIn("Rendering continues in the background", SOURCE)
 
+    def test_edited_caption_stays_visible_as_final_reviewed_copy(self):
+        self.assertIn("EDITED FINAL COPY", SOURCE)
+        self.assertIn("next_index = index", SOURCE)
+        self.assertIn("shows exactly what will be sent to Schedule Master", SOURCE)
+
     def test_copy_reply_is_bound_to_exact_prompt_and_preserves_route(self):
         self.assertIn('"prompt_message_id": prompt_message_id', SOURCE)
         self.assertIn("reply_to_message_id", SOURCE)
