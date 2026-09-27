@@ -2816,72 +2816,138 @@ def _build_contiguous_topic_segments(
     return selected
 
 
+def _topic_review_payload(
+    request_id: str, state: dict[str, Any], index: int
+) -> tuple[str, dict[str, Any]]:
+    topics = (state.get("topic_result") or {}).get("segments", [])
+    reviews = dict(state.get("topic_reviews") or {})
+    if not topics:
+        return (
+            "No 16:9 highlights are available.",
+            {"inline_keyboard": [[{
+                "text": "📅 Finish & Schedule",
+                "callback_data": f"rs:schedule_now:{request_id}",
+            }]]},
+        )
+    index = max(0, min(len(topics) - 1, int(index or 0)))
+    segment = topics[index]
+    status = str((reviews.get(str(index)) or {}).get("status") or "")
+    marker = (
+        "✅"
+        if status in {"queued", "rendering", "rendered"}
+        else ("❌" if status in {"reject", "rejected"} else "▫️")
+    )
+    approved = sum(
+        str(item.get("status") or "") in {"queued", "rendering", "rendered"}
+        for item in reviews.values()
+    )
+    rendered = sum(
+        str(item.get("status") or "") == "rendered" for item in reviews.values()
+    )
+    text = (
+        f"📺 16:9 REVIEW • {index + 1}/{len(topics)}\n"
+        f"Approved: {approved} • Rendered: {rendered}\n\n"
+        f"{marker} Segment {index + 1}: {segment.get('title', '')}\n\n"
+        f"Time: {_timecode(float(segment['start']))}–"
+        f"{_timecode(float(segment['end']))}\n"
+        f"Duration: {round(float(segment['duration']) / 60, 1)} minutes"
+        + (
+            f"\n\nSection summary:\n{segment.get('summary', '')}"
+            if segment.get("summary")
+            else ""
+        )
+    )
+    buttons = [[
+        {
+            "text": "✅ Approve 16:9",
+            "callback_data": f"rs:topic_approve:{request_id}:{index}",
+        },
+        {
+            "text": "❌ Skip",
+            "callback_data": f"rs:topic_reject:{request_id}:{index}",
+        },
+    ]]
+    nav = []
+    if index > 0:
+        nav.append({
+            "text": "◀️ Previous",
+            "callback_data": f"rs:topic_page:{request_id}:{index - 1}",
+        })
+    if index < len(topics) - 1:
+        nav.append({
+            "text": "Next ▶️",
+            "callback_data": f"rs:topic_page:{request_id}:{index + 1}",
+        })
+    if nav:
+        buttons.append(nav)
+    buttons.append([{
+        "text": "📅 Finish & Schedule",
+        "callback_data": f"rs:schedule_now:{request_id}",
+    }])
+    return text[:4000], {"inline_keyboard": buttons}
+
+
+def _refresh_topic_review(
+    chat_id: str, request_id: str, *, index: int | None = None
+) -> None:
+    with _LOCK, _telegram_db() as db:
+        row = db.execute(
+            "SELECT state_json FROM telegram_requests WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+    if not row:
+        return
+    state = json.loads(row["state_json"])
+    if index is None:
+        index = int(state.get("topic_review_index") or 0)
+    text, markup = _topic_review_payload(request_id, state, index)
+    message_id = state.get("topic_review_message_id")
+    if message_id:
+        try:
+            telegram("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "disable_web_page_preview": True,
+                "reply_markup": markup,
+            })
+        except Exception as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.warning(
+                    "16:9 review edit failed; replacing request_id=%s", request_id
+                )
+                message_id = None
+    if not message_id:
+        result = telegram("sendMessage", {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+            "reply_markup": markup,
+        })
+        message_id = (result.get("result") or {}).get("message_id")
+    if message_id:
+        with _LOCK, _telegram_db() as db:
+            latest = db.execute(
+                "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if latest:
+                latest_state = json.loads(latest["state_json"])
+                latest_state["topic_review_message_id"] = message_id
+                latest_state["topic_review_index"] = index
+                db.execute(
+                    "UPDATE telegram_requests SET state_json=?, updated_at=? "
+                    "WHERE request_id=?",
+                    (json.dumps(latest_state), now(), request_id),
+                )
+
+
 def _send_topic_candidates(
     chat_id: str, request_id: str, topic_result: dict
 ) -> None:
-    topics = topic_result.get("segments", [])
-    send(
-        chat_id,
-        f"📺 16:9 section analysis complete\nJob ID: {request_id}\n"
-        f"Sections covering the eligible video: {len(topics)}\n\n"
-        "These sections do not overlap. Approve the horizontal videos you want rendered.",
-    )
-    for index, segment in enumerate(topics):
-        text = (
-            f"16:9 Segment {index + 1}: {segment.get('title', '')}\n\n"
-            f"Time: {_timecode(float(segment['start']))}–"
-            f"{_timecode(float(segment['end']))}\n"
-            f"Duration: {round(float(segment['duration']) / 60, 1)} minutes"
-            + (
-                f"\n\nSection summary:\n{segment.get('summary', '')}"
-                if segment.get("summary")
-                else ""
-            )
-        )
-        telegram(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": True,
-                "reply_markup": {
-                    "inline_keyboard": [
-                        [
-                            {
-                                "text": "✅ Approve 16:9",
-                                "callback_data": f"rs:topic_approve:{request_id}:{index}",
-                            },
-                            {
-                                "text": "❌ Skip",
-                                "callback_data": f"rs:topic_reject:{request_id}:{index}",
-                            },
-                        ],
-                        [
-                            {
-                                "text": "✏️ Change / Add / Options",
-                                "callback_data": f"rs:options:{request_id}",
-                            }
-                        ],
-                    ]
-                },
-            },
-        )
-    telegram(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": (
-                "When you have approved every 16:9 highlight you want, tap "
-                "Schedule Now. Untouched highlights will be skipped."
-            ),
-            "reply_markup": {
-                "inline_keyboard": [[{
-                    "text": "📅 No More 16:9s — Schedule Now",
-                    "callback_data": f"rs:schedule_now:{request_id}",
-                }]]
-            },
-        },
-    )
+    """Present 16:9 review in one evolving Telegram message."""
+    _send_short_confirmation(chat_id, request_id)
+    _refresh_topic_review(chat_id, request_id, index=0)
 
 
 def _process_topics(
@@ -4109,6 +4175,19 @@ def _accept_update(
             ),
         }
 
+    topic_page = re.fullmatch(
+        r"rs:topic_page:([A-Za-z0-9-]+):(\d+)", callback_data
+    )
+    if topic_page:
+        request_id, index_text = topic_page.groups()
+        _refresh_topic_review(chat_id, request_id, index=int(index_text))
+        _send_short_confirmation(chat_id, request_id)
+        return {
+            "status": "topic_review_page",
+            "request_id": request_id,
+            "topic_index": int(index_text),
+        }
+
     topic_action = re.fullmatch(
         r"rs:topic_(approve|reject):([A-Za-z0-9-]+):(\d+)", callback_data
     )
@@ -4145,13 +4224,11 @@ def _accept_update(
             )
         if verb == "approve":
             RENDER_EXECUTOR.submit(_render_topic_approved, request_id, index, chat_id)
-            send(
-                chat_id,
-                f"16:9 Segment {index + 1} approved and queued. "
-                f"Up to {RIPPED_SHORTS_RENDER_WORKERS} total videos render at once.",
-            )
+            _refresh_topic_review(chat_id, request_id, index=index)
+            _send_short_confirmation(chat_id, request_id)
         else:
-            send(chat_id, f"16:9 Segment {index + 1} skipped.")
+            _refresh_topic_review(chat_id, request_id, index=index)
+            _send_short_confirmation(chat_id, request_id)
         return {
             "status": f"topic_{verb}",
             "request_id": request_id,
@@ -4483,7 +4560,8 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(state), now(), request_id),
             )
-        send(chat_id, f"🎬 16:9 Segment {index + 1} is now rendering.")
+        _refresh_topic_review(chat_id, request_id, index=index)
+        _send_short_confirmation(chat_id, request_id)
         segment = state["topic_result"]["segments"][index]
         video = _ensure_render_source(request_id, state)
         video_id = state["parsed"].get("video_id", request_id)
@@ -4516,11 +4594,8 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(latest_state), now(), request_id),
             )
-        send(
-            chat_id,
-            f"✅ 16:9 Segment {index + 1} rendered and uploaded to the Vid Title folder ({vid_title}):\n"
-            f"{rendered.get('segment_url', '')}",
-        )
+        _refresh_topic_review(chat_id, request_id, index=index)
+        _send_short_confirmation(chat_id, request_id)
         _notify_render_queue_complete(request_id, chat_id)
     except Exception as exc:
         logger.exception(
