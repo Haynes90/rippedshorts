@@ -248,6 +248,17 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("next_index = index", SOURCE)
         self.assertIn("shows exactly what will be sent to Schedule Master", SOURCE)
 
+    def test_copy_reply_accepts_review_card_or_single_pending_edit(self):
+        self.assertIn("candidate_matches = []", SOURCE)
+        self.assertIn("reply_to_message_id in {prompt_id, review_id}", SOURCE)
+        self.assertIn("len(candidate_matches) == 1", SOURCE)
+
+    def test_copy_reply_always_confirms_saved_edit(self):
+        self.assertIn("confirmation_done = False", SOURCE)
+        self.assertIn("reply_to_message_id", SOURCE)
+        self.assertIn('"confirmation": "saved"', SOURCE)
+        self.assertIn("last_copy_edit_saved_at", SOURCE)
+
     def test_copy_reply_is_bound_to_exact_prompt_and_preserves_route(self):
         self.assertIn('"prompt_message_id": prompt_message_id', SOURCE)
         self.assertIn("reply_to_message_id", SOURCE)

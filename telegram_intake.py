@@ -3876,12 +3876,14 @@ def _accept_update(
     if not trusted_source and not _authorized(chat_id, user_id):
         return {"status": "unauthorized"}
     if text and not callback_data:
+        incoming_message_id = str(message.get("message_id") or "")
         reply_to_message_id = str(
             ((message.get("reply_to_message") or {}).get("message_id") or "")
         )
         edit_row = None
         edit_state = None
         waiting = None
+        candidate_matches = []
         with _LOCK, _telegram_db() as db:
             rows = db.execute(
                 "SELECT * FROM telegram_requests WHERE chat_id=? AND user_id=? "
@@ -3889,30 +3891,43 @@ def _accept_update(
                 (chat_id, user_id),
             ).fetchall()
 
-            # Prefer the exact force-reply prompt so simultaneous jobs/edits cannot
-            # steal one another's replies. Fall back for prompts created before this fix.
-            fallback = None
             for candidate_row in rows:
                 candidate_state = json.loads(candidate_row["state_json"])
                 candidate_waiting = candidate_state.get("awaiting_copy_input") or {}
                 if str(candidate_waiting.get("user_id") or "") != user_id:
                     continue
+                candidate_matches.append(
+                    (candidate_row, candidate_state, candidate_waiting)
+                )
+
+            # Best match: exact force-reply prompt, then the persistent copy-review
+            # card itself. If exactly one edit is waiting for this user/chat, accept
+            # it even when Telegram reports a different reply target.
+            for candidate_row, candidate_state, candidate_waiting in candidate_matches:
                 prompt_id = str(candidate_waiting.get("prompt_message_id") or "")
-                if reply_to_message_id and prompt_id == reply_to_message_id:
+                review_id = str(candidate_state.get("copy_review_message_id") or "")
+                if reply_to_message_id and reply_to_message_id in {prompt_id, review_id}:
                     edit_row, edit_state, waiting = (
                         candidate_row,
                         candidate_state,
                         candidate_waiting,
                     )
                     break
-                if fallback is None and not prompt_id:
-                    fallback = (
-                        candidate_row,
-                        candidate_state,
-                        candidate_waiting,
-                    )
-            if edit_row is None and fallback is not None:
-                edit_row, edit_state, waiting = fallback
+
+            if edit_row is None and len(candidate_matches) == 1:
+                edit_row, edit_state, waiting = candidate_matches[0]
+
+            # Backward compatibility for edit prompts created before prompt IDs
+            # were persisted.
+            if edit_row is None:
+                for candidate_row, candidate_state, candidate_waiting in candidate_matches:
+                    if not str(candidate_waiting.get("prompt_message_id") or ""):
+                        edit_row, edit_state, waiting = (
+                            candidate_row,
+                            candidate_state,
+                            candidate_waiting,
+                        )
+                        break
 
             if edit_row and edit_state and waiting:
                 edit_state.pop("awaiting_copy_input", None)
@@ -3932,9 +3947,11 @@ def _accept_update(
                 drafts[index]["edited_fields"] = sorted(
                     set(drafts[index].get("edited_fields") or []) | {field}
                 )
-                next_index = index
                 edit_state["copy_drafts"] = drafts
                 edit_state["copy_review_index"] = index
+                edit_state["last_copy_edit_saved_at"] = now()
+                edit_state["last_copy_edit_index"] = index
+                edit_state["last_copy_edit_field"] = field
                 request_id = edit_row["request_id"]
                 prompt_message_id = waiting.get("prompt_message_id")
                 db.execute(
@@ -3944,12 +3961,18 @@ def _accept_update(
                 )
             else:
                 request_id = ""
-                next_index = 0
                 prompt_message_id = None
 
-        # The edit transaction is committed before refreshing the persistent card.
+        # Commit first, then render the authoritative saved draft back into the
+        # same persistent review card.
         if request_id:
-            _refresh_copy_review(chat_id, request_id, index=next_index)
+            _refresh_copy_review(chat_id, request_id, index=index)
+            confirmation_text = (
+                f"✅ {field.title()} saved as the final reviewed copy. "
+                "The caption review card now shows the exact text that will be sent "
+                "to Schedule Master."
+            )
+            confirmation_done = False
             if prompt_message_id:
                 try:
                     telegram(
@@ -3957,16 +3980,33 @@ def _accept_update(
                         {
                             "chat_id": chat_id,
                             "message_id": prompt_message_id,
-                            "text": (
-                                f"✅ {field.title()} saved as the final reviewed copy. "
-                                "The review card above now shows exactly what will be sent "
-                                "to Schedule Master. Use Next when you're ready."
+                            "text": confirmation_text,
+                        },
+                    )
+                    confirmation_done = True
+                except Exception:
+                    logger.warning(
+                        "Could not edit copy confirmation prompt request_id=%s",
+                        request_id,
+                    )
+            if not confirmation_done:
+                try:
+                    telegram(
+                        "sendMessage",
+                        {
+                            "chat_id": chat_id,
+                            "text": confirmation_text,
+                            "reply_to_message_id": (
+                                int(incoming_message_id)
+                                if incoming_message_id.isdigit()
+                                else None
                             ),
+                            "disable_web_page_preview": True,
                         },
                     )
                 except Exception:
-                    logger.warning(
-                        "Could not update copy edit prompt request_id=%s",
+                    logger.exception(
+                        "Could not send copy edit confirmation request_id=%s",
                         request_id,
                     )
             return {
@@ -3974,7 +4014,7 @@ def _accept_update(
                 "request_id": request_id,
                 "field": field,
                 "asset_index": index,
-                "next_asset_index": next_index,
+                "confirmation": "saved",
             }
 
 
