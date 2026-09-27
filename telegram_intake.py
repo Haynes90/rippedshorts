@@ -19,6 +19,7 @@ from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request, 
 
 from audio_master_handoff import DB_PATH, SOURCE_DIR, connect, download_drive, drive_metadata, get_job
 from source_ingestion import (
+    _has_usable_audio,
     download_youtube_resilient,
     ingest_with_audio_master,
     restrict_to_boundary,
@@ -96,7 +97,15 @@ def _ensure_render_source(request_id: str, state: dict[str, Any]) -> Path:
     current_value = str(state.get("video_path") or "").strip()
     current = Path(current_value) if current_value else None
     if current and current.is_file() and current.stat().st_size > 0:
-        return current
+        if _has_usable_audio(current):
+            return current
+        logger.warning(
+            "RENDER_SOURCE_LOCAL_REJECT request_id=%s path=%s reason=no_audio_stream",
+            request_id,
+            current,
+        )
+        current.unlink(missing_ok=True)
+        current = None
 
     parsed = state.get("parsed") or {}
     video_id = str(parsed.get("video_id") or "").strip()
@@ -122,8 +131,15 @@ def _ensure_render_source(request_id: str, state: dict[str, Any]) -> Path:
             latest_value = str(latest_state.get("video_path") or "").strip()
             latest_path = Path(latest_value) if latest_value else None
             if latest_path and latest_path.is_file() and latest_path.stat().st_size > 0:
-                state["video_path"] = str(latest_path)
-                return latest_path
+                if _has_usable_audio(latest_path):
+                    state["video_path"] = str(latest_path)
+                    return latest_path
+                logger.warning(
+                    "RENDER_SOURCE_LATEST_REJECT request_id=%s path=%s reason=no_audio_stream",
+                    request_id,
+                    latest_path,
+                )
+                latest_path.unlink(missing_ok=True)
 
         logger.warning(
             "RENDER_SOURCE_MISSING request_id=%s video_id=%s old_path=%s; "
@@ -153,6 +169,11 @@ def _ensure_render_source(request_id: str, state: dict[str, Any]) -> Path:
         if not path.is_file() or path.stat().st_size <= 0:
             raise RuntimeError(
                 f"Recovered render source is unusable for video_id={video_id}: {path}"
+            )
+        if not _has_usable_audio(path):
+            path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"Recovered render source has no audio stream for video_id={video_id}"
             )
 
         state["video_path"] = str(path)

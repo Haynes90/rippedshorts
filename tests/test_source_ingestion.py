@@ -50,3 +50,28 @@ def test_prompt_requires_distinct_non_overlapping_complete_thoughts():
     assert "Clips MUST NOT overlap in time" in source
     assert "Prefer fewer excellent complete thoughts" in source
     assert "beginning, middle, and end" in source
+
+
+def test_cached_drive_source_must_have_audio_before_reuse():
+    source = (Path(__file__).resolve().parents[1] / "source_ingestion.py").read_text(encoding="utf-8")
+    assert "if _has_usable_audio(candidate):" in source
+    assert "RIPPED_SOURCE_DRIVE_REJECT" in source
+
+
+def test_every_youtube_source_profile_requires_audio_before_winning():
+    source = (Path(__file__).resolve().parents[1] / "source_ingestion.py").read_text(encoding="utf-8")
+    assert "and _has_usable_audio(item)" in source
+    assert "profile produced source media without an audio stream" in source
+
+
+def test_rapidapi_source_requires_audio_before_winning():
+    source = (Path(__file__).resolve().parents[1] / "source_ingestion.py").read_text(encoding="utf-8")
+    assert "RapidAPI returned a source without an audio stream" in source
+    assert "RapidAPI downloaded a source without an audio stream" in source
+
+
+def test_source_audio_validation_rejects_silent_audio_tracks():
+    source = (Path(__file__).resolve().parents[1] / "source_ingestion.py").read_text(encoding="utf-8")
+    assert "def _has_usable_audio(" in source
+    assert "volumedetect" in source
+    assert 'SOURCE_AUDIO_MIN_MAX_DB", "-55"' in source

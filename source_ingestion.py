@@ -154,7 +154,7 @@ def _sermon_boundary(payload: Any) -> dict[str, float] | None:
 
 
 def _has_audio_stream(path: Path) -> bool:
-    """Reject cached/downloaded video-only files before transcription or rendering."""
+    """Return whether media contains at least one audio stream."""
     try:
         result = subprocess.run(
             [os.getenv("FFPROBE_BINARY", "ffprobe"), "-v", "error", "-select_streams", "a:0",
@@ -163,6 +163,33 @@ def _has_audio_stream(path: Path) -> bool:
         )
         return result.returncode == 0 and "audio" in result.stdout.lower()
     except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _has_usable_audio(path: Path) -> bool:
+    """Require an audio stream with actual signal, not a silent audio track."""
+    if not _has_audio_stream(path):
+        return False
+    try:
+        result = subprocess.run(
+            [
+                os.getenv("FFMPEG_BINARY", "ffmpeg"),
+                "-hide_banner", "-nostats", "-v", "info",
+                "-i", str(path),
+                "-vn", "-af", "volumedetect",
+                "-f", "null", "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        output = (result.stderr or "") + "\n" + (result.stdout or "")
+        match = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", output)
+        if not match:
+            return False
+        minimum_db = float(os.getenv("SOURCE_AUDIO_MIN_MAX_DB", "-55"))
+        return float(match.group(1)) >= minimum_db
+    except (OSError, subprocess.SubprocessError, ValueError):
         return False
 
 def reuse_from_drive(video_id: str, workdir: Path) -> dict[str, Any]:
@@ -211,7 +238,19 @@ def reuse_from_drive(video_id: str, workdir: Path) -> dict[str, Any]:
     video_path = None
     if video_asset:
         suffix = Path(video_asset["name"]).suffix or ".mp4"
-        video_path = download_drive_file(video_asset["id"], workdir / f"{video_id}-source{suffix}")
+        candidate = download_drive_file(
+            video_asset["id"],
+            workdir / f"{video_id}-source{suffix}",
+        )
+        if _has_usable_audio(candidate):
+            video_path = candidate
+        else:
+            print(
+                f"RIPPED_SOURCE_DRIVE_REJECT video_id={video_id} "
+                f"file={candidate} reason=no_audio_stream",
+                flush=True,
+            )
+            candidate.unlink(missing_ok=True)
 
     return {
         "assets": assets,
@@ -371,6 +410,10 @@ def _run_rapidapi_profile(
             target.write_bytes(response.content)
             if target.stat().st_size <= 0:
                 raise RuntimeError("RapidAPI returned an empty video response")
+            if not _has_usable_audio(target):
+                raise RuntimeError(
+                    "RapidAPI returned a source without an audio stream"
+                )
             return target
 
         try:
@@ -439,6 +482,10 @@ def _run_rapidapi_profile(
                         handle.write(chunk)
             file_response.close()
             if target.is_file() and target.stat().st_size > 0:
+                if not _has_audio_stream(target):
+                    raise RuntimeError(
+                        "RapidAPI downloaded a source without an audio stream"
+                    )
                 print(
                     f"RIPPED_SOURCE_PROFILE success video_id={video_id} "
                     f"profile=rapidapi_video_download provider=rapidapi "
@@ -587,10 +634,21 @@ def _run_youtube_profile(
         if stop_event.is_set():
             raise RuntimeError("cancelled because another YouTube acquisition profile won")
         matches = sorted(lane.glob(f"{video_id}-source.*"))
-        usable = next((item for item in matches if item.is_file() and item.stat().st_size > 0), None)
+        usable = next(
+            (
+                item
+                for item in matches
+                if item.is_file()
+                and item.stat().st_size > 0
+                and _has_usable_audio(item)
+            ),
+            None,
+        )
         if not usable:
-            if usable:
-                raise RuntimeError("profile produced a video-only source without an audio stream")
+            if any(item.is_file() and item.stat().st_size > 0 for item in matches):
+                raise RuntimeError(
+                    "profile produced source media without an audio stream"
+                )
             raise RuntimeError("profile completed without a usable source video")
         print(
             f"RIPPED_SOURCE_PROFILE success video_id={video_id} profile={profile['name']} "
