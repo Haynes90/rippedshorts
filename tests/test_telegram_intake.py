@@ -253,10 +253,27 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("reply_to_message_id in {prompt_id, review_id}", SOURCE)
         self.assertIn("len(candidate_matches) == 1", SOURCE)
 
+    def test_copy_edit_is_checkpointed_before_success_confirmation(self):
+        self.assertIn("def _checkpoint_copy_edit(", SOURCE)
+        self.assertIn("COPY_EDIT_CHECKPOINTED", SOURCE)
+        self.assertIn("for checkpoint_attempt in range(1, 4)", SOURCE)
+        self.assertIn('"confirmation": "saved_and_checkpointed"', SOURCE)
+        self.assertIn("durable copy sheet is ready for Schedule Master", SOURCE)
+
+    def test_copy_checkpoint_failure_keeps_same_edit_route_open(self):
+        self.assertIn('latest_state["awaiting_copy_input"] = waiting', SOURCE)
+        self.assertIn('"status": "copy_checkpoint_failed"', SOURCE)
+        self.assertIn("You are still on this same caption", SOURCE)
+
+    def test_schedule_handoff_prefers_durable_caption_checkpoint(self):
+        self.assertIn("def _caption_learning_checkpoint_map(", SOURCE)
+        self.assertIn('"copy_source": "CAPTION_LEARNING_CHECKPOINT"', SOURCE)
+        self.assertIn("checkpoint_copy = _caption_learning_checkpoint_map(request_id)", SOURCE)
+
     def test_copy_reply_always_confirms_saved_edit(self):
         self.assertIn("confirmation_done = False", SOURCE)
         self.assertIn("reply_to_message_id", SOURCE)
-        self.assertIn('"confirmation": "saved"', SOURCE)
+        self.assertIn('"confirmation": "saved_and_checkpointed"', SOURCE)
         self.assertIn("last_copy_edit_saved_at", SOURCE)
 
     def test_copy_reply_is_bound_to_exact_prompt_and_preserves_route(self):
