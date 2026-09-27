@@ -1713,6 +1713,12 @@ def _telegram_db() -> sqlite3.Connection:
         "user_id TEXT NOT NULL, status TEXT NOT NULL, mode TEXT NOT NULL, source_kind TEXT NOT NULL, "
         "source_value TEXT NOT NULL, state_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
     )
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS telegram_copy_inputs ("
+        "prompt_message_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, chat_id TEXT NOT NULL, "
+        "user_id TEXT NOT NULL, field TEXT NOT NULL, asset_index INTEGER NOT NULL, "
+        "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+    )
     return db
 
 
@@ -4005,9 +4011,33 @@ def _accept_update(
         waiting = None
         candidate_matches = []
         with _LOCK, _telegram_db() as db:
+            # Primary path: the exact Telegram force-reply prompt identifies the
+            # request and asset directly. This prevents normal group-chat filtering
+            # from swallowing replacement captions.
+            if reply_to_message_id:
+                pending = db.execute(
+                    "SELECT * FROM telegram_copy_inputs "
+                    "WHERE prompt_message_id=? AND chat_id=? AND user_id=?",
+                    (reply_to_message_id, chat_id, user_id),
+                ).fetchone()
+                if pending:
+                    candidate_row = db.execute(
+                        "SELECT * FROM telegram_requests WHERE request_id=?",
+                        (pending["request_id"],),
+                    ).fetchone()
+                    if candidate_row:
+                        edit_row = candidate_row
+                        edit_state = json.loads(candidate_row["state_json"])
+                        waiting = {
+                            "field": str(pending["field"]),
+                            "index": int(pending["asset_index"]),
+                            "user_id": user_id,
+                            "prompt_message_id": reply_to_message_id,
+                        }
+
             rows = db.execute(
                 "SELECT * FROM telegram_requests WHERE chat_id=? AND user_id=? "
-                "ORDER BY updated_at DESC LIMIT 20",
+                "ORDER BY updated_at DESC LIMIT 50",
                 (chat_id, user_id),
             ).fetchall()
 
@@ -4024,6 +4054,8 @@ def _accept_update(
             # card itself. If exactly one edit is waiting for this user/chat, accept
             # it even when Telegram reports a different reply target.
             for candidate_row, candidate_state, candidate_waiting in candidate_matches:
+                if edit_row is not None:
+                    break
                 prompt_id = str(candidate_waiting.get("prompt_message_id") or "")
                 review_id = str(candidate_state.get("copy_review_message_id") or "")
                 if reply_to_message_id and reply_to_message_id in {prompt_id, review_id}:
@@ -4174,7 +4206,21 @@ def _accept_update(
                         (json.dumps(latest_state), now(), request_id),
                     )
 
+            with _LOCK, _telegram_db() as db:
+                if prompt_message_id:
+                    db.execute(
+                        "DELETE FROM telegram_copy_inputs WHERE prompt_message_id=?",
+                        (str(prompt_message_id),),
+                    )
+
             _refresh_copy_review(chat_id, request_id, index=index)
+            logger.info(
+                "COPY_REPLY_APPLIED request_id=%s field=%s index=%s prompt_message_id=%s",
+                request_id,
+                field,
+                index,
+                prompt_message_id,
+            )
             confirmation_text = (
                 f"✅ {field.title()} saved and synced. "
                 "The caption review card now shows the exact final text, and the "
@@ -4510,6 +4556,22 @@ def _accept_update(
                 "user_id": user_id,
                 "prompt_message_id": prompt_message_id,
             }
+            if prompt_message_id:
+                db.execute(
+                    "INSERT OR REPLACE INTO telegram_copy_inputs "
+                    "(prompt_message_id, request_id, chat_id, user_id, field, asset_index, created_at, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        str(prompt_message_id),
+                        request_id,
+                        chat_id,
+                        user_id,
+                        field,
+                        index,
+                        now(),
+                        now(),
+                    ),
+                )
             latest_state["copy_review_index"] = index
             db.execute(
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
