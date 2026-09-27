@@ -261,6 +261,29 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("semantic_fallback=True", SOURCE)
         self.assertIn('selection_mode = "semantic_fallback"', SOURCE)
 
+    def test_16_9_builder_really_uses_fallback_minimum_at_runtime(self):
+        transcript = [
+            {"start": 0, "end": 50, "text": "Question and setup."},
+            {"start": 50, "end": 100, "text": "Complete answer and payoff."},
+        ]
+        suggestions = [{
+            "start": 0,
+            "end": 100,
+            "title": "Q&A",
+            "summary": "A complete question and answer.",
+            "highlight_type": "question_answer",
+            "reason": "Standalone exchange",
+            "score": 90,
+        }]
+        self.assertEqual(build_topic_highlights(transcript, suggestions), [])
+        recovered = build_topic_highlights(
+            transcript,
+            suggestions,
+            minimum_seconds=90,
+        )
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["duration"], 100)
+
     def test_16_9_builder_accepts_lower_minimum_only_for_fallback(self):
         self.assertIn("minimum_seconds: float | None = None", SOURCE)
         self.assertIn("max(60.0, float(minimum_seconds))", SOURCE)
