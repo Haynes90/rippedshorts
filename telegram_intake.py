@@ -2692,10 +2692,12 @@ def _topic_break_suggestions(
             "arguments or opinions with supporting reasoning, demonstrations, or other "
             "complete standalone conversations. A section may be shorter than a typical "
             "long highlight but should normally be at least "
-            f"{minimum:.0f} seconds. Do not pad with unrelated material just to reach a "
-            "duration. Prefer a natural complete section over an arbitrary block. Return "
-            "an empty array only when the transcript genuinely contains no self-contained "
-            "discussion of that minimum length."
+            f"{minimum:.0f} seconds. This is a minimum only, never a target or maximum. "
+            "If one complete subject naturally runs 5, 8, 12, or more minutes, return the "
+            "whole coherent section rather than shortening or discarding it. Do not pad with "
+            "unrelated material just to reach a duration. Prefer a natural complete section "
+            "over an arbitrary block. Return an empty array only when the transcript genuinely "
+            "contains no self-contained discussion of that minimum length."
         )
     else:
         minimum = (
