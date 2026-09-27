@@ -853,6 +853,84 @@ def _build_crop_filter(video_path: Path, start: float, duration: float) -> str:
     return f"crop={target_width}:{height}:x='{crop_expression}':y=0"
 
 
+def _audio_max_volume_db(
+    media_path: Path, *, start: float | None = None, duration: float | None = None
+) -> float | None:
+    """Return max audio level in dB, or None when no audio stream is usable."""
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+            str(media_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if probe.returncode != 0 or "audio" not in (probe.stdout or "").lower():
+        return None
+
+    command = ["ffmpeg", "-hide_banner", "-nostats", "-v", "info"]
+    if start is not None:
+        command += ["-ss", f"{max(0.0, start):.3f}"]
+    if duration is not None:
+        command += ["-t", f"{max(0.1, duration):.3f}"]
+    command += [
+        "-i", str(media_path),
+        "-vn", "-af", "volumedetect",
+        "-f", "null", "-",
+    ]
+    measured = subprocess.run(
+        command, capture_output=True, text=True, timeout=180
+    )
+    output = (measured.stderr or "") + "\n" + (measured.stdout or "")
+    match = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", output)
+    if not match:
+        return None
+    return float(match.group(1))
+
+
+def _assert_render_audio(
+    source_path: Path,
+    output_path: Path,
+    *,
+    start: float,
+    duration: float,
+    aspect: str,
+) -> None:
+    """Reject missing/silent source or output audio before Drive upload."""
+    minimum_db = float(os.getenv("RENDER_AUDIO_MIN_MAX_DB", "-50"))
+    source_level = _audio_max_volume_db(
+        source_path, start=start, duration=duration
+    )
+    if source_level is None:
+        raise RuntimeError(
+            f"{aspect} source segment has no usable audio stream; refusing silent render"
+        )
+    if source_level < minimum_db:
+        raise RuntimeError(
+            f"{aspect} source segment is effectively silent "
+            f"(max_volume={source_level:.1f} dB, minimum={minimum_db:.1f} dB)"
+        )
+
+    output_level = _audio_max_volume_db(output_path)
+    if output_level is None:
+        raise RuntimeError(
+            f"{aspect} rendered file has no usable audio stream; refusing upload"
+        )
+    if output_level < minimum_db:
+        raise RuntimeError(
+            f"{aspect} rendered file is effectively silent "
+            f"(max_volume={output_level:.1f} dB, minimum={minimum_db:.1f} dB)"
+        )
+    logger.info(
+        "RENDER_AUDIO_VALIDATED aspect=%s source_max_db=%.1f output_max_db=%.1f",
+        aspect,
+        source_level,
+        output_level,
+    )
+
+
 def create_clip_file(video_path: Path, start: float, duration: float, output_path: Path) -> None:
     vertical_filter, complex_filter = _build_vertical_filter(
         video_path, start, duration
@@ -874,7 +952,11 @@ def create_clip_file(video_path: Path, start: float, duration: float, output_pat
             "-map", "0:a?",
         ])
     else:
-        command.extend(["-vf", f"{vertical_filter},scale=1080:1920"])
+        command.extend([
+            "-vf", f"{vertical_filter},scale=1080:1920",
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+        ])
     command.extend([
         "-c:v",
         "libx264",
@@ -894,6 +976,13 @@ def create_clip_file(video_path: Path, start: float, duration: float, output_pat
         )
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise RuntimeError(f"FFmpeg render produced no usable clip: {output_path}")
+    _assert_render_audio(
+        video_path,
+        output_path,
+        start=start,
+        duration=duration,
+        aspect="9:16",
+    )
 
 
 def create_topic_segment_file(
@@ -909,6 +998,8 @@ def create_topic_segment_file(
         f"{duration:.2f}",
         "-i",
         str(video_path),
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
         "-vf",
         "scale=1920:1080:force_original_aspect_ratio=decrease,"
         "pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
@@ -930,6 +1021,13 @@ def create_topic_segment_file(
         )
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise RuntimeError(f"FFmpeg 16:9 render produced no usable segment: {output_path}")
+    _assert_render_audio(
+        video_path,
+        output_path,
+        start=start,
+        duration=duration,
+        aspect="16:9",
+    )
 
 
 def attach_topic_segment_asset(

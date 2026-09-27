@@ -603,73 +603,164 @@ def _copy_review_assets(state: dict[str, Any], request_id: str) -> list[dict[str
     return assets
 
 
-def _send_copy_review(chat_id: str, request_id: str, drafts: list[dict[str, Any]]) -> None:
-    for index, draft in enumerate(drafts):
-        if draft["asset_type"] == "9:16_SHORT":
-            text = (
-                f"✍️ 9:16 Caption Draft {draft.get('candidate_number', index + 1)}\n\n"
-                f"{draft.get('social_caption', '')}\n\n{draft.get('hashtags', '')}"
-            )
-            buttons = [
-                [
-                    {
-                        "text": "✅ Keep Caption",
-                        "callback_data": f"rs:copy_keep:{request_id}:{index}",
-                    },
-                    {
-                        "text": "✏️ Write My Caption",
-                        "callback_data": f"rs:copy_edit_caption:{request_id}:{index}",
-                    },
-                ],
-                [{
-                    "text": "🔄 Generate Another",
-                    "callback_data": f"rs:copy_regenerate:{request_id}:{index}",
-                }],
-            ]
-        else:
-            text = (
-                f"📺 16:9 Metadata Draft {draft.get('candidate_number', index + 1)}\n\n"
-                f"TITLE\n{draft.get('video_title', '')}\n\n"
-                f"DESCRIPTION\n{draft.get('video_description', '')}\n\n"
-                f"SEO TAGS\n{draft.get('hashtags', '')}"
-            )
-            buttons = [
-                [{
-                    "text": "✅ Keep Title & Description",
+def _copy_review_payload(
+    request_id: str, drafts: list[dict[str, Any]], index: int
+) -> tuple[str, dict[str, Any]]:
+    if not drafts:
+        return (
+            "No copy drafts are available.",
+            {"inline_keyboard": [[{
+                "text": "✅ Finish & Schedule",
+                "callback_data": f"rs:copy_finish:{request_id}",
+            }]]},
+        )
+    index = max(0, min(len(drafts) - 1, int(index or 0)))
+    draft = drafts[index]
+    approved = sum(
+        str(item.get("copy_status") or "") in {"approved", "edited"}
+        or bool(item.get("user_edited"))
+        for item in drafts
+    )
+    regenerated = sum(
+        int(item.get("regeneration_count") or 0) > 0 for item in drafts
+    )
+    header = (
+        f"✍️ COPY REVIEW • {index + 1}/{len(drafts)}\n"
+        f"Approved/edited: {approved}/{len(drafts)} • "
+        f"Regenerated: {regenerated}"
+    )
+    if draft["asset_type"] == "9:16_SHORT":
+        body = (
+            f"\n\n9:16 Caption • Short "
+            f"{draft.get('candidate_number', index + 1)}\n\n"
+            f"{draft.get('social_caption', '')}\n\n"
+            f"{draft.get('hashtags', '')}"
+        )
+        buttons = [
+            [
+                {
+                    "text": "✅ Keep Caption",
                     "callback_data": f"rs:copy_keep:{request_id}:{index}",
-                }],
-                [
-                    {
-                        "text": "✏️ Edit Title",
-                        "callback_data": f"rs:copy_edit_title:{request_id}:{index}",
-                    },
-                    {
-                        "text": "✏️ Edit Description",
-                        "callback_data": f"rs:copy_edit_description:{request_id}:{index}",
-                    },
-                ],
-                [{
-                    "text": "🔄 Generate Another",
-                    "callback_data": f"rs:copy_regenerate:{request_id}:{index}",
-                }],
-            ]
-        telegram("sendMessage", {
-            "chat_id": chat_id,
-            "text": text[:4000],
-            "disable_web_page_preview": True,
-            "reply_markup": {"inline_keyboard": buttons},
+                },
+                {
+                    "text": "✏️ Edit Caption",
+                    "callback_data": f"rs:copy_edit_caption:{request_id}:{index}",
+                },
+            ],
+            [{
+                "text": "🔄 Generate Another",
+                "callback_data": f"rs:copy_regenerate:{request_id}:{index}",
+            }],
+        ]
+    else:
+        body = (
+            f"\n\n16:9 Metadata • Segment "
+            f"{draft.get('candidate_number', index + 1)}\n\n"
+            f"TITLE\n{draft.get('video_title', '')}\n\n"
+            f"DESCRIPTION\n{draft.get('video_description', '')}\n\n"
+            f"SEO TAGS\n{draft.get('hashtags', '')}"
+        )
+        buttons = [
+            [{
+                "text": "✅ Keep Title & Description",
+                "callback_data": f"rs:copy_keep:{request_id}:{index}",
+            }],
+            [
+                {
+                    "text": "✏️ Edit Title",
+                    "callback_data": f"rs:copy_edit_title:{request_id}:{index}",
+                },
+                {
+                    "text": "✏️ Edit Description",
+                    "callback_data": f"rs:copy_edit_description:{request_id}:{index}",
+                },
+            ],
+            [{
+                "text": "🔄 Generate Another",
+                "callback_data": f"rs:copy_regenerate:{request_id}:{index}",
+            }],
+        ]
+    nav = []
+    if index > 0:
+        nav.append({
+            "text": "◀️ Previous",
+            "callback_data": f"rs:copy_page:{request_id}:{index - 1}",
         })
-    telegram("sendMessage", {
-        "chat_id": chat_id,
-        "text": (
-            "Review the drafts above. Edit anything you want; unchanged drafts are "
-            "treated as approved. When finished, release the complete batch."
-        ),
-        "reply_markup": {"inline_keyboard": [[{
-            "text": "✅ Approve Copy & Schedule",
-            "callback_data": f"rs:copy_finish:{request_id}",
-        }]]},
-    })
+    if index < len(drafts) - 1:
+        nav.append({
+            "text": "Next ▶️",
+            "callback_data": f"rs:copy_page:{request_id}:{index + 1}",
+        })
+    if nav:
+        buttons.append(nav)
+    buttons.append([{
+        "text": "✅ Finish & Schedule",
+        "callback_data": f"rs:copy_finish:{request_id}",
+    }])
+    return (header + body)[:4000], {"inline_keyboard": buttons}
+
+
+def _refresh_copy_review(
+    chat_id: str, request_id: str, *, index: int | None = None
+) -> None:
+    with _LOCK, _telegram_db() as db:
+        row = db.execute(
+            "SELECT state_json FROM telegram_requests WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+    if not row:
+        return
+    state = json.loads(row["state_json"])
+    drafts = list(state.get("copy_drafts") or [])
+    if index is None:
+        index = int(state.get("copy_review_index") or 0)
+    text, markup = _copy_review_payload(request_id, drafts, index)
+    message_id = state.get("copy_review_message_id")
+    if message_id:
+        try:
+            telegram("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "disable_web_page_preview": True,
+                "reply_markup": markup,
+            })
+        except Exception as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.warning(
+                    "Copy review edit failed; replacing request_id=%s", request_id
+                )
+                message_id = None
+    if not message_id:
+        result = telegram("sendMessage", {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+            "reply_markup": markup,
+        })
+        message_id = (result.get("result") or {}).get("message_id")
+    if message_id:
+        with _LOCK, _telegram_db() as db:
+            latest = db.execute(
+                "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if latest:
+                latest_state = json.loads(latest["state_json"])
+                latest_state["copy_review_message_id"] = message_id
+                latest_state["copy_review_index"] = index
+                db.execute(
+                    "UPDATE telegram_requests SET state_json=?, updated_at=? "
+                    "WHERE request_id=?",
+                    (json.dumps(latest_state), now(), request_id),
+                )
+
+
+def _send_copy_review(
+    chat_id: str, request_id: str, drafts: list[dict[str, Any]]
+) -> None:
+    """Present copy review as one evolving Telegram message."""
+    _refresh_copy_review(chat_id, request_id, index=0)
 
 
 def _regenerate_copy_draft(request_id: str, index: int, chat_id: str) -> None:
@@ -701,8 +792,7 @@ def _regenerate_copy_draft(request_id: str, index: int, chat_id: str) -> None:
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(state), now(), request_id),
             )
-        send(chat_id, f"✅ Draft {index + 1} was regenerated. Here is the refreshed review set:")
-        _send_copy_review(chat_id, request_id, drafts)
+        _refresh_copy_review(chat_id, request_id, index=index)
     except Exception:
         logger.exception("Could not regenerate copy request_id=%s index=%s", request_id, index)
         send(chat_id, f"❌ I couldn't regenerate draft {index + 1}. Your previous draft is still saved.")
@@ -2307,82 +2397,199 @@ def _preflight_candidates(video: Path, clips: list[dict[str, Any]]) -> list[dict
         accepted.append(clip)
     return accepted
 
-def _send_candidates(
-    chat_id: str, request_id: str, result: dict, *, start_index: int = 0
-) -> None:
-    """Send compact review pages instead of one Telegram message per candidate."""
-    clips = result.get("segments", [])
-    review_count = max(0, len(clips) - start_index)
+
+def _short_review_page_payload(
+    request_id: str, state: dict[str, Any], page_number: int
+) -> tuple[str, dict[str, Any]]:
+    clips = (state.get("result") or {}).get("segments", [])
     page_size = max(
         2, min(5, int(os.getenv("TELEGRAM_CANDIDATES_PER_PAGE", "4")))
     )
-    selected = list(range(start_index, len(clips)))
-    if not selected:
-        send(
-            chat_id,
-            f"✅ Analysis complete\nJob ID: {request_id}\nNo new Shorts need review.",
-        )
-        _send_short_confirmation(chat_id, request_id)
-        return
+    total_pages = max(1, (len(clips) + page_size - 1) // page_size)
+    page_number = max(1, min(total_pages, int(page_number or 1)))
+    start = (page_number - 1) * page_size
+    indexes = list(range(start, min(len(clips), start + page_size)))
+    reviews = dict(state.get("candidate_reviews") or {})
 
-    total_pages = (len(selected) + page_size - 1) // page_size
-    for page_number, offset in enumerate(range(0, len(selected), page_size), 1):
-        indexes = selected[offset : offset + page_size]
-        sections = [
-            f"✅ Shorts review • Page {page_number}/{total_pages}\n"
-            f"Job ID: {request_id}\n"
-            f"{review_count} new candidate(s). Approve only what you want rendered."
-        ]
-        buttons = []
-        for zero_index in indexes:
-            clip = clips[zero_index]
-            short_number = int(
-                clip.get("candidate_number") or zero_index + 1
-            )
-            transcript = str(clip.get("transcript", "")).strip()
-            if len(transcript) > 560:
-                transcript = transcript[:557] + "..."
-            sections.append(
-                f"\nSHORT {short_number}\n"
-                f"{_timecode(float(clip['start']))}–"
-                f"{_timecode(float(clip['end']))} • "
-                f"{round(float(clip['duration']))}s • "
-                f"{clip.get('category', 'social clip')}\n"
-                f"Why: {str(clip.get('reason', ''))[:260]}\n"
-                f"{transcript}"
-            )
-            buttons.append(
-                [
-                    {
-                        "text": f"✅ {short_number}",
-                        "callback_data": (
-                            f"rs:approve:{request_id}:{zero_index}"
-                        ),
-                    },
-                    {
-                        "text": f"❌ {short_number}",
-                        "callback_data": (
-                            f"rs:reject:{request_id}:{zero_index}"
-                        ),
-                    },
-                ]
-            )
-        buttons.append(
-            [{
-                "text": "✏️ Change / Add / Options",
-                "callback_data": f"rs:options:{request_id}",
-            }]
+    approved_total = sum(
+        str(item.get("status") or "") in {"queued", "rendering", "rendered"}
+        for item in reviews.values()
+    )
+    rejected_total = sum(
+        str(item.get("status") or "") in {"reject", "rejected"}
+        for item in reviews.values()
+    )
+    rendered_total = sum(
+        str(item.get("status") or "") == "rendered"
+        for item in reviews.values()
+    )
+    active_total = sum(
+        str(item.get("status") or "") in {"queued", "rendering"}
+        for item in reviews.values()
+    )
+
+    sections = [
+        f"✂️ 9:16 Shorts Review • Page {page_number}/{total_pages}",
+        f"Approved: {approved_total} • Rejected: {rejected_total} • "
+        f"Rendered: {rendered_total} • Rendering/Queued: {active_total}",
+    ]
+    buttons = []
+    for zero_index in indexes:
+        clip = clips[zero_index]
+        short_number = int(clip.get("candidate_number") or zero_index + 1)
+        review_status = str(
+            (reviews.get(str(zero_index)) or {}).get("status") or ""
         )
-        telegram(
-            "sendMessage",
+        marker = (
+            "✅"
+            if review_status in {"queued", "rendering", "rendered"}
+            else ("❌" if review_status in {"reject", "rejected"} else "▫️")
+        )
+        transcript = str(clip.get("transcript", "")).strip()
+        if len(transcript) > 500:
+            transcript = transcript[:497] + "..."
+        sections.append(
+            f"\n{marker} SHORT {short_number}\n"
+            f"{_timecode(float(clip['start']))}–"
+            f"{_timecode(float(clip['end']))} • "
+            f"{round(float(clip['duration']))}s • "
+            f"{clip.get('category', 'social clip')}\n"
+            f"Why: {str(clip.get('reason', ''))[:220]}\n"
+            f"{transcript}"
+        )
+        buttons.append([
             {
-                "chat_id": chat_id,
-                "text": "\n".join(sections)[:4000],
-                "disable_web_page_preview": True,
-                "reply_markup": {"inline_keyboard": buttons},
+                "text": f"✅ {short_number}",
+                "callback_data": f"rs:approve:{request_id}:{zero_index}",
             },
-        )
-    _send_short_confirmation(chat_id, request_id)
+            {
+                "text": f"❌ {short_number}",
+                "callback_data": f"rs:reject:{request_id}:{zero_index}",
+            },
+        ])
+
+    nav = []
+    if page_number > 1:
+        nav.append({
+            "text": "◀️ Previous 4",
+            "callback_data": f"rs:shorts_page:{request_id}:{page_number - 1}",
+        })
+    if page_number < total_pages:
+        nav.append({
+            "text": "Next 4 ▶️",
+            "callback_data": f"rs:shorts_page:{request_id}:{page_number + 1}",
+        })
+    if nav:
+        buttons.append(nav)
+    buttons.append([{
+        "text": "✏️ Change / Add / Options",
+        "callback_data": f"rs:options:{request_id}",
+    }])
+    return "\n".join(sections)[:4000], {"inline_keyboard": buttons}
+
+
+def _refresh_short_review_message(
+    chat_id: str, request_id: str, *, page_number: int | None = None
+) -> None:
+    with _LOCK, _telegram_db() as db:
+        row = db.execute(
+            "SELECT state_json FROM telegram_requests WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+    if not row:
+        return
+    state = json.loads(row["state_json"])
+    if page_number is None:
+        page_number = int(state.get("short_review_page") or 1)
+    text, markup = _short_review_page_payload(request_id, state, page_number)
+    message_id = state.get("short_review_message_id")
+    if message_id:
+        try:
+            telegram("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "disable_web_page_preview": True,
+                "reply_markup": markup,
+            })
+        except Exception as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.warning(
+                    "Short review edit failed; replacing request_id=%s", request_id
+                )
+                message_id = None
+    if not message_id:
+        result = telegram("sendMessage", {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+            "reply_markup": markup,
+        })
+        message_id = (result.get("result") or {}).get("message_id")
+    if message_id:
+        with _LOCK, _telegram_db() as db:
+            latest = db.execute(
+                "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if latest:
+                latest_state = json.loads(latest["state_json"])
+                latest_state["short_review_message_id"] = message_id
+                latest_state["short_review_page"] = page_number
+                db.execute(
+                    "UPDATE telegram_requests SET state_json=?, updated_at=? "
+                    "WHERE request_id=?",
+                    (json.dumps(latest_state), now(), request_id),
+                )
+
+
+def _short_control_payload(request_id: str, row, state: dict[str, Any]):
+    reviews = dict(state.get("candidate_reviews") or {})
+    topics = dict(state.get("topic_reviews") or {})
+    approved = sum(
+        str(item.get("status") or "") in {"queued", "rendering", "rendered"}
+        for item in reviews.values()
+    )
+    rendered = sum(
+        str(item.get("status") or "") == "rendered" for item in reviews.values()
+    )
+    active = sum(
+        str(item.get("status") or "") in {"queued", "rendering"}
+        for item in reviews.values()
+    )
+    topic_approved = sum(
+        str(item.get("status") or "") in {"queued", "rendering", "rendered"}
+        for item in topics.values()
+    )
+    text = (
+        "🎛 RIPPED SHORTS CONTROL\n"
+        f"9:16 — approved {approved} • rendered {rendered} • active {active}\n"
+        f"16:9 — approved {topic_approved}\n"
+        "Rendering continues in the background while you move through review."
+    )
+    if row["mode"] == "both":
+        if state.get("shorts_confirmed_at"):
+            buttons = [[{
+                "text": "📅 Finish & Schedule",
+                "callback_data": f"rs:schedule_now:{request_id}",
+            }]]
+        else:
+            buttons = [
+                [{
+                    "text": "▶️ Continue to 16:9",
+                    "callback_data": f"rs:shorts_confirm:{request_id}",
+                }],
+                [{
+                    "text": "📅 Finish & Schedule",
+                    "callback_data": f"rs:schedule_now:{request_id}",
+                }],
+            ]
+    else:
+        buttons = [[{
+            "text": "📅 Finish & Schedule",
+            "callback_data": f"rs:schedule_now:{request_id}",
+        }]]
+    return text, {"inline_keyboard": buttons}
 
 
 def _send_short_confirmation(chat_id: str, request_id: str) -> None:
@@ -2394,44 +2601,66 @@ def _send_short_confirmation(chat_id: str, request_id: str) -> None:
     if not row:
         return
     state = json.loads(row["state_json"])
-    if state.get("shorts_confirmed_at") or state.get("short_selection_completed_at"):
-        return
-    continue_text = (
-        "Untouched Shorts will be skipped, your rendered choices will go to "
-        "Schedule Master, and 16:9 analysis will begin."
-        if row["mode"] == "both"
-        else "Untouched Shorts will be skipped and your rendered choices will go "
-        "to Schedule Master for captioning and scheduling."
-    )
-    telegram(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": (
-                "Approve the 9:16 Shorts you want. When you are finished choosing, "
-                "tap the button below. " + continue_text
-            ),
-            "reply_markup": {
-                "inline_keyboard": (
-                    [
-                        [{
-                            "text": "✅ Continue to 16:9 Highlights",
-                            "callback_data": f"rs:shorts_confirm:{request_id}",
-                        }],
-                        [{
-                            "text": "📅 No More Videos — Schedule Now",
-                            "callback_data": f"rs:schedule_now:{request_id}",
-                        }],
-                    ]
-                    if row["mode"] == "both"
-                    else [[{
-                        "text": "📅 No More Shorts — Schedule Now",
-                        "callback_data": f"rs:schedule_now:{request_id}",
-                    }]]
+    text, markup = _short_control_payload(request_id, row, state)
+    message_id = state.get("short_control_message_id")
+    if message_id:
+        try:
+            telegram("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "reply_markup": markup,
+            })
+            return
+        except Exception as exc:
+            if "message is not modified" in str(exc).lower():
+                return
+            logger.warning(
+                "Short control edit failed; replacing request_id=%s", request_id
+            )
+    result = telegram("sendMessage", {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": markup,
+    })
+    new_id = (result.get("result") or {}).get("message_id")
+    if new_id:
+        with _LOCK, _telegram_db() as db:
+            latest = db.execute(
+                "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if latest:
+                latest_state = json.loads(latest["state_json"])
+                latest_state["short_control_message_id"] = new_id
+                db.execute(
+                    "UPDATE telegram_requests SET state_json=?, updated_at=? "
+                    "WHERE request_id=?",
+                    (json.dumps(latest_state), now(), request_id),
                 )
-            },
-        },
+
+
+def _send_candidates(
+    chat_id: str, request_id: str, result: dict, *, start_index: int = 0
+) -> None:
+    """Create one persistent control card and one reusable 9:16 review page."""
+    clips = result.get("segments", [])
+    if not clips:
+        send(
+            chat_id,
+            f"✅ Analysis complete\nJob ID: {request_id}\nNo new Shorts need review.",
+        )
+        _send_short_confirmation(chat_id, request_id)
+        return
+    page_size = max(
+        2, min(5, int(os.getenv("TELEGRAM_CANDIDATES_PER_PAGE", "4")))
     )
+    page = max(1, (max(0, start_index) // page_size) + 1)
+    # Send the navigation/control card first so it remains above the evolving
+    # review message. Both cards are edited in place from here forward.
+    _send_short_confirmation(chat_id, request_id)
+    _refresh_short_review_message(chat_id, request_id, page_number=page)
+
 
 def _transcribe(video_path: Path, progress=None) -> list[dict]:
     """Rebuild missing transcripts with overlapping word-timed audio windows."""
@@ -2589,72 +2818,138 @@ def _build_contiguous_topic_segments(
     return selected
 
 
+def _topic_review_payload(
+    request_id: str, state: dict[str, Any], index: int
+) -> tuple[str, dict[str, Any]]:
+    topics = (state.get("topic_result") or {}).get("segments", [])
+    reviews = dict(state.get("topic_reviews") or {})
+    if not topics:
+        return (
+            "No 16:9 highlights are available.",
+            {"inline_keyboard": [[{
+                "text": "📅 Finish & Schedule",
+                "callback_data": f"rs:schedule_now:{request_id}",
+            }]]},
+        )
+    index = max(0, min(len(topics) - 1, int(index or 0)))
+    segment = topics[index]
+    status = str((reviews.get(str(index)) or {}).get("status") or "")
+    marker = (
+        "✅"
+        if status in {"queued", "rendering", "rendered"}
+        else ("❌" if status in {"reject", "rejected"} else "▫️")
+    )
+    approved = sum(
+        str(item.get("status") or "") in {"queued", "rendering", "rendered"}
+        for item in reviews.values()
+    )
+    rendered = sum(
+        str(item.get("status") or "") == "rendered" for item in reviews.values()
+    )
+    text = (
+        f"📺 16:9 REVIEW • {index + 1}/{len(topics)}\n"
+        f"Approved: {approved} • Rendered: {rendered}\n\n"
+        f"{marker} Segment {index + 1}: {segment.get('title', '')}\n\n"
+        f"Time: {_timecode(float(segment['start']))}–"
+        f"{_timecode(float(segment['end']))}\n"
+        f"Duration: {round(float(segment['duration']) / 60, 1)} minutes"
+        + (
+            f"\n\nSection summary:\n{segment.get('summary', '')}"
+            if segment.get("summary")
+            else ""
+        )
+    )
+    buttons = [[
+        {
+            "text": "✅ Approve 16:9",
+            "callback_data": f"rs:topic_approve:{request_id}:{index}",
+        },
+        {
+            "text": "❌ Skip",
+            "callback_data": f"rs:topic_reject:{request_id}:{index}",
+        },
+    ]]
+    nav = []
+    if index > 0:
+        nav.append({
+            "text": "◀️ Previous",
+            "callback_data": f"rs:topic_page:{request_id}:{index - 1}",
+        })
+    if index < len(topics) - 1:
+        nav.append({
+            "text": "Next ▶️",
+            "callback_data": f"rs:topic_page:{request_id}:{index + 1}",
+        })
+    if nav:
+        buttons.append(nav)
+    buttons.append([{
+        "text": "📅 Finish & Schedule",
+        "callback_data": f"rs:schedule_now:{request_id}",
+    }])
+    return text[:4000], {"inline_keyboard": buttons}
+
+
+def _refresh_topic_review(
+    chat_id: str, request_id: str, *, index: int | None = None
+) -> None:
+    with _LOCK, _telegram_db() as db:
+        row = db.execute(
+            "SELECT state_json FROM telegram_requests WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+    if not row:
+        return
+    state = json.loads(row["state_json"])
+    if index is None:
+        index = int(state.get("topic_review_index") or 0)
+    text, markup = _topic_review_payload(request_id, state, index)
+    message_id = state.get("topic_review_message_id")
+    if message_id:
+        try:
+            telegram("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "disable_web_page_preview": True,
+                "reply_markup": markup,
+            })
+        except Exception as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.warning(
+                    "16:9 review edit failed; replacing request_id=%s", request_id
+                )
+                message_id = None
+    if not message_id:
+        result = telegram("sendMessage", {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+            "reply_markup": markup,
+        })
+        message_id = (result.get("result") or {}).get("message_id")
+    if message_id:
+        with _LOCK, _telegram_db() as db:
+            latest = db.execute(
+                "SELECT state_json FROM telegram_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if latest:
+                latest_state = json.loads(latest["state_json"])
+                latest_state["topic_review_message_id"] = message_id
+                latest_state["topic_review_index"] = index
+                db.execute(
+                    "UPDATE telegram_requests SET state_json=?, updated_at=? "
+                    "WHERE request_id=?",
+                    (json.dumps(latest_state), now(), request_id),
+                )
+
+
 def _send_topic_candidates(
     chat_id: str, request_id: str, topic_result: dict
 ) -> None:
-    topics = topic_result.get("segments", [])
-    send(
-        chat_id,
-        f"📺 16:9 section analysis complete\nJob ID: {request_id}\n"
-        f"Sections covering the eligible video: {len(topics)}\n\n"
-        "These sections do not overlap. Approve the horizontal videos you want rendered.",
-    )
-    for index, segment in enumerate(topics):
-        text = (
-            f"16:9 Segment {index + 1}: {segment.get('title', '')}\n\n"
-            f"Time: {_timecode(float(segment['start']))}–"
-            f"{_timecode(float(segment['end']))}\n"
-            f"Duration: {round(float(segment['duration']) / 60, 1)} minutes"
-            + (
-                f"\n\nSection summary:\n{segment.get('summary', '')}"
-                if segment.get("summary")
-                else ""
-            )
-        )
-        telegram(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": True,
-                "reply_markup": {
-                    "inline_keyboard": [
-                        [
-                            {
-                                "text": "✅ Approve 16:9",
-                                "callback_data": f"rs:topic_approve:{request_id}:{index}",
-                            },
-                            {
-                                "text": "❌ Skip",
-                                "callback_data": f"rs:topic_reject:{request_id}:{index}",
-                            },
-                        ],
-                        [
-                            {
-                                "text": "✏️ Change / Add / Options",
-                                "callback_data": f"rs:options:{request_id}",
-                            }
-                        ],
-                    ]
-                },
-            },
-        )
-    telegram(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": (
-                "When you have approved every 16:9 highlight you want, tap "
-                "Schedule Now. Untouched highlights will be skipped."
-            ),
-            "reply_markup": {
-                "inline_keyboard": [[{
-                    "text": "📅 No More 16:9s — Schedule Now",
-                    "callback_data": f"rs:schedule_now:{request_id}",
-                }]]
-            },
-        },
-    )
+    """Present 16:9 review in one evolving Telegram message."""
+    _send_short_confirmation(chat_id, request_id)
+    _refresh_topic_review(chat_id, request_id, index=0)
 
 
 def _process_topics(
@@ -3442,6 +3737,7 @@ def _accept_update(
     chat_id = str((message.get("chat") or {}).get("id", ""))
     user_id = str((callback.get("from") or message.get("from") or {}).get("id", ""))
     callback_data = str(callback.get("data") or "")
+    callback_message_id = (callback.get("message") or {}).get("message_id")
     text = _telegram_message_text(message)
     if not chat_id or not user_id:
         return {"status": "ignored"}
@@ -3487,24 +3783,28 @@ def _accept_update(
                     (json.dumps(edit_state), now(), edit_row["request_id"]),
                 )
                 request_id = edit_row["request_id"]
-                send(
-                    chat_id,
-                    f"✅ Your {field} replaced the AI draft and will be learned.\n\n{text[:3200]}",
-                )
-                telegram("sendMessage", {
-                    "chat_id": chat_id,
-                    "text": "Make another edit above or finish the copy review.",
-                    "reply_markup": {"inline_keyboard": [[{
-                        "text": "✅ Approve Copy & Schedule",
-                        "callback_data": f"rs:copy_finish:{request_id}",
-                    }]]},
-                })
+                _refresh_copy_review(chat_id, request_id, index=index)
                 return {
                     "status": "copy_updated",
                     "request_id": request_id,
                     "field": field,
                     "asset_index": index,
                 }
+
+    shorts_page = re.fullmatch(
+        r"rs:shorts_page:([A-Za-z0-9-]+):(\d+)", callback_data
+    )
+    if shorts_page:
+        request_id, page_text = shorts_page.groups()
+        _refresh_short_review_message(
+            chat_id, request_id, page_number=int(page_text)
+        )
+        _send_short_confirmation(chat_id, request_id)
+        return {
+            "status": "short_review_page",
+            "request_id": request_id,
+            "page": int(page_text),
+        }
 
     options_choice = re.fullmatch(
         r"rs:options:([A-Za-z0-9-]+)", callback_data
@@ -3675,6 +3975,18 @@ def _accept_update(
         _send_copy_review(chat_id, request_id, drafts)
         return {"status": "copy_review_requested", "request_id": request_id}
 
+    copy_page = re.fullmatch(
+        r"rs:copy_page:([A-Za-z0-9-]+):(\d+)", callback_data
+    )
+    if copy_page:
+        request_id, index_text = copy_page.groups()
+        _refresh_copy_review(chat_id, request_id, index=int(index_text))
+        return {
+            "status": "copy_review_page",
+            "request_id": request_id,
+            "asset_index": int(index_text),
+        }
+
     copy_action = re.fullmatch(
         r"rs:copy_(keep|regenerate):([A-Za-z0-9-]+):(\d+)",
         callback_data,
@@ -3699,10 +4011,7 @@ def _accept_update(
                     "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                     (json.dumps(state), now(), request_id),
                 )
-                send(
-                    chat_id,
-                    f"✅ Draft {index + 1} approved. You can review another draft or finish scheduling.",
-                )
+                _refresh_copy_review(chat_id, request_id, index=index)
                 return {"status": "copy_approved", "request_id": request_id, "asset_index": index}
             drafts[index]["copy_status"] = "regenerating"
             state["copy_drafts"] = drafts
@@ -3710,7 +4019,7 @@ def _accept_update(
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(state), now(), request_id),
             )
-        send(chat_id, f"🔄 Creating a fresh version of draft {index + 1}…")
+        _refresh_copy_review(chat_id, request_id, index=index)
         background_tasks.add_task(
             _regenerate_copy_draft, request_id, index, chat_id
         )
@@ -3868,6 +4177,19 @@ def _accept_update(
             ),
         }
 
+    topic_page = re.fullmatch(
+        r"rs:topic_page:([A-Za-z0-9-]+):(\d+)", callback_data
+    )
+    if topic_page:
+        request_id, index_text = topic_page.groups()
+        _refresh_topic_review(chat_id, request_id, index=int(index_text))
+        _send_short_confirmation(chat_id, request_id)
+        return {
+            "status": "topic_review_page",
+            "request_id": request_id,
+            "topic_index": int(index_text),
+        }
+
     topic_action = re.fullmatch(
         r"rs:topic_(approve|reject):([A-Za-z0-9-]+):(\d+)", callback_data
     )
@@ -3904,13 +4226,11 @@ def _accept_update(
             )
         if verb == "approve":
             RENDER_EXECUTOR.submit(_render_topic_approved, request_id, index, chat_id)
-            send(
-                chat_id,
-                f"16:9 Segment {index + 1} approved and queued. "
-                f"Up to {RIPPED_SHORTS_RENDER_WORKERS} total videos render at once.",
-            )
+            _refresh_topic_review(chat_id, request_id, index=index)
+            _send_short_confirmation(chat_id, request_id)
         else:
-            send(chat_id, f"16:9 Segment {index + 1} skipped.")
+            _refresh_topic_review(chat_id, request_id, index=index)
+            _send_short_confirmation(chat_id, request_id)
         return {
             "status": f"topic_{verb}",
             "request_id": request_id,
@@ -3965,12 +4285,8 @@ def _accept_update(
                 render_status="queued",
             )
             RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
-            send(
-                chat_id,
-                f"Short {index + 1} approved and queued for rendering. "
-                f"Up to {RIPPED_SHORTS_RENDER_WORKERS} clips render at once; the rest wait.\n"
-                f"{_render_progress_text(request_id)}",
-            )
+            _refresh_short_review_message(chat_id, request_id)
+            _send_short_confirmation(chat_id, request_id)
         else:
             _safe_log_candidate(
                 state,
@@ -3980,7 +4296,8 @@ def _accept_update(
                 user_id,
                 render_status="not_rendered",
             )
-            send(chat_id, f"Short {index + 1} rejected.")
+            _refresh_short_review_message(chat_id, request_id)
+            _send_short_confirmation(chat_id, request_id)
         return {"status": verb, "request_id": request_id, "short_index": index}
     resume_match = re.fullmatch(
         r"/resume(?:@rippedshortsbot)?(?:\s+latest)?", text, re.I
@@ -4245,7 +4562,8 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(state), now(), request_id),
             )
-        send(chat_id, f"🎬 16:9 Segment {index + 1} is now rendering.")
+        _refresh_topic_review(chat_id, request_id, index=index)
+        _send_short_confirmation(chat_id, request_id)
         segment = state["topic_result"]["segments"][index]
         video = _ensure_render_source(request_id, state)
         video_id = state["parsed"].get("video_id", request_id)
@@ -4278,11 +4596,8 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(latest_state), now(), request_id),
             )
-        send(
-            chat_id,
-            f"✅ 16:9 Segment {index + 1} rendered and uploaded to the Vid Title folder ({vid_title}):\n"
-            f"{rendered.get('segment_url', '')}",
-        )
+        _refresh_topic_review(chat_id, request_id, index=index)
+        _send_short_confirmation(chat_id, request_id)
         _notify_render_queue_complete(request_id, chat_id)
     except Exception as exc:
         logger.exception(
@@ -4353,11 +4668,8 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(state), now(), request_id),
             )
-        send(
-            chat_id,
-            f"🎬 Short {index + 1} is now rendering.\n"
-            f"{_render_progress_text(request_id)}",
-        )
+        _refresh_short_review_message(chat_id, request_id)
+        _send_short_confirmation(chat_id, request_id)
         user_id = str(
             (state.get("candidate_reviews") or {}).get(str(index), {}).get("user_id", "")
         )
@@ -4408,12 +4720,8 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             clip_url=clip.get("clip_url", ""),
             rendered_at=rendered_at,
         )
-        send(
-            chat_id,
-            f"✅ Short {index + 1} rendered and uploaded to the Vid Title folder ({vid_title}):\n"
-            f"{clip.get('clip_url', '')}\n"
-            f"{_render_progress_text(request_id)}",
-        )
+        _refresh_short_review_message(chat_id, request_id)
+        _send_short_confirmation(chat_id, request_id)
         _notify_render_queue_complete(request_id, chat_id)
     except Exception as exc:
         logger.exception(
