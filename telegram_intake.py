@@ -28,6 +28,7 @@ from source_ingestion import (
 )
 from google_drive import read_google_doc_text
 from google_sheets import get_rows
+from caption_checkpoints import caption_checkpoints
 from telegram_quick_edits import OPTIONS_TEXT, apply_quick_command, is_quick_command
 from clipmaster_review import (
     claims_update as clipmaster_claims_update,
@@ -981,24 +982,7 @@ def _caption_learning_checkpoint_map(request_id: str) -> dict[str, dict[str, str
         )
         return {}
 
-    result: dict[str, dict[str, str]] = {}
-    for row in rows:
-        if str(row.get("request_id") or "").strip() != request_id:
-            continue
-        asset_id = str(row.get("asset_id") or "").strip()
-        if not asset_id:
-            continue
-        decision = str(row.get("decision") or "").strip().upper()
-        if decision not in {"EDITED", "ACCEPTED"}:
-            continue
-        result[asset_id] = {
-            "social_caption": str(row.get("final_caption") or ""),
-            "video_title": str(row.get("final_title") or ""),
-            "video_description": str(row.get("final_description") or ""),
-            "hashtags": str(row.get("hashtags") or ""),
-            "copy_source": "CAPTION_LEARNING_CHECKPOINT",
-        }
-    return result
+    return caption_checkpoints(rows, request_id)
 
 
 def _log_copy_learning(
@@ -1576,15 +1560,6 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
             {**asset, **reviewed_copy.get(str(asset.get("asset_id") or ""), {})}
             for asset in assets
         ]
-        checkpoint_copy = _caption_learning_checkpoint_map(request_id)
-        if checkpoint_copy:
-            assets = [
-                {
-                    **asset,
-                    **checkpoint_copy.get(str(asset.get("asset_id") or ""), {}),
-                }
-                for asset in assets
-            ]
     else:
         # Compatibility fallback for jobs created before the copy-review release.
         assets = _generate_schedule_copy(
@@ -1593,6 +1568,15 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
             _state_vid_title(state),
             str((state.get("parsed") or {}).get("source_value") or ""),
         )
+    checkpoint_copy = _caption_learning_checkpoint_map(request_id)
+    if checkpoint_copy:
+        assets = [
+            {
+                **asset,
+                **checkpoint_copy.get(str(asset.get("asset_id") or ""), {}),
+            }
+            for asset in assets
+        ]
     payload = {
         "request_id": request_id,
         "youtube_video_id": str(parsed.get("video_id") or ""),
