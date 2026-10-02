@@ -152,26 +152,71 @@ def _stable_layout_sections(samples, energy, duration: float):
     return sections
 
 
-def _crop_x(center: float, width: int, crop_width: int) -> int:
-    return max(0, min(width - crop_width, int(center * width) - crop_width // 2))
+def _participant_horizontal_zones(
+    left: float, right: float, width: int
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Split the source into hard speaker lanes using the midpoint between faces."""
+    boundary = int(round(((left + right) / 2.0) * width))
+    gutter_ratio = min(
+        0.08, max(0.0, float(os.getenv("PARTICIPANT_BOUNDARY_GUTTER_RATIO", "0.015")))
+    )
+    gutter = int(round(width * gutter_ratio))
+    left_end = max(2, min(width - 2, boundary - gutter))
+    right_start = min(width - 2, max(2, boundary + gutter))
+    if right_start <= left_end:
+        midpoint = max(2, min(width - 2, boundary))
+        left_end = midpoint
+        right_start = midpoint
+    return (0, left_end), (right_start, width)
+
+
+def _bounded_crop_x(
+    center: float, width: int, crop_width: int, zone: tuple[int, int]
+) -> int:
+    zone_start, zone_end = zone
+    usable_width = max(2, zone_end - zone_start)
+    crop_width = min(crop_width, usable_width)
+    preferred = int(round(center * width)) - crop_width // 2
+    return max(zone_start, min(zone_end - crop_width, preferred))
+
+
+def _stacked_panel_geometry(
+    center: float, width: int, height: int, zone: tuple[int, int]
+) -> tuple[int, int, int, int]:
+    """Build one 9:8 panel without crossing the participant boundary."""
+    zone_width = max(2, zone[1] - zone[0])
+    crop_width = min(zone_width, int(height * 9 / 8))
+    crop_width = max(2, crop_width - crop_width % 2)
+    crop_height = height
+    if crop_width < int(height * 9 / 8):
+        crop_height = min(height, int(crop_width * 8 / 9))
+        crop_height = max(2, crop_height - crop_height % 2)
+    x = _bounded_crop_x(center, width, crop_width, zone)
+    return crop_width, crop_height, x, 0
 
 
 def _section_filter(label: str, layout: str, left: float, right: float, width: int, height: int):
+    zones = _participant_horizontal_zones(left, right, width)
     if layout in {"A", "B"}:
         crop_width = min(width, int(height * 9 / 16))
         crop_width = max(2, crop_width - crop_width % 2)
-        x = _crop_x(left if layout == "A" else right, width, crop_width)
+        center = left if layout == "A" else right
+        zone = zones[0] if layout == "A" else zones[1]
+        # Full-screen active-speaker crops are also forbidden from crossing
+        # into the other participant's lane.
+        crop_width = min(crop_width, max(2, zone[1] - zone[0]))
+        crop_width = max(2, crop_width - crop_width % 2)
+        x = _bounded_crop_x(center, width, crop_width, zone)
         return f"[{label}]crop={crop_width}:{height}:{x}:0,scale=1080:1920,setsar=1[v{label[1:]}]"
-    crop_width = min(width, int(height * 9 / 8))
-    crop_width = max(2, crop_width - crop_width % 2)
-    lx, rx = _crop_x(left, width, crop_width), _crop_x(right, width, crop_width)
+    first = _stacked_panel_geometry(left, width, height, zones[0])
+    second = _stacked_panel_geometry(right, width, height, zones[1])
     index = label[1:]
     return (
         f"[{label}]split=2[{label}a][{label}b];"
-        f"[{label}a]crop={crop_width}:{height}:{lx}:0,scale=1080:960:"
+        f"[{label}a]crop={first[0]}:{first[1]}:{first[2]}:{first[3]},scale=1080:960:"
         "force_original_aspect_ratio=increase,crop=1080:960,setsar=1"
         f"[top{index}];"
-        f"[{label}b]crop={crop_width}:{height}:{rx}:0,scale=1080:960:"
+        f"[{label}b]crop={second[0]}:{second[1]}:{second[2]}:{second[3]},scale=1080:960:"
         "force_original_aspect_ratio=increase,crop=1080:960,setsar=1"
         f"[bottom{index}];[top{index}][bottom{index}]vstack=2[v{index}]"
     )
