@@ -16,6 +16,12 @@ class DualParticipantFramingTests(unittest.TestCase):
         self.assertIn("[p1]crop=", SOURCE)
         self.assertIn("[top][bottom]vstack=inputs=2[v]", SOURCE)
 
+    def test_stacked_crops_have_hard_participant_boundaries(self):
+        self.assertIn("def _participant_horizontal_zones(", SOURCE)
+        self.assertIn("PARTICIPANT_BOUNDARY_GUTTER_RATIO", SOURCE)
+        self.assertIn("def _bounded_crop_x(", SOURCE)
+        self.assertIn("crop vertically rather than stealing pixels from the other speaker", SOURCE)
+
     def test_single_speaker_path_remains_fallback(self):
         self.assertIn("return _build_crop_filter(video_path, start, duration), False", SOURCE)
 

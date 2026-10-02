@@ -788,22 +788,73 @@ def _estimate_dual_participant_tracks(
     return left, right
 
 
+def _participant_horizontal_zones(
+    width: int, centers: tuple[float, float]
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Create non-overlapping source lanes so one speaker crop never bleeds into the other."""
+    left, right = sorted(centers)
+    boundary = int(round(((left + right) / 2.0) * width))
+    gutter_ratio = min(
+        0.08, max(0.0, float(os.getenv("PARTICIPANT_BOUNDARY_GUTTER_RATIO", "0.015")))
+    )
+    gutter = int(round(width * gutter_ratio))
+    left_end = max(2, min(width - 2, boundary - gutter))
+    right_start = min(width - 2, max(2, boundary + gutter))
+    if right_start <= left_end:
+        midpoint = max(2, min(width - 2, boundary))
+        left_end = midpoint
+        right_start = midpoint
+    return (0, left_end), (right_start, width)
+
+
+def _bounded_crop_x(
+    center: float, width: int, crop_width: int, zone: tuple[int, int]
+) -> int:
+    """Center a crop on a face while keeping every pixel inside its participant lane."""
+    zone_start, zone_end = zone
+    usable_width = max(2, zone_end - zone_start)
+    crop_width = min(crop_width, usable_width)
+    preferred = int(round(center * width)) - crop_width // 2
+    return max(zone_start, min(zone_end - crop_width, preferred))
+
+
+def _stacked_panel_geometry(
+    width: int,
+    height: int,
+    center: float,
+    zone: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Return a 9:8 panel crop that stays entirely inside one participant lane."""
+    zone_start, zone_end = zone
+    zone_width = max(2, zone_end - zone_start)
+    ideal_width = min(zone_width, int(height * 9 / 8))
+    ideal_width = max(2, ideal_width - ideal_width % 2)
+    crop_width = ideal_width
+    crop_height = height
+    if crop_width < int(height * 9 / 8):
+        # A split-screen lane can be narrower than a 9:8 panel. In that case,
+        # crop vertically rather than stealing pixels from the other speaker.
+        crop_height = min(height, int(crop_width * 8 / 9))
+        crop_height = max(2, crop_height - crop_height % 2)
+    x = _bounded_crop_x(center, width, crop_width, zone)
+    # Top-anchor the reduced-height crop to protect heads/faces.
+    y = 0
+    return crop_width, crop_height, x, y
+
+
 def _stacked_participant_filter(
     width: int, height: int, centers: tuple[float, float]
 ) -> str:
-    """Independently crop two participants and stack them in a 9:16 canvas."""
-    participant_width = min(width, int(height * 9 / 8))
-    participant_width = max(2, participant_width - participant_width % 2)
-    positions = [
-        max(0, min(width - participant_width, int(center * width) - participant_width // 2))
-        for center in centers
-    ]
+    """Crop each participant only inside their source lane, then stack them."""
+    zones = _participant_horizontal_zones(width, centers)
+    first = _stacked_panel_geometry(width, height, centers[0], zones[0])
+    second = _stacked_panel_geometry(width, height, centers[1], zones[1])
     return (
         f"split=2[p0][p1];"
-        f"[p0]crop={participant_width}:{height}:{positions[0]}:0,"
+        f"[p0]crop={first[0]}:{first[1]}:{first[2]}:{first[3]},"
         "scale=1080:960:force_original_aspect_ratio=increase,"
         "crop=1080:960[top];"
-        f"[p1]crop={participant_width}:{height}:{positions[1]}:0,"
+        f"[p1]crop={second[0]}:{second[1]}:{second[2]}:{second[3]},"
         "scale=1080:960:force_original_aspect_ratio=increase,"
         "crop=1080:960[bottom];"
         "[top][bottom]vstack=inputs=2[v]"

@@ -104,74 +104,165 @@ def _detect_tracks(video_path: Path, start: float, duration: float, load_cascade
 
 
 def _stable_layout_sections(samples, energy, duration: float):
+    """Choose deliberate A/B/STACKED edits without delaying a clear speaker handoff."""
     if len(samples) < 4:
         return []
     motions = [max(a[1], b[1]) for _, a, b in samples]
     motion_floor = max(0.008, median(motions) * 0.65)
     audio_values = [value for value in energy if value > 0]
     audio_floor = median(audio_values) * 0.35 if audio_values else 0.0
-    confidence_ratio = max(1.15, float(os.getenv("ACTIVE_SPEAKER_CONFIDENCE_RATIO", "1.35")))
+    confidence_ratio = max(
+        1.15, float(os.getenv("ACTIVE_SPEAKER_CONFIDENCE_RATIO", "1.35"))
+    )
+    strong_ratio = max(
+        confidence_ratio,
+        float(os.getenv("ACTIVE_SPEAKER_STRONG_CONFIDENCE_RATIO", "1.80")),
+    )
     desired = []
     for timestamp, left, right in samples:
         speaking_audio = _energy_at(energy, timestamp) >= audio_floor if energy else True
         left_score = left[1] if speaking_audio else 0.0
         right_score = right[1] if speaking_audio else 0.0
-        if max(left_score, right_score) < motion_floor:
+        peak = max(left_score, right_score)
+        if peak < motion_floor:
             layout = "STACKED"
+            strength = 0.0
         elif left_score >= right_score * confidence_ratio:
             layout = "A"
+            strength = left_score / max(right_score, 1e-6)
         elif right_score >= left_score * confidence_ratio:
             layout = "B"
+            strength = right_score / max(left_score, 1e-6)
         else:
             layout = "STACKED"
-        desired.append((timestamp, layout, left[0], right[0]))
+            strength = max(left_score, right_score) / max(min(left_score, right_score), 1e-6)
+        desired.append((timestamp, layout, left[0], right[0], strength))
 
     confirmations = max(2, int(os.getenv("ACTIVE_SPEAKER_CONFIRMATIONS", "3")))
-    minimum_hold = max(1.5, float(os.getenv("ACTIVE_SPEAKER_MIN_HOLD_SECONDS", "2.5")))
+    switch_confirmations = max(
+        2, int(os.getenv("ACTIVE_SPEAKER_SWITCH_CONFIRMATIONS", "2"))
+    )
+    minimum_hold = max(
+        2.5, float(os.getenv("ACTIVE_SPEAKER_MIN_HOLD_SECONDS", "3.0"))
+    )
     current = "STACKED"
     pending = None
     pending_count = 0
+    pending_strength = 0.0
     last_change = 0.0
     sections = [(0.0, current, desired[0][2], desired[0][3])]
-    for timestamp, layout, left, right in desired:
+
+    for timestamp, layout, left, right, strength in desired:
         if layout == current:
-            pending, pending_count = None, 0
+            pending, pending_count, pending_strength = None, 0, 0.0
             continue
+
         if layout == pending:
             pending_count += 1
+            pending_strength = max(pending_strength, strength)
         else:
-            pending, pending_count = layout, 1
-        if pending_count >= confirmations and timestamp - last_change >= minimum_hold:
-            current = layout
+            pending, pending_count, pending_strength = layout, 1, strength
+
+        # A confidently detected speaking person is a real editorial event, not
+        # camera jitter. Allow that handoff as soon as it is confirmed, even when
+        # the previous composition has not yet reached the normal ~3s hold.
+        clear_speaker_handoff = (
+            pending in {"A", "B"}
+            and pending_strength >= strong_ratio
+            and pending_count >= switch_confirmations
+        )
+
+        # Ambiguous transitions (especially into STACKED) still obey the hold so
+        # the reel does not ping-pong when both people move or detection is noisy.
+        normal_transition = (
+            pending_count >= confirmations
+            and timestamp - last_change >= minimum_hold
+        )
+
+        if clear_speaker_handoff or normal_transition:
+            current = pending
             sections.append((timestamp, current, left, right))
             last_change = timestamp
-            pending, pending_count = None, 0
+            logger.info(
+                "Active-speaker transition t=%.2f layout=%s reason=%s confidence=%.2f",
+                timestamp,
+                current,
+                "clear-speaker-handoff" if clear_speaker_handoff else "stable-layout",
+                pending_strength,
+            )
+            pending, pending_count, pending_strength = None, 0, 0.0
+
     # A useful active-speaker plan must contain at least one confident full frame.
     if not any(item[1] in {"A", "B"} for item in sections):
         return []
     return sections
 
 
-def _crop_x(center: float, width: int, crop_width: int) -> int:
-    return max(0, min(width - crop_width, int(center * width) - crop_width // 2))
+def _participant_horizontal_zones(
+    left: float, right: float, width: int
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Split the source into hard speaker lanes using the midpoint between faces."""
+    boundary = int(round(((left + right) / 2.0) * width))
+    gutter_ratio = min(
+        0.08, max(0.0, float(os.getenv("PARTICIPANT_BOUNDARY_GUTTER_RATIO", "0.015")))
+    )
+    gutter = int(round(width * gutter_ratio))
+    left_end = max(2, min(width - 2, boundary - gutter))
+    right_start = min(width - 2, max(2, boundary + gutter))
+    if right_start <= left_end:
+        midpoint = max(2, min(width - 2, boundary))
+        left_end = midpoint
+        right_start = midpoint
+    return (0, left_end), (right_start, width)
+
+
+def _bounded_crop_x(
+    center: float, width: int, crop_width: int, zone: tuple[int, int]
+) -> int:
+    zone_start, zone_end = zone
+    usable_width = max(2, zone_end - zone_start)
+    crop_width = min(crop_width, usable_width)
+    preferred = int(round(center * width)) - crop_width // 2
+    return max(zone_start, min(zone_end - crop_width, preferred))
+
+
+def _stacked_panel_geometry(
+    center: float, width: int, height: int, zone: tuple[int, int]
+) -> tuple[int, int, int, int]:
+    """Build one 9:8 panel without crossing the participant boundary."""
+    zone_width = max(2, zone[1] - zone[0])
+    crop_width = min(zone_width, int(height * 9 / 8))
+    crop_width = max(2, crop_width - crop_width % 2)
+    crop_height = height
+    if crop_width < int(height * 9 / 8):
+        crop_height = min(height, int(crop_width * 8 / 9))
+        crop_height = max(2, crop_height - crop_height % 2)
+    x = _bounded_crop_x(center, width, crop_width, zone)
+    return crop_width, crop_height, x, 0
 
 
 def _section_filter(label: str, layout: str, left: float, right: float, width: int, height: int):
+    zones = _participant_horizontal_zones(left, right, width)
     if layout in {"A", "B"}:
         crop_width = min(width, int(height * 9 / 16))
         crop_width = max(2, crop_width - crop_width % 2)
-        x = _crop_x(left if layout == "A" else right, width, crop_width)
+        center = left if layout == "A" else right
+        zone = zones[0] if layout == "A" else zones[1]
+        # Full-screen active-speaker crops are also forbidden from crossing
+        # into the other participant's lane.
+        crop_width = min(crop_width, max(2, zone[1] - zone[0]))
+        crop_width = max(2, crop_width - crop_width % 2)
+        x = _bounded_crop_x(center, width, crop_width, zone)
         return f"[{label}]crop={crop_width}:{height}:{x}:0,scale=1080:1920,setsar=1[v{label[1:]}]"
-    crop_width = min(width, int(height * 9 / 8))
-    crop_width = max(2, crop_width - crop_width % 2)
-    lx, rx = _crop_x(left, width, crop_width), _crop_x(right, width, crop_width)
+    first = _stacked_panel_geometry(left, width, height, zones[0])
+    second = _stacked_panel_geometry(right, width, height, zones[1])
     index = label[1:]
     return (
         f"[{label}]split=2[{label}a][{label}b];"
-        f"[{label}a]crop={crop_width}:{height}:{lx}:0,scale=1080:960:"
+        f"[{label}a]crop={first[0]}:{first[1]}:{first[2]}:{first[3]},scale=1080:960:"
         "force_original_aspect_ratio=increase,crop=1080:960,setsar=1"
         f"[top{index}];"
-        f"[{label}b]crop={crop_width}:{height}:{rx}:0,scale=1080:960:"
+        f"[{label}b]crop={second[0]}:{second[1]}:{second[2]}:{second[3]},scale=1080:960:"
         "force_original_aspect_ratio=increase,crop=1080:960,setsar=1"
         f"[bottom{index}];[top{index}][bottom{index}]vstack=2[v{index}]"
     )

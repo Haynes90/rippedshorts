@@ -23,6 +23,25 @@ class ActiveSpeakerLayoutTests(unittest.TestCase):
         self.assertIn("concat=n=", ACTIVE)
         self.assertIn("vstack=2", ACTIVE)
 
+    def test_active_speaker_crops_respect_participant_lanes(self):
+        self.assertIn("def _participant_horizontal_zones(", ACTIVE)
+        self.assertIn("PARTICIPANT_BOUNDARY_GUTTER_RATIO", ACTIVE)
+        self.assertIn("def _bounded_crop_x(", ACTIVE)
+        self.assertIn("forbidden from crossing", ACTIVE)
+
+
+    def test_clear_speaker_handoff_can_bypass_normal_hold(self):
+        self.assertIn('ACTIVE_SPEAKER_MIN_HOLD_SECONDS", "3.0"', ACTIVE)
+        self.assertIn("ACTIVE_SPEAKER_SWITCH_CONFIRMATIONS", ACTIVE)
+        self.assertIn("ACTIVE_SPEAKER_STRONG_CONFIDENCE_RATIO", ACTIVE)
+        self.assertIn("clear_speaker_handoff", ACTIVE)
+        self.assertIn("if clear_speaker_handoff or normal_transition", ACTIVE)
+
+    def test_ambiguous_state_still_uses_stacked_and_hold(self):
+        self.assertIn('layout = "STACKED"', ACTIVE)
+        self.assertIn("normal_transition", ACTIVE)
+        self.assertIn("timestamp - last_change >= minimum_hold", ACTIVE)
+
     def test_failure_retains_deterministic_fallback(self):
         self.assertIn("return None", ACTIVE)
         self.assertIn("if active_filter:", MAIN)
