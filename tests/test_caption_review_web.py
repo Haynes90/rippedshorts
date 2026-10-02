@@ -34,3 +34,10 @@ def test_mobile_page_groups_source_and_copy_assets():
     assert "16:9 Highlight" in PORTAL
     assert "Finish &amp; Schedule" in PORTAL
     assert "Saved ✓" in PORTAL
+
+
+def test_finish_saves_current_written_copy_before_scheduling():
+    assert "Saving edits…" in PORTAL
+    assert "document.querySelectorAll('.asset')" in PORTAL
+    assert "await saveAsset(index, 'save')" in PORTAL
+    assert "final written copy was saved and sent" in PORTAL
