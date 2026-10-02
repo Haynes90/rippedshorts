@@ -104,48 +104,94 @@ def _detect_tracks(video_path: Path, start: float, duration: float, load_cascade
 
 
 def _stable_layout_sections(samples, energy, duration: float):
+    """Choose deliberate A/B/STACKED edits without delaying a clear speaker handoff."""
     if len(samples) < 4:
         return []
     motions = [max(a[1], b[1]) for _, a, b in samples]
     motion_floor = max(0.008, median(motions) * 0.65)
     audio_values = [value for value in energy if value > 0]
     audio_floor = median(audio_values) * 0.35 if audio_values else 0.0
-    confidence_ratio = max(1.15, float(os.getenv("ACTIVE_SPEAKER_CONFIDENCE_RATIO", "1.35")))
+    confidence_ratio = max(
+        1.15, float(os.getenv("ACTIVE_SPEAKER_CONFIDENCE_RATIO", "1.35"))
+    )
+    strong_ratio = max(
+        confidence_ratio,
+        float(os.getenv("ACTIVE_SPEAKER_STRONG_CONFIDENCE_RATIO", "1.80")),
+    )
     desired = []
     for timestamp, left, right in samples:
         speaking_audio = _energy_at(energy, timestamp) >= audio_floor if energy else True
         left_score = left[1] if speaking_audio else 0.0
         right_score = right[1] if speaking_audio else 0.0
-        if max(left_score, right_score) < motion_floor:
+        peak = max(left_score, right_score)
+        if peak < motion_floor:
             layout = "STACKED"
+            strength = 0.0
         elif left_score >= right_score * confidence_ratio:
             layout = "A"
+            strength = left_score / max(right_score, 1e-6)
         elif right_score >= left_score * confidence_ratio:
             layout = "B"
+            strength = right_score / max(left_score, 1e-6)
         else:
             layout = "STACKED"
-        desired.append((timestamp, layout, left[0], right[0]))
+            strength = max(left_score, right_score) / max(min(left_score, right_score), 1e-6)
+        desired.append((timestamp, layout, left[0], right[0], strength))
 
     confirmations = max(2, int(os.getenv("ACTIVE_SPEAKER_CONFIRMATIONS", "3")))
-    minimum_hold = max(1.5, float(os.getenv("ACTIVE_SPEAKER_MIN_HOLD_SECONDS", "2.5")))
+    switch_confirmations = max(
+        2, int(os.getenv("ACTIVE_SPEAKER_SWITCH_CONFIRMATIONS", "2"))
+    )
+    minimum_hold = max(
+        2.5, float(os.getenv("ACTIVE_SPEAKER_MIN_HOLD_SECONDS", "3.0"))
+    )
     current = "STACKED"
     pending = None
     pending_count = 0
+    pending_strength = 0.0
     last_change = 0.0
     sections = [(0.0, current, desired[0][2], desired[0][3])]
-    for timestamp, layout, left, right in desired:
+
+    for timestamp, layout, left, right, strength in desired:
         if layout == current:
-            pending, pending_count = None, 0
+            pending, pending_count, pending_strength = None, 0, 0.0
             continue
+
         if layout == pending:
             pending_count += 1
+            pending_strength = max(pending_strength, strength)
         else:
-            pending, pending_count = layout, 1
-        if pending_count >= confirmations and timestamp - last_change >= minimum_hold:
-            current = layout
+            pending, pending_count, pending_strength = layout, 1, strength
+
+        # A confidently detected speaking person is a real editorial event, not
+        # camera jitter. Allow that handoff as soon as it is confirmed, even when
+        # the previous composition has not yet reached the normal ~3s hold.
+        clear_speaker_handoff = (
+            pending in {"A", "B"}
+            and pending_strength >= strong_ratio
+            and pending_count >= switch_confirmations
+        )
+
+        # Ambiguous transitions (especially into STACKED) still obey the hold so
+        # the reel does not ping-pong when both people move or detection is noisy.
+        normal_transition = (
+            pending_count >= confirmations
+            and timestamp - last_change >= minimum_hold
+        )
+
+        if clear_speaker_handoff or normal_transition:
+            current = pending
             sections.append((timestamp, current, left, right))
             last_change = timestamp
-            pending, pending_count = None, 0
+            logger.info(
+                "Active-speaker transition t=%.2f layout=%s reason=%s confidence=%.2f",
+                timestamp,
+                current,
+                "clear-speaker-handoff" if clear_speaker_handoff else "stable-layout",
+                pending_strength,
+            )
+            pending, pending_count, pending_strength = None, 0, 0.0
+
     # A useful active-speaker plan must contain at least one confident full frame.
     if not any(item[1] in {"A", "B"} for item in sections):
         return []
