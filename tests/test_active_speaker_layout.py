@@ -23,6 +23,12 @@ class ActiveSpeakerLayoutTests(unittest.TestCase):
         self.assertIn("concat=n=", ACTIVE)
         self.assertIn("vstack=2", ACTIVE)
 
+    def test_active_speaker_crops_respect_participant_lanes(self):
+        self.assertIn("def _participant_horizontal_zones(", ACTIVE)
+        self.assertIn("PARTICIPANT_BOUNDARY_GUTTER_RATIO", ACTIVE)
+        self.assertIn("def _bounded_crop_x(", ACTIVE)
+        self.assertIn("forbidden from crossing", ACTIVE)
+
     def test_failure_retains_deterministic_fallback(self):
         self.assertIn("return None", ACTIVE)
         self.assertIn("if active_filter:", MAIN)
