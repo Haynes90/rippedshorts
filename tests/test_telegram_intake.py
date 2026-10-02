@@ -389,6 +389,14 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn('"video_description"', SOURCE)
         self.assertIn("BRAND RULE", SOURCE)
 
+    def test_short_caption_keeps_hashtags_separate_and_clean(self):
+        self.assertIn("def _normalize_hashtags(", SOURCE)
+        self.assertIn("Return hashtags only in the ", SOURCE)
+        self.assertIn("do not put hashtags inside social_caption", SOURCE)
+        self.assertIn("Do not label sections with Hook:", SOURCE)
+        self.assertIn("_normalize_hashtags(copy.get(\"hashtags\"))", SOURCE)
+        self.assertIn('\"hashtags\": _normalize_hashtags(asset.get(\"hashtags\"))', SOURCE)
+
     def test_schedule_now_requires_copy_review(self):
         self.assertIn('"copy_review_requested_at"', SOURCE)
         self.assertIn("rs:copy_edit_caption:", SOURCE)
