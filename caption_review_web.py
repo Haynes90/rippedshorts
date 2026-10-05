@@ -431,13 +431,21 @@ async function finishReview() {{
   const button = document.getElementById('finishButton');
   const globalStatus = document.getElementById('globalStatus');
   button.disabled = true;
-  button.textContent = 'Finishing…';
+  button.textContent = 'Saving edits…';
   try {{
+    // Finish must use exactly what is currently written in the review fields,
+    // even if the user did not tap Save on each individual card first.
+    const cards = Array.from(document.querySelectorAll('.asset'));
+    for (const card of cards) {{
+      const index = Number(card.dataset.index);
+      await saveAsset(index, 'save');
+    }}
+    button.textContent = 'Finishing…';
     const response = await fetch(`/api/ripped-shorts/review/${{TOKEN}}/finish`, {{method:'POST'}});
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Finish failed');
     button.textContent = 'Sent to Schedule Master ✓';
-    globalStatus.textContent = 'Your saved copy and Drive videos remain permanent. This review link can expire safely.';
+    globalStatus.textContent = 'Your final written copy was saved and sent with the Drive videos.';
   }} catch(error) {{
     button.disabled = false;
     button.textContent = 'Finish & Schedule';
