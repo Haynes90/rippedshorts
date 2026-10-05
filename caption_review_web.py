@@ -354,47 +354,47 @@ function updateProgress(data=state) {{
   const completed = data.completed || 0;
   const regenerated = data.regenerated || 0;
   document.getElementById('progressText').textContent =
-    `${completed}/${total} reviewed • ${regenerated} regenerated`;
+    `${{completed}}/${{total}} reviewed • ${{regenerated}} regenerated`;
   document.getElementById('bar').style.width =
-    total ? `${Math.round((completed/total)*100)}%` : '0%';
+    total ? `${{Math.round((completed/total)*100)}}%` : '0%';
 }}
 updateProgress();
 
 function bodyFor(index, action='save') {{
-  const card = document.getElementById(`asset-${index}`);
+  const card = document.getElementById(`asset-${{index}}`);
   const type = card.dataset.type;
   const body = {{action}};
   if (type === '9:16_SHORT') {{
-    body.social_caption = document.getElementById(`caption-${index}`).value;
-    body.hashtags = document.getElementById(`hashtags-${index}`).value;
+    body.social_caption = document.getElementById(`caption-${{index}}`).value;
+    body.hashtags = document.getElementById(`hashtags-${{index}}`).value;
   }} else {{
-    body.video_title = document.getElementById(`title-${index}`).value;
-    body.video_description = document.getElementById(`description-${index}`).value;
-    body.hashtags = document.getElementById(`hashtags-${index}`).value;
+    body.video_title = document.getElementById(`title-${{index}}`).value;
+    body.video_description = document.getElementById(`description-${{index}}`).value;
+    body.hashtags = document.getElementById(`hashtags-${{index}}`).value;
   }}
   return body;
 }}
 
 async function saveAsset(index, action='save') {{
-  const saved = document.getElementById(`saved-${index}`);
+  const saved = document.getElementById(`saved-${{index}}`);
   saved.textContent = 'Saving…';
   try {{
-    const response = await fetch(`/api/ripped-shorts/review/${TOKEN}/asset/${index}`, {{
+    const response = await fetch(`/api/ripped-shorts/review/${{TOKEN}}/asset/${{index}}`, {{
       method:'POST',
       headers:{{'Content-Type':'application/json'}},
       body:JSON.stringify(bodyFor(index, action))
     }});
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Save failed');
-    saved.textContent = `Saved ✓ ${new Date().toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}})}`;
-    document.getElementById(`status-${index}`).textContent =
+    saved.textContent = `Saved ✓ ${{new Date().toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}})}}`;
+    document.getElementById(`status-${{index}}`).textContent =
       action === 'keep' ? 'Kept' : 'Edited';
     state.completed = data.completed;
     state.regenerated = data.regenerated;
     updateProgress();
     return data;
   }} catch (error) {{
-    saved.textContent = `Not saved — ${error.message}`;
+    saved.textContent = `Not saved — ${{error.message}}`;
     throw error;
   }}
 }}
@@ -404,26 +404,26 @@ async function keepAsset(index) {{
 }}
 
 async function regenAsset(index) {{
-  const saved = document.getElementById(`saved-${index}`);
+  const saved = document.getElementById(`saved-${{index}}`);
   saved.textContent = 'Regenerating…';
   try {{
-    const response = await fetch(`/api/ripped-shorts/review/${TOKEN}/asset/${index}/regenerate`, {{method:'POST'}});
+    const response = await fetch(`/api/ripped-shorts/review/${{TOKEN}}/asset/${{index}}/regenerate`, {{method:'POST'}});
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Regeneration failed');
     if (data.asset_type === '9:16_SHORT') {{
-      document.getElementById(`caption-${index}`).value = data.social_caption || '';
-      document.getElementById(`hashtags-${index}`).value = data.hashtags || '';
+      document.getElementById(`caption-${{index}}`).value = data.social_caption || '';
+      document.getElementById(`hashtags-${{index}}`).value = data.hashtags || '';
     }} else {{
-      document.getElementById(`title-${index}`).value = data.video_title || '';
-      document.getElementById(`description-${index}`).value = data.video_description || '';
-      document.getElementById(`hashtags-${index}`).value = data.hashtags || '';
+      document.getElementById(`title-${{index}}`).value = data.video_title || '';
+      document.getElementById(`description-${{index}}`).value = data.video_description || '';
+      document.getElementById(`hashtags-${{index}}`).value = data.hashtags || '';
     }}
-    document.getElementById(`status-${index}`).textContent = 'Pending';
+    document.getElementById(`status-${{index}}`).textContent = 'Pending';
     saved.textContent = 'New draft generated — review and Save or Keep.';
     state.regenerated = data.regenerated;
     updateProgress();
   }} catch(error) {{
-    saved.textContent = `Regeneration failed — ${error.message}`;
+    saved.textContent = `Regeneration failed — ${{error.message}}`;
   }}
 }}
 
@@ -441,7 +441,7 @@ async function finishReview() {{
       await saveAsset(index, 'save');
     }}
     button.textContent = 'Finishing…';
-    const response = await fetch(`/api/ripped-shorts/review/${TOKEN}/finish`, {{method:'POST'}});
+    const response = await fetch(`/api/ripped-shorts/review/${{TOKEN}}/finish`, {{method:'POST'}});
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Finish failed');
     button.textContent = 'Sent to Schedule Master ✓';
@@ -449,7 +449,7 @@ async function finishReview() {{
   }} catch(error) {{
     button.disabled = false;
     button.textContent = 'Finish & Schedule';
-    globalStatus.textContent = `Could not finish: ${error.message}`;
+    globalStatus.textContent = `Could not finish: ${{error.message}}`;
   }}
 }}
 </script>
