@@ -1010,6 +1010,35 @@ def _log_copy_learning(
         logger.exception("Could not record Caption Learning rows request_id=%s", request_id)
 
 
+def _normalize_hashtags(value: Any) -> str:
+    """Return clean space-separated hashtags from model strings or arrays."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        parts = [str(item or "").strip() for item in value]
+        return " ".join(part for part in parts if part)
+    if isinstance(value, dict):
+        parts = [str(item or "").strip() for item in value.values()]
+        return " ".join(part for part in parts if part)
+    text = str(value).strip()
+    if not text:
+        return ""
+    # Recover legacy/model output that arrived as a serialized list instead of text.
+    if text[:1] in {"[", "("} and text[-1:] in {"]", ")"}:
+        try:
+            import ast
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, (list, tuple, set)):
+                return " ".join(
+                    str(item or "").strip()
+                    for item in parsed
+                    if str(item or "").strip()
+                )
+        except (ValueError, SyntaxError):
+            pass
+    return text
+
+
 def _generate_schedule_copy(
     assets: list[dict[str, Any]],
     show_id: str,
@@ -1313,7 +1342,9 @@ def _generate_schedule_copy(
         "Return JSON with an assets array; every item must contain asset_id, "
         "social_caption, video_title, video_description, and hashtags. "
         "For 9:16, write an engaging natural social caption with a hook, useful "
-        "context, attribution when known, a light CTA, and a few relevant hashtags. "
+        "context, attribution when known, and a light CTA. Return hashtags only in the "
+        "separate hashtags field; do not put hashtags inside social_caption. Do not label "
+        "sections with Hook:, Caption:, CTA:, or Hashtags:. "
         "For 16:9, write a compelling YouTube/Facebook title and a fuller description. "
         "Put a unique two- or three-sentence hook and summary first. Do not repeat the title. "
         "The system will then append the mandatory source credit, original-video URL, and "
@@ -1355,7 +1386,7 @@ def _generate_schedule_copy(
         enriched = []
         for item in fallback:
             copy = generated.get(str(item["asset_id"])) or {}
-            generated_hashtags = str(copy.get("hashtags") or "").strip()
+            generated_hashtags = _normalize_hashtags(copy.get("hashtags"))
             enriched.append(
                 {
                     **item,
@@ -1438,7 +1469,7 @@ def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> 
             "social_caption": str(asset.get("social_caption") or ""),
             "video_title": str(asset.get("video_title") or asset.get("title") or ""),
             "video_description": str(asset.get("video_description") or ""),
-            "hashtags": str(asset.get("hashtags") or ""),
+            "hashtags": _normalize_hashtags(asset.get("hashtags")),
             "copy_source": str(asset.get("copy_source") or ""),
         }
         ordered = [row.get(header, "") for header in headers]
