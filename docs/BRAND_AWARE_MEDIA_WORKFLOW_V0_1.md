@@ -122,3 +122,17 @@ Native Instagram collaboration invitations are NOT equivalent to caption @mentio
 ## Confirmed scope update — batch creator approval on web review (2026-10-29)
 
 The user specifically chose **one confirmation at the top of the existing website for the whole batch**. Present creator identities and proposed Instagram collaborators in a single **Who's featured?** section; a single approval covers all approved clips in that batch (including 9:16 and 16:9 where selected). Keep separate caption/title editing for each clip. Save the creator decision and propagate unchanged to every accepted delivery. No repeated creator prompts for individual clips. **Do not build per-clip collaborator customization in this version**; later versions may add it. Account-to-creator associations still require identity verification, and native invite behavior must be capability-checked rather than equated to mentions.
+
+## Scheduling requirement — source-aware interleaving (confirmed)
+
+For approved clips from multiple original source videos, Schedule Master should **interleave distinct sources** instead of exhausting all clips from one video before moving to the next. Example: `A1 → B1 → C1 → A2 → B2 → A3 → C2` (subject to eligibility). Sources are grouped by stable source video ID / source group, **not** by display title. This is controlled rotation, not unpredictable random reshuffling.
+
+- Preserve brand separation, configured daily posting cadence, time windows, minimum gaps, release/approval dates, human copy, locked slots, source spacing, duplicate suppression and 9:16 vs. 16:9 scheduling lanes.
+- Favor another eligible source when multiple sources are ready; do not require strict round-robin if doing so would prevent filling today's slots or violate priority/spacing.
+- Retain original clip order **within each source** by default, unless an explicitly approved clip priority overrides it.
+- New approved source B or C should enter the **next available eligible** scheduling window, not be forced to wait behind all already-queued clips from A. Rebalance only future, unposted, unlocked queue slots; never move published posts or silently modify explicitly locked schedules.
+- If only source A is eligible, continue A while honoring cadence and spacing instead of leaving avoidable daily gaps.
+- Reconciliation should be stable: repeated audits with unchanged inputs do not reshuffle the entire calendar. Use deterministic tie-breaking and preserve idempotency/companion destinations (IG/YT/FB) for each underlying clip group.
+- Verify with tests for A/B/C interleaving, late B arrival, only-A backlog, locked dates, companion rows, no duplicate/extra post and same-day queue filling.
+
+This is a **cross-repository implementation requirement** for `Haynes90/ScheduleMaster`, not evidence the algorithm has been changed or deployed. Inspect existing `app/scheduler.py` source rotation before modifying; make only necessary targeted changes.
