@@ -127,6 +127,7 @@ def project(request_id, state, creators=None, scheduler=None):
         'next_required_action':(block[1].get('reason') or 'Complete '+block[0]) if block else 'Owner approval for the named asset, destinations and publication window is required',
         'human_approvals_required':[n for n in HUMAN if stages[n]['status']!='PASSED'],
         'internal_validation_completed_at':response.get('internal_validation_completed_at'),
+        'internal_test_completed_at':response.get('internal_test_completed_at'),
         'public_publication_complete':False}
     return result
 
