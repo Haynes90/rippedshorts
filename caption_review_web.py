@@ -9,7 +9,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Header, HTTPException, Request, Response
 
 from audio_master_handoff import connect
 
@@ -724,6 +724,11 @@ def workflow_status(token: str):
         if not row:
             raise HTTPException(status_code=404,detail='Request not found')
         state=json.loads(row['state_json'])
+    return _workflow_result(session['request_id'],state)
+
+
+def _workflow_result(request_id, state):
+    from workflow_test_status import project
     scheduler=None
     target=(os.getenv('SCHEDULE_MASTER_INTERNAL_URL') or os.getenv('SCHEDULE_MASTER_URL') or '').strip().rstrip('/')
     secret=os.getenv('SCHEDULE_MASTER_SHARED_SECRET','').strip()
@@ -731,7 +736,7 @@ def workflow_status(token: str):
         import requests
         from urllib.parse import quote
         try:
-            response=requests.get(target+'/schedule/test-runs/'+quote(session['request_id'],safe=''),
+            response=requests.get(target+'/schedule/test-runs/'+quote(request_id,safe=''),
                 headers={'x-schedule-master-secret':secret},timeout=(3,8))
             response.raise_for_status()
             scheduler=response.json()
@@ -739,5 +744,22 @@ def workflow_status(token: str):
             # Do not show stale permission/preflight success while downstream is unavailable.
             scheduler={**((state.get('schedule_master') or {}).get('shorts_response') or {}),
                 'publishing_globally_paused':None,'delivery_validation':{'status':'BLOCKED','reason':'SCHEDULER_STATUS_UNAVAILABLE'}}
-    result=project(session['request_id'],state,state.get('creator_approval'),scheduler)
+    result=project(request_id,state,state.get('creator_approval'),scheduler)
     return result
+
+
+@router.get('/api/ripped-shorts/test-runs/{request_id}')
+def workflow_status_by_request(request_id: str, x_schedule_master_secret: str = Header(default='')):
+    """Available before a review session exists, using the existing service secret."""
+    import secrets
+    import sqlite3
+    import audio_master_handoff as storage
+    from contextlib import closing
+    expected=os.getenv('SCHEDULE_MASTER_SHARED_SECRET','').strip()
+    if not expected or not secrets.compare_digest(expected,x_schedule_master_secret):
+        raise HTTPException(status_code=401,detail='Invalid workflow service secret')
+    with closing(sqlite3.connect(storage.DB_PATH.resolve().as_uri()+'?mode=ro',uri=True)) as db:
+        row=db.execute('SELECT state_json FROM telegram_requests WHERE request_id=?',(request_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404,detail='Request not found')
+        return _workflow_result(request_id,json.loads(row[0]))

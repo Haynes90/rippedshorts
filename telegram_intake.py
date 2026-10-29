@@ -1940,6 +1940,10 @@ def _status_card_text(request_id: str, status: str, state: dict[str, Any]) -> st
         f"16:9: {topic_total} candidates\n"
         f"Renders: {rendered} complete, {active} active\n"
         f"Next: {state.get('next_action') or 'continue'}"
+        + (f"\nTest: {state['workflow_test']['overall_status']}"
+           f"\nCheckpoint: {state['workflow_test'].get('blocking_stage') or 'complete'}"
+           f"\nTest next: {state['workflow_test'].get('next_required_action') or 'review'}"
+           if state.get('workflow_test') else '')
         + (
             f"\nError: {classify_error(error)} — {error[:500]}"
             if error

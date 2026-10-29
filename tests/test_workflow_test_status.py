@@ -102,3 +102,22 @@ def test_submitted_caption_cannot_change_after_batch_handoff(monkeypatch,complet
     response=client.post('/api/ripped-shorts/review/token/asset/0',json={'social_caption':'replacement'})
     assert response.status_code==409
     assert state['copy_drafts'][0]['social_caption']=='Exact human words'
+
+
+def test_service_authenticated_status_works_before_review_session_and_preserves_database(tmp_path,monkeypatch):
+    import caption_review_web as web
+    import audio_master_handoff as storage
+    path=tmp_path/'early.db';monkeypatch.setattr(storage,'DB_PATH',path)
+    monkeypatch.setenv('SCHEDULE_MASTER_SHARED_SECRET','test-only')
+    state=dict(show_id='TCB',parsed={'video_id':'video'},source_validation={'status':'verified'},
+        audio_master_ingest={'job_id':'audio','error_class':'TRANSCRIPTION_AUTHENTICATION_BLOCKED'})
+    with sqlite3.connect(path) as db:
+        db.execute('CREATE TABLE telegram_requests(request_id TEXT,state_json TEXT)')
+        db.execute('INSERT INTO telegram_requests VALUES(?,?)',('early',json.dumps(state)))
+    before=path.read_bytes();app=FastAPI();app.include_router(web.router);client=TestClient(app)
+    assert client.get('/api/ripped-shorts/test-runs/early').status_code==401
+    result=client.get('/api/ripped-shorts/test-runs/early',headers={'x-schedule-master-secret':'test-only'})
+    assert result.status_code==200
+    assert result.json()['checkpoints']['TRANSCRIPT_READY']['status']=='BLOCKED'
+    assert result.json()['checkpoints']['MEDIA_READY']['status']=='PASSED'
+    assert path.read_bytes()==before
