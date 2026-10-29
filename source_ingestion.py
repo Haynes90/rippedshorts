@@ -183,7 +183,7 @@ def verify_youtube_source(path, video_id, youtube_url):
             prior = json.loads(receipt.read_text(encoding='utf-8'))
         except (ValueError, OSError):
             prior = {}
-        if all(prior.get(k)==v for k,v in fingerprint.items()):
+        if all(prior.get(k)==v for k,v in fingerprint.items()) and 'source_channel_id' in prior:
             return prior
     with YoutubeDL({'quiet':True,'no_warnings':True,'skip_download':True,'noplaylist':True}) as yt:
         metadata = yt.extract_info(youtube_url,download=False)
