@@ -10,7 +10,7 @@ Status: **Design approved in conversation; implementation pending.** This docume
 - Produce complete sentences and **speech boundaries**, not just punctuation or coarse transcript chunks; preserve setups, full thoughts, payoffs, and especially multi-minute explanations/discussions for 16:9.
 - Create a shared creator directory with **brand-specific defaults**, suggestions and approvals. Creator association and Instagram collaborator invitations are different things.
 - Never bypass human clip/copy/collaborator review, silently rewrite human-approved captions, publish before approvals, or enable Agape as a consequence of the TCB POC.
-- Do not assume a native Instagram Collab invitation is supported by the current Meta adapter. Verify capabilities and record actual outcome; use an explicit manual-invitation state if unsupported.
+- Native Instagram Collab invitations are required. Use the native collaborators parameter during Reel container creation; validate up to three usernames. Rejecting approved collaboration configuration must hold the delivery, never publish without collaborators or substitute mentions/manual instructions.
 
 ## Existing integration surfaces (verify before coding)
 
@@ -53,8 +53,8 @@ Read-only correction-pass checks independently used each deployed service's own 
 5. **Human clip acceptance in Telegram** (existing). Check candidate entry/exit against actual speech, adjoining sentence, word onset/offset and natural pause. Where no safe cut exists, request boundary adjustment/review; silence alone is insufficient evidence.
 6. **Render after video is ready:** FFmpeg extracts approved ranges; preserve 9:16 speaker-aware crop and native 16:9 formatting. Independently validate opening/closing speech in exported file using targeted boundary checks rather than automatic full-video retranscription.
 7. **Creator directory suggestions:** initialize based on selected brand, **verified** source-channel creator association, show hosts and episode guest metadata. These suggestions appear at the **top of the existing website**, where the user confirms the list once per batch. Unknown or unverified identity never silently becomes an approved collaborator.
-8. **Existing web approval — batch-level collaborator confirmation (V0.1):** at the TOP of the review website show **Who's featured?** with suggested verified creators, saved Instagram usernames, TDOG recurring hosts or TCB YouTube-source suggestions. The user confirms/adds/removes creators **once for the entire accepted batch**, and chooses whether to invite them as collaborators or use caption mentions. The single confirmed choice applies to **all approved clips in that batch**; do not require repeated per-clip approvals. Continue the existing per-asset caption/title/description editing beneath this section. Future version: allow per-clip collaborator overrides, but do NOT build or require those now. Only hand off after batch creators and copy review are explicitly completed.
-9. **Schedule Master intake:** receive approved render file, metadata, brand, source IDs, creator IDs and per-platform collaborator intent. Preserve the exact approved caption. Publish on established cadence after all safety gates. Record whether native collab invite was submitted/accepted or requires manual action; never report a plain @mention as a successful invite.
+8. **Existing web approval — batch-level collaborator confirmation (V0.1):** at the TOP of the review website show **Who's featured?** with suggested verified creators, saved Instagram usernames, TDOG recurring hosts or TCB YouTube-source suggestions. The user confirms/adds/removes creators **once for the entire accepted batch**, and confirms native Instagram Collab invitation intent separately from caption wording. The single confirmed choice applies to **all approved clips in that batch**; do not require repeated per-clip approvals. Continue the existing per-asset caption/title/description editing beneath this section. Future version: allow per-clip collaborator overrides, but do NOT build or require those now. Only hand off after batch creators and copy review are explicitly completed.
+9. **Schedule Master intake:** receive approved render file, metadata, brand, source IDs, creator IDs and per-platform collaborator intent. Preserve the exact approved caption. Publish on established cadence after all safety gates. Record native invitation submission separately from recipient acceptance; hold on rejected collaboration configuration; never report a plain @mention as a successful invite.
 
 ## Brand-specific collaborator rules
 
@@ -80,7 +80,7 @@ Episode/source:
 Batch collaboration approval (V0.1): `request_id`, `brand_id`, `confirmed_creator_ids[]`, `collaboration_intent_by_creator`, `approved_by`, `approved_at`, `scope=approved_batch`, `approval_revision`. Snapshot this approved selection into each eligible delivery so downstream retries preserve it. Never apply it to rejected/unselected clips. Individual-clip overrides are explicitly out of scope for V0.1.
 
 Per delivery (future-compatible schema):
-`asset_id`, `creator_id`, `feature_status`, `collaboration_intent` (none/mention/invite), `approval_status`, `approval_at`, `invitation_status` (not_attempted/submitted/accepted/rejected/manual_required/unsupported), `platform_receipt?`.
+`asset_id`, `creator_id`, `feature_status`, `collaboration_intent` (none/mention/invite), `approval_status`, `approval_at`, `invitation_status` (not_attempted/submitted/accepted/rejected/review_hold), `platform_receipt?`.
 
 Store durable creator and decision data in an existing supported persistence layer, not ephemeral local memory; avoid inventing handles, excessive scope, duplicate identity records, or logging credentials. Define upsert/deduplication keyed by stable creator ID and verified external IDs.
 
@@ -108,7 +108,7 @@ Known failed test: request `92128853-2d02-41f6-a172-7a769775abae` / YouTube `gKn
 
 ## Platform integrity
 
-Native Instagram collaboration invitations are NOT equivalent to caption @mentions. Before implementing an automated invite, verify the exact supported Meta API flow/permissions for the deployed account type and document tested behavior and limits. If unsupported, explicitly mark `manual_required` and present the exact creator account; never claim `submitted`. Respect platform collaborator limits, account approvals and per-post recipient confirmation. YouTube/Facebook creator tagging is separate platform-specific capability.
+Native Instagram collaboration invitations are NOT equivalent to caption @mentions. Before implementing an automated invite, verify the exact supported Meta API flow/permissions for the deployed account type and document tested behavior and limits. If the approved native collaboration configuration is unsupported or rejected, hold the affected delivery for review; never silently remove collaborators, publish bare, substitute manual instructions, or claim submission. Respect platform collaborator limits, account approvals and per-post recipient confirmation. YouTube/Facebook creator tagging is separate platform-specific capability.
 
 ## Implementation phases (approval gates)
 
@@ -129,7 +129,7 @@ Native Instagram collaboration invitations are NOT equivalent to caption @mentio
 - TDOG recurring hosts suggested each episode; returning guests reused after confirmation; one top-of-site selection applies to all accepted clips in the batch. Per-clip overrides are future scope.
 - One explicit creator/collaborator approval at the top of the existing website applies to all approved clips in that batch, never rejected ones; individual caption edits remain available per asset.
 - Exact human-edited captions and decisions survive handoff and retries.
-- Native collaborator invitation success is verified or marked unsupported/manual; never confused with @mention.
+- Native collaborators reach the Reel container request. Submission is recorded separately from recipient acceptance; configuration rejection holds the delivery and never falls back to @mentions or bare publishing.
 - No duplicate source acquisition, no duplicate deliveries, no Agape activation. No changes to live publishing flags.
 
 ## Decisions before coding
@@ -155,3 +155,10 @@ For approved clips from multiple original source videos, Schedule Master should 
 - Verify with tests for A/B/C interleaving, late B arrival, only-A backlog, locked dates, companion rows, no duplicate/extra post and same-day queue filling.
 
 This is a **cross-repository implementation requirement** for `Haynes90/ScheduleMaster`, not evidence the algorithm has been changed or deployed. Inspect existing `app/scheduler.py` source rotation before modifying; make only necessary targeted changes.
+
+
+## Required native Instagram contract (owner clarification, 2026-10-29)
+
+This PR remains design documentation only. Implementation belongs in separate reviewed PRs. The batch approval must durably capture approved usernames, approver, timestamp and revision, and the consumer must preserve the exact snapshot through scheduling, outbox recovery and retries. Meta supports at most three collaborators for this flow. Validate usernames before submission. Persist the accepted container ID and submitted list before publishing, then the publishing receipt; do not equate request acceptance with invited users accepting. On a collaboration rejection, hold only the affected delivery for review. Required mocked acceptance cases cover a verified TCB source creator and TDOG standing hosts @andrethefarmer and @urbangardeningwithgray through website approval, Schedule Master intake and the actual adapter request. No live publishing is authorized.
+
+Official references: [media container](https://developers.facebook.com/documentation/instagram-platform/instagram-graph-api/reference/ig-user/media), [collaboration](https://developers.facebook.com/documentation/instagram-platform/instagram-api-with-facebook-login/collaboration).
