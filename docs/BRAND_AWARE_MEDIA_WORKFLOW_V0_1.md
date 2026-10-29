@@ -33,16 +33,16 @@ Status: **Design approved in conversation; implementation pending.** This docume
 4. **Selection:** Ripped Shorts scans the full time-aligned transcript, proposes complete 9:16 thoughts within configured length, and 16:9 full explanations/stories/interviews (possibly several minutes and multiple speakers). No truncation at arbitrary transcription chunk boundary.
 5. **Human clip acceptance in Telegram** (existing). Check candidate entry/exit against actual speech, adjoining sentence, word onset/offset and natural pause. Where no safe cut exists, request boundary adjustment/review; silence alone is insufficient evidence.
 6. **Render after video is ready:** FFmpeg extracts approved ranges; preserve 9:16 speaker-aware crop and native 16:9 formatting. Independently validate opening/closing speech in exported file using targeted boundary checks rather than automatic full-video retranscription.
-7. **Creator directory suggestions:** initialize based on the selected brand, **verified** source-channel creator association, show hosts and episode guest metadata. Unknown or unverified identity never silently becomes an approved collaborator.
-8. **Existing web approval:** show final captions/titles/descriptions and proposed collaborator usernames per clip; allow accept/remove/mention-only/new creator confirmation. Explicitly approve account selection and exact copy before handoff.
+7. **Creator directory suggestions:** initialize based on selected brand, **verified** source-channel creator association, show hosts and episode guest metadata. These suggestions appear at the **top of the existing website**, where the user confirms the list once per batch. Unknown or unverified identity never silently becomes an approved collaborator.
+8. **Existing web approval — batch-level collaborator confirmation (V0.1):** at the TOP of the review website show **Who's featured?** with suggested verified creators, saved Instagram usernames, TDOG recurring hosts or TCB YouTube-source suggestions. The user confirms/adds/removes creators **once for the entire accepted batch**, and chooses whether to invite them as collaborators or use caption mentions. The single confirmed choice applies to **all approved clips in that batch**; do not require repeated per-clip approvals. Continue the existing per-asset caption/title/description editing beneath this section. Future version: allow per-clip collaborator overrides, but do NOT build or require those now. Only hand off after batch creators and copy review are explicitly completed.
 9. **Schedule Master intake:** receive approved render file, metadata, brand, source IDs, creator IDs and per-platform collaborator intent. Preserve the exact approved caption. Publish on established cadence after all safety gates. Record whether native collab invite was submitted/accepted or requires manual action; never report a plain @mention as a successful invite.
 
 ## Brand-specific collaborator rules
 
 | Brand | Defaults | Creator prompt | Per-clip behavior |
 | --- | --- | --- | --- |
-| TDOG (The Dirt on Gardening) | Saved recurring hosts suggested every episode | Ask for additional episode guests; recognize returning guests such as Britt Parrish **only after identity/handle confirmation** | Allow exclusions when host or guest is not featured in a particular clip. |
-| TCB (The Chocolate Botanist) | Do **not** assume source-channel owner appears in every clip | Ask **“Who’s featured in this video?”**; suggest known creator from YouTube channel ID (e.g. Black in the Garden after user supplies and verifies mapping) | Creator/guest inclusion is explicitly reviewable on each asset. |
+| TDOG (The Dirt on Gardening) | Saved recurring hosts suggested every episode | Ask for additional episode guests; recognize returning guests such as Britt Parrish **only after identity/handle confirmation** | Show default hosts and episode guests together at top of web review. Confirm once for entire batch; per-clip exceptions deferred. |
+| TCB (The Chocolate Botanist) | Do **not** assume source-channel owner appears in every clip | Ask **“Who’s featured in this video?”**; suggest known creator from YouTube channel ID (e.g. Black in the Garden after user supplies and verifies mapping) | One creator/guest confirmation at the top of the website applies to every approved asset in the current batch; per-asset exceptions are deferred. |
 | Other brands | No assumed defaults | Keep configurable, off until specified | Preserve isolation and existing brand gates. |
 
 Recurring TDOG hosts must have an editable saved list; do not hardcode names or invent Instagram handles. Source YouTube channel ID is a strong **source account** match, not proof that person appears. YouTube video ID can map to an episode and its guest roster; use verified episode metadata or explicit user confirmation for people actually featured. Persist confirmed mapping for future recommendations. Default selection is a **suggestion**, with explicit or previously approved standing-rule authorization for actual invites.
@@ -58,7 +58,9 @@ Brand relationship:
 Episode/source:
 `brand_id`, `youtube_video_id`, `youtube_channel_id`, `source_creator_id?`, `episode_guest_creator_ids[]`, `confirmed_featured_creator_ids[]`, `provenance`.
 
-Per delivery:
+Batch collaboration approval (V0.1): `request_id`, `brand_id`, `confirmed_creator_ids[]`, `collaboration_intent_by_creator`, `approved_by`, `approved_at`, `scope=approved_batch`, `approval_revision`. Snapshot this approved selection into each eligible delivery so downstream retries preserve it. Never apply it to rejected/unselected clips. Individual-clip overrides are explicitly out of scope for V0.1.
+
+Per delivery (future-compatible schema):
 `asset_id`, `creator_id`, `feature_status`, `collaboration_intent` (none/mention/invite), `approval_status`, `approval_at`, `invitation_status` (not_attempted/submitted/accepted/rejected/manual_required/unsupported), `platform_receipt?`.
 
 Store durable creator and decision data in an existing supported persistence layer, not ephemeral local memory; avoid inventing handles, excessive scope, duplicate identity records, or logging credentials. Define upsert/deduplication keyed by stable creator ID and verified external IDs.
@@ -95,7 +97,7 @@ Native Instagram collaboration invitations are NOT equivalent to caption @mentio
 2. **Parallel ingestion and durable reuse**: independent concurrent acquisition/transcription statuses, test failure isolation, full-video integrity, and no repeat downloads.
 3. **Sentence + speech timing**: accurate chunk seam joining, speech onset/offset and preview validation with uncertain-boundary holds. Preserve accepted outputs.
 4. **Creator directory and Telegram UX**: TDOG recurring hosts; TCB feature prompt and source-channel suggestion; guest alias reconciliation and confirmation.
-5. **Web review + Schedule Master contract**: per-clip approved collaborator intent, idempotent delivery, platform capability gate, human-copy precedence.
+5. **Web review + Schedule Master contract**: one top-of-page **batch collaborator confirmation** applied to all accepted clips, idempotent delivery snapshots, platform capability gate, human-copy precedence. Defer per-clip collaborator exceptions to a later version.
 6. **End-to-end TCB then TDOG canary**: selected source → parallel acquisition → transcription → complete boundary → clip acceptance → actual render → caption/collaborator approval → safe handoff. No public publishing without separate authorization. Agape rollout deferred.
 
 ## Acceptance checks
@@ -105,7 +107,8 @@ Native Instagram collaboration invitations are NOT equivalent to caption @mentio
 - Word and sentence continuity across chunk boundaries; full spoken explanations and natural entry/exit in both 9:16 and 16:9, including multi-speaker 16:9.
 - A speech edge with no silence does not falsely pass by silence-only logic; uncertain edge is held for review.
 - TCB prompts for who is featured; suggests creator matching verified YouTube channel; no assumed tagging without confirmation.
-- TDOG recurring hosts suggested each episode; returning guests reused after confirmation; each clip can remove irrelevant collaborator.
+- TDOG recurring hosts suggested each episode; returning guests reused after confirmation; one top-of-site selection applies to all accepted clips in the batch. Per-clip overrides are future scope.
+- One explicit creator/collaborator approval at the top of the existing website applies to all approved clips in that batch, never rejected ones; individual caption edits remain available per asset.
 - Exact human-edited captions and decisions survive handoff and retries.
 - Native collaborator invitation success is verified or marked unsupported/manual; never confused with @mention.
 - No duplicate source acquisition, no duplicate deliveries, no Agape activation. No changes to live publishing flags.
@@ -115,3 +118,7 @@ Native Instagram collaboration invitations are NOT equivalent to caption @mentio
 - User approved workflow direction, **not yet a specific storage schema, live API permissions, changes to platform capabilities, merging/deployment or publishing**.
 - Confirm saved recurring TDOG hosts' actual Instagram identities and creator directory backing store.
 - Confirm whether feature detection comes from episode metadata, creator/channel match, or explicit user selection; never infer guest presence from channel ownership alone.
+
+## Confirmed scope update — batch creator approval on web review (2026-10-29)
+
+The user specifically chose **one confirmation at the top of the existing website for the whole batch**. Present creator identities and proposed Instagram collaborators in a single **Who's featured?** section; a single approval covers all approved clips in that batch (including 9:16 and 16:9 where selected). Keep separate caption/title editing for each clip. Save the creator decision and propagate unchanged to every accepted delivery. No repeated creator prompts for individual clips. **Do not build per-clip collaborator customization in this version**; later versions may add it. Account-to-creator associations still require identity verification, and native invite behavior must be capability-checked rather than equated to mentions.
