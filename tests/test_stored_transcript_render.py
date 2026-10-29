@@ -32,21 +32,26 @@ class StoredTranscriptRenderTests(unittest.TestCase):
         self.api = Mock(side_effect=AssertionError('Rendering must not call speech services'))
         self.probe = Mock(return_value=SimpleNamespace(stdout='video\n'))
         self.duration = Mock(side_effect=[100, 5])
+        self.edge = Mock(return_value=[{'word':w,'start':i*.7,'end':i*.7+.5}
+                                      for i,w in enumerate('This is a complete sentence.'.split())])
+        self.semantic = Mock(return_value=dict(complete_start=True,complete_end=True,complete_thought=True))
         self.env = dict(Path=Path, math=math, os=os, CompletionReviewRequired=RuntimeError,
                         media_duration=self.duration, _run=self.probe,
-                        transcribe_window=self.api, review_thought=self.api,
+                        transcribe_window=self.edge, review_thought=self.semantic,
+                        _tokens=lambda words:re.findall(r'\w+', ' '.join(w['word'] for w in words).casefold()),
                         pause_end=self.api, verify_render=self.api)
         self.render = load_function('clip_completion.py', 'render_complete_clip', self.env)
         self.renderer = Mock(side_effect=lambda *args: self.output.write_bytes(b'video fixture'))
         self.segment = {'start': 10, 'end': 15, 'transcript': 'This is a complete sentence.'}
 
-    def test_both_aspects_use_stored_bounds_without_speech_calls(self):
+    def test_both_aspects_keep_stored_bounds_and_verify_spoken_edges(self):
         for aspect in ('9:16', '16:9'):
             with self.subTest(aspect=aspect):
                 self.duration.side_effect = [100, 5]
                 result = self.render(Path('silent-source.mp4'), self.segment, self.output, self.renderer, aspect)
                 self.renderer.assert_called_with(Path('silent-source.mp4'), 10, 5, self.output)
-                self.assertEqual(result['completion_check']['basis'], 'stored_transcript_and_media_bounds')
+                self.assertEqual(result['completion_check']['basis'], 'approved_transcript_and_measured_export_speech')
+                self.assertTrue(result['completion_check']['export_edges'])
                 self.assertFalse(result['completion_check']['audio_pause'])
         self.api.assert_not_called()
 

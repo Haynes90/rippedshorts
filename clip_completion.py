@@ -74,6 +74,8 @@ def transcribe_window(video, start, end):
                             data=[("model", "whisper-1"), ("response_format", "verbose_json"),
                                   ("timestamp_granularities[]", "word")],
                             files={"file": (audio.name, stream, "audio/mpeg")}, timeout=(15, 900))
+                    if response.status_code in {401, 403}:
+                        raise CompletionReviewRequired("TRANSCRIPTION_AUTHENTICATION_BLOCKED: verify the configured transcription credential")
                     if response.status_code >= 400:
                         logger.warning("RIPPED_TRANSCRIPTION_RESPONSE status=%s body=%s", response.status_code, response.text[:240])
                 response.raise_for_status()
@@ -86,7 +88,9 @@ def transcribe_window(video, start, end):
             if attempt == 2:
                 raise CompletionReviewRequired("Word transcription failed after three attempts") from None
             time.sleep(min(60, 5 * (2 ** attempt)))
-        except (ValueError, KeyError, TypeError, CompletionReviewRequired):
+        except (ValueError, KeyError, TypeError, CompletionReviewRequired) as exc:
+            if "TRANSCRIPTION_AUTHENTICATION_BLOCKED" in str(exc):
+                raise
             if attempt == 2:
                 raise CompletionReviewRequired("Word transcription failed after three attempts") from None
             time.sleep(min(30, 2 * (attempt + 1)))
@@ -245,10 +249,28 @@ def render_complete_clip(video, segment, output, renderer, aspect):
     transcript = str(segment.get("transcript") or "").strip()
     if not transcript or transcript.rstrip("\"”’')]}").rstrip()[-1:] not in (".", "!", "?"):
         raise CompletionReviewRequired("Stored transcript ends mid-sentence; review the selected bounds")
+    evidence = segment.get('words') or [{'word':word} for word in transcript.split()]
+    thought = review_thought(evidence, start, end, aspect)
+    if any(thought.get(k) is not True for k in ('complete_start','complete_end','complete_thought')):
+        raise CompletionReviewRequired('The approved excerpt does not establish a complete thought; review its boundaries')
     try:
         renderer(video, start, end - start, output)
         if not Path(output).is_file() or Path(output).stat().st_size == 0:
             raise CompletionReviewRequired("Renderer produced no video")
+        # Listen to both exported edges and compare them with the approved transcript.
+        text_words = transcript.split()
+        expected = [{"word":word,"start":start,"end":end} for word in text_words]
+        for tail in (False, True):
+            sample_start = max(0, end-start-18) if tail else 0
+            sample_end = end-start if tail else min(18, end-start)
+            heard = transcribe_window(output, sample_start, sample_end)
+            expected_tokens = _tokens(expected[-6:] if tail else expected[:6])
+            heard_tokens = _tokens(heard)
+            edge = heard_tokens[-len(expected_tokens):] if tail else heard_tokens[:len(expected_tokens)]
+            if not expected_tokens or edge != expected_tokens:
+                raise CompletionReviewRequired("Actual exported speech does not match approved boundary words")
+            if not heard or (tail and sample_end-heard[-1]["end"] < .08):
+                raise CompletionReviewRequired("Export ends too close to speech; adjust the approved boundary")
         actual_duration = media_duration(output)
         if abs(actual_duration - (end - start)) > .25:
             raise CompletionReviewRequired("Export duration differs from selected bounds")
@@ -262,8 +284,8 @@ def render_complete_clip(video, segment, output, renderer, aspect):
         raise
     return {**segment, "start": start, "end": end, "duration": end - start,
             "completion_check": {"status": "verified", "version": 2,
-                "basis": "stored_transcript_and_media_bounds",
+                "basis": "approved_transcript_and_measured_export_speech",
                 "transcript_sentence_end": True, "media_duration": True,
                 "video_stream": True, "word_alignment": False,
-                "audio_pause": False, "export_edges": False}}
+                "audio_pause": False, "export_edges": True}}
 

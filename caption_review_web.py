@@ -185,6 +185,11 @@ def _payload_for_session(token: str) -> dict[str, Any]:
             }
         )
 
+    from creator_approval import suggestions, approved_batch
+    creator_brand = str(state.get("show_id") or "").upper()
+    creator_required = creator_brand in {"TCB", "TDOG"}
+    creator_suggestions = suggestions(creator_brand, str(state.get("youtube_channel_id") or "")) if creator_required else []
+    creator_approval = approved_batch(request_id) if creator_required else None
     completed = sum(
         item["copy_status"] in {"approved", "edited"} or item["user_edited"]
         for item in items
@@ -192,6 +197,10 @@ def _payload_for_session(token: str) -> dict[str, Any]:
     regenerated = sum(item["regeneration_count"] > 0 for item in items)
     return {
         "request_id": request_id,
+        "creator_brand": creator_brand,
+        "creator_required": creator_required,
+        "creator_suggestions": creator_suggestions,
+        "creator_approval": creator_approval,
         "title": title,
         "video_id": video_id,
         "source_url": str(parsed.get("source_value") or ""),
@@ -266,6 +275,9 @@ def _card_html(item: dict[str, Any], token: str) -> str:
 
 
 def _page(payload: dict[str, Any], token: str) -> str:
+    from creator_review_ui import section, SCRIPT
+    creator_section = section()
+    creator_script = SCRIPT
     cards = "".join(_card_html(item, token) for item in payload["items"])
     expires = html.escape(payload["expires_at"][:10])
     thumb = (
@@ -329,6 +341,7 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
     </div>
   </section>
 
+  {creator_section}
   <div class="progress">
     <div class="progressbar"><div id="bar"></div></div>
     <div class="progress-text" id="progressText"></div>
@@ -348,6 +361,7 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
 const TOKEN = {token_json};
 const INITIAL = {state_json};
 let state = INITIAL;
+{creator_script}
 
 function updateProgress(data=state) {{
   const total = data.total || data.items.length || 0;
@@ -594,6 +608,28 @@ def regenerate_review_asset(token: str, index: int):
     return {**current, "status": "regenerated", "regenerated": payload["regenerated"]}
 
 
+@router.post("/api/ripped-shorts/review/{token}/creators")
+async def confirm_review_creators(token: str, request: Request):
+    session = _session(token)
+    row = _request_row(str(session["request_id"]))
+    state = json.loads(row["state_json"])
+    if (state.get("schedule_master") or {}).get("shorts_status") in {"sending", "accepted"}:
+        raise HTTPException(status_code=409, detail="This batch is already submitted; its approval is preserved")
+    body = await request.json()
+    from creator_approval import confirm_batch
+    try:
+        approved = confirm_batch(str(session["request_id"]), str(state.get("show_id") or ""),
+            str((state.get("parsed") or {}).get("video_id") or ""),
+            str(state.get("youtube_channel_id") or ""), body.get("entries"),
+            str(row["user_id"] or "web_review"), body.get("confirmed") is True)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    if state.get("schedule_requested_at"):
+        import telegram_intake as tg
+        tg._notify_render_queue_complete(str(session["request_id"]), str(row["chat_id"]))
+    return {"status":"approved", "creator_approval":approved}
+
+
 @router.post("/api/ripped-shorts/review/{token}/finish")
 def finish_review(token: str):
     session = _session(token)
@@ -605,6 +641,9 @@ def finish_review(token: str):
         raise HTTPException(status_code=409, detail="No copy drafts are available")
     if state.get("schedule_requested_at"):
         return {"status": "already_scheduling", "request_id": request_id}
+    from creator_approval import approved_batch
+    if str(state.get("show_id") or "").upper() in {"TCB", "TDOG"} and not approved_batch(request_id):
+        raise HTTPException(status_code=409, detail="Confirm the featured creators once at the top of this page")
 
     state.pop("awaiting_copy_input", None)
     state["copy_review_completed_at"] = _iso(_now())

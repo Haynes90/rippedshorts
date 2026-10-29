@@ -1421,14 +1421,21 @@ def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> 
         "asset_type", "candidate_number", "drive_url", "transcript",
         "duration_seconds", "main_theme", "keywords", "social_caption",
         "video_title", "video_description", "hashtags", "copy_source",
-        "handoff_status",
+        "handoff_status", "creator_approval_json",
     ]
     headers = get_or_create_headers(
         RIPPED_LOG_SHEET_ID, SCHEDULE_OUTBOX_TAB, headers
     )
+    def column(number):
+        value = ""
+        while number:
+            number, remainder = divmod(number - 1, 26)
+            value = chr(65 + remainder) + value
+        return value
+    last_column = column(len(headers))
     result = sheets.spreadsheets().values().get(
         spreadsheetId=RIPPED_LOG_SHEET_ID,
-        range=f"'{SCHEDULE_OUTBOX_TAB}'!A1:U5000",
+        range=f"'{SCHEDULE_OUTBOX_TAB}'!A1:{last_column}5000",
     ).execute()
     values = result.get("values", [])
     existing = {}
@@ -1454,6 +1461,7 @@ def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> 
         "source_url": str(payload.get("source_url") or ""),
         "source_title": str(payload.get("source_title") or ""),
         "handoff_status": status,
+        "creator_approval_json": json.dumps(payload.get("creator_approval")) if payload.get("creator_approval") else "",
     }
     for asset in payload.get("assets") or []:
         row = {
@@ -1472,14 +1480,15 @@ def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> 
             "hashtags": _normalize_hashtags(asset.get("hashtags")),
             "copy_source": str(asset.get("copy_source") or ""),
         }
-        ordered = [row.get(header, "") for header in headers]
+        ordered = [row.get(header) for header in headers]
         asset_id = row["asset_id"]
         if asset_id in existing:
             row_number = existing[asset_id]
-            updates.append({
-                "range": f"'{SCHEDULE_OUTBOX_TAB}'!A{row_number}:U{row_number}",
-                "values": [ordered],
-            })
+            # Update only owned fields; preserve other columns and formulas.
+            for index, header in enumerate(headers, 1):
+                if header in row:
+                    updates.append({"range": f"'{SCHEDULE_OUTBOX_TAB}'!{column(index)}{row_number}",
+                                    "values": [[row[header]]]})
         else:
             rows_to_append.append(ordered)
     if updates:
@@ -1523,6 +1532,11 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
         if not row:
             return False
         state = json.loads(row["state_json"])
+        from creator_approval import approved_batch
+        creators = approved_batch(request_id) if str(state.get("show_id") or "").upper() in {"TCB", "TDOG"} else None
+        if str(state.get("show_id") or "").upper() in {"TCB", "TDOG"} and not creators:
+            send(chat_id, "Who's featured? Confirm the creators once at the top of the website review before scheduling.")
+            return False
         schedule = dict(state.get("schedule_master") or {})
         if schedule.get("shorts_status") in {"sending", "accepted"}:
             return False
@@ -1617,6 +1631,7 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
         "source_title": _state_vid_title(state),
         # Ripped Shorts only hands off after "Approve Copy & Schedule".
         "copy_approved": True,
+        "creator_approval": creators,
         "assets": assets,
     }
     try:
@@ -2084,6 +2099,8 @@ def _sentence_complete_candidate(
         "end": completed_end,
         "duration": round(completed_end - completed_start, 3),
         "transcript": " ".join(text for _, _, text in selected),
+        "words": [word for segment in transcript_segments for word in segment.get("words", [])
+                  if float(word["start"]) >= completed_start and float(word["end"]) <= completed_end],
     }
 
 
@@ -3453,24 +3470,40 @@ def _process(request_id: str) -> None:
                         parsed["source_value"],
                         progress=lambda message: send(chat_id, message),
                     )
+                    from source_ingestion import reuse_audio_master_result
+                    exact_assets = reuse_audio_master_result(audio_master_result, video_id, work)
+                    video = exact_assets.get("video_path") or video
+                    segments = exact_assets.get("segments") or segments
                     state["audio_master_ingest"] = {
                         "job_id": audio_master_result.get("job_id"),
                         "status": audio_master_result.get("status"),
                         "skip_metadata_podhome": audio_master_result.get("skip_metadata_podhome"),
                     }
                 except Exception as audio_master_error:
+                    partial = getattr(audio_master_error, "result", None)
+                    if partial:
+                        from source_ingestion import reuse_audio_master_result
+                        try:
+                            retained = reuse_audio_master_result(partial, video_id, work)
+                            video = retained.get("video_path") or video
+                            segments = retained.get("segments") or segments
+                        except Exception as artifact_error:
+                            state.setdefault("warnings", []).append(f"Retained artifact access failed: {type(artifact_error).__name__}")
                     # Audio Master is a cache accelerator, not a single point of
                     # failure. Its retained-video path can fail independently
                     # while Ripped Shorts can still download/transcribe directly.
                     state["audio_master_ingest"] = {
                         "status": "fallback_to_ripped_shorts",
+                        "job_id": partial.get("job_id") if partial else None,
+                        "error_class": partial.get("error_class") if partial else None,
+                        "upstream_status": partial.get("status") if partial else None,
                         "error": str(audio_master_error),
                     }
                     state.setdefault("warnings", []).append(
-                        f"Audio Master reusable-source path failed; using Ripped Shorts fallback: {audio_master_error}"
+                        f"Audio Master ingestion incomplete; preserving completed artifacts before fallback: {audio_master_error}"
                     )
                     logger.warning(
-                        "Audio Master source unavailable; continuing with direct Ripped Shorts ingestion "
+                        "Audio Master ingestion incomplete; preserving artifacts and recovering missing lanes "
                         "request_id=%s video_id=%s error=%s",
                         request_id,
                         video_id,
@@ -3478,12 +3511,14 @@ def _process(request_id: str) -> None:
                     )
                     send(
                         chat_id,
-                        "⚠️ Audio Master did not retain a usable source video. "
-                        "Ripped Shorts is continuing with its direct backup path.",
+                        "⚠️ Audio Master did not complete both reusable assets. "
+                        "Ripped Shorts is keeping completed files and recovering only what is missing.",
                     )
 
+                # Persist the acquisition result before any independent fallback can fail.
+                _save(request_id, "processing", {**state, "stage": "source_resolution"})
                 try:
-                    cache = reuse_from_drive(video_id, work)
+                    cache = reuse_from_drive(video_id, work) if not video or not segments else {"video_path":video,"segments":segments}
                 except Exception as cache_error:
                     cache = {"video_path": None, "segments": [], "sermon_boundary": None}
                     state.setdefault("warnings", []).append(
@@ -3520,6 +3555,10 @@ def _process(request_id: str) -> None:
                 else:
                     state.setdefault("warnings", []).append("Approved sermon boundary did not contain reusable transcript segments.")
 
+        if row["source_kind"] == "youtube":
+            from source_ingestion import verify_youtube_source
+            state["source_validation"] = verify_youtube_source(video, video_id, parsed["source_value"])
+            _save(request_id, "processing", {**state, "stage":"source_validated"})
         if row["mode"] == "topics":
             _process_topics(
                 request_id,
