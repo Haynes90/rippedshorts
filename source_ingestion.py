@@ -197,7 +197,7 @@ def verify_youtube_source(path, video_id, youtube_url):
     expected = float(metadata['duration'])
     if not math.isfinite(actual) or abs(actual-expected)>max(1,min(3,expected*.001)) or not {'video','audio'} <= {s.get('codec_type') for s in data.get('streams',[])}:
         raise ValueError('Source is incomplete or lacks video/audio; hold for media review')
-    verified = {**fingerprint,'duration':actual,'expected_duration':expected,'status':'verified'}
+    verified = {**fingerprint,'duration':actual,'expected_duration':expected,'source_channel_id':str(metadata.get('channel_id') or ''),'status':'verified'}
     temporary = receipt.with_suffix('.tmp')
     temporary.write_text(json.dumps(verified),encoding='utf-8')
     temporary.replace(receipt)
@@ -329,7 +329,7 @@ class AudioMasterIngestError(RuntimeError):
         self.result = result
 
 
-def ingest_with_audio_master(video_id: str, youtube_url: str, progress=None) -> dict[str, Any]:
+def ingest_with_audio_master(video_id: str, youtube_url: str, progress=None, workflow_context=None) -> dict[str, Any]:
     """Run Audio Master's cache/download/transcription path and wait for Drive assets."""
     base = (os.getenv("AUDIO_MASTER_INTERNAL_URL") or "").strip().rstrip("/")
     if base and "://" not in base:
@@ -351,7 +351,7 @@ def ingest_with_audio_master(video_id: str, youtube_url: str, progress=None) -> 
     headers = {"x-ripped-shorts-ingest-secret": secret}
     response = requests.post(
         f"{base}/api/ripped-shorts/ingest",
-        json={"video_id": video_id, "youtube_url": youtube_url, "title": video_id},
+        json={"video_id": video_id, "youtube_url": youtube_url, "title": video_id, "workflow_context":workflow_context},
         headers=headers,
         timeout=(10, 60),
     )

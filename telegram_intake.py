@@ -1421,7 +1421,7 @@ def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> 
         "asset_type", "candidate_number", "drive_url", "transcript",
         "duration_seconds", "main_theme", "keywords", "social_caption",
         "video_title", "video_description", "hashtags", "copy_source",
-        "handoff_status", "creator_approval_json",
+        "handoff_status", "creator_approval_json", "workflow_context_json", "copy_status",
     ]
     headers = get_or_create_headers(
         RIPPED_LOG_SHEET_ID, SCHEDULE_OUTBOX_TAB, headers
@@ -1462,6 +1462,7 @@ def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> 
         "source_title": str(payload.get("source_title") or ""),
         "handoff_status": status,
         "creator_approval_json": json.dumps(payload.get("creator_approval")) if payload.get("creator_approval") else "",
+        "workflow_context_json": json.dumps(payload.get("workflow_context")) if payload.get("workflow_context") else "",
     }
     for asset in payload.get("assets") or []:
         row = {
@@ -1477,7 +1478,8 @@ def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> 
             "social_caption": str(asset.get("social_caption") or ""),
             "video_title": str(asset.get("video_title") or asset.get("title") or ""),
             "video_description": str(asset.get("video_description") or ""),
-            "hashtags": _normalize_hashtags(asset.get("hashtags")),
+            "hashtags": str(asset.get("hashtags") or "") if payload.get("workflow_context") else _normalize_hashtags(asset.get("hashtags")),
+            "copy_status": str(asset.get("copy_status") or ""),
             "copy_source": str(asset.get("copy_source") or ""),
         }
         ordered = [row.get(header) for header in headers]
@@ -1622,7 +1624,13 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
             }
             for asset in assets
         ]
+    from workflow_test_status import journal, context, copy_revision
+    journal(request_id,state,creators)
+    workflow_context = {**context(request_id,state), 'approved_caption_revision':copy_revision(assets),
+        'approved_collaborator_revision':(creators or {}).get('approval_revision'),
+        'upstream_checkpoints':state['workflow_test']['checkpoints']}
     payload = {
+        "workflow_context":workflow_context,
         "request_id": request_id,
         "youtube_video_id": str(parsed.get("video_id") or ""),
         "youtube_channel_id": str(state.get("youtube_channel_id") or "") or None,
@@ -1702,6 +1710,7 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
                 }
             )
             latest_state["schedule_master"] = latest_schedule
+            __import__("workflow_test_status").journal(request_id,latest_state,creators)
             db.execute(
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(latest_state), now(), request_id),
@@ -2007,6 +2016,8 @@ def _update_status_card(
 
 
 def _save(request_id: str, status: str, state: dict[str, Any]) -> None:
+    from workflow_test_status import journal
+    journal(request_id, state)
     state["heartbeat_at"] = now()
     if status != "error":
         state["last_successful_stage"] = str(state.get("stage") or status)
@@ -3469,6 +3480,7 @@ def _process(request_id: str) -> None:
                         video_id,
                         parsed["source_value"],
                         progress=lambda message: send(chat_id, message),
+                        workflow_context=__import__("workflow_test_status").context(request_id,state),
                     )
                     from source_ingestion import reuse_audio_master_result
                     exact_assets = reuse_audio_master_result(audio_master_result, video_id, work)
@@ -3478,6 +3490,7 @@ def _process(request_id: str) -> None:
                         "job_id": audio_master_result.get("job_id"),
                         "status": audio_master_result.get("status"),
                         "skip_metadata_podhome": audio_master_result.get("skip_metadata_podhome"),
+                        "checkpoints": audio_master_result.get("checkpoints"),
                     }
                 except Exception as audio_master_error:
                     partial = getattr(audio_master_error, "result", None)
@@ -3558,6 +3571,11 @@ def _process(request_id: str) -> None:
         if row["source_kind"] == "youtube":
             from source_ingestion import verify_youtube_source
             state["source_validation"] = verify_youtube_source(video, video_id, parsed["source_value"])
+            state["youtube_channel_id"] = state["source_validation"].get("source_channel_id") or state.get("youtube_channel_id") or ""
+            state["transcript_evidence"] = {'timed_segments':len(segments),
+                'speech_evidence':bool(segments) and all(str(seg.get('text') or '').strip() and float(seg.get('duration') or (float(seg.get('end') or 0)-float(seg.get('start') or 0)))>0 for seg in segments),
+                'word_count':sum(len(seg.get('words') or []) for seg in segments),
+                'audio_master_job_id':(state.get('audio_master_ingest') or {}).get('job_id'), 'observed_at':now()}
             _save(request_id, "processing", {**state, "stage":"source_validated"})
         if row["mode"] == "topics":
             _process_topics(
@@ -5208,6 +5226,7 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
                 "rendered_at": now(),
             }
             latest_state["topic_reviews"] = reviews
+            __import__("workflow_test_status").journal(request_id,latest_state)
             db.execute(
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(latest_state), now(), request_id),
@@ -5322,6 +5341,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
                 "rendered_at": rendered_at,
             }
             latest_state["candidate_reviews"] = reviews
+            __import__("workflow_test_status").journal(request_id,latest_state)
             db.execute(
                 "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
                 ("awaiting_review", json.dumps(latest_state), now(), request_id),

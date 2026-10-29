@@ -342,6 +342,22 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
   </section>
 
   {creator_section}
+  <section class="asset"><h2>Workflow test status</h2>
+    <p>Internal checks do not publish content. Live testing requires separate owner approval.</p>
+    <button type="button" id="refreshWorkflow">Refresh test status</button>
+    <pre id="workflowStatus" style="white-space:pre-wrap">Status not loaded.</pre>
+  </section>
+  <script>
+  document.getElementById('refreshWorkflow').onclick=async()=>{{
+    const result=await fetch('/api/ripped-shorts/review/{token}/test-status');
+    const data=await result.json();
+    document.getElementById('workflowStatus').textContent=result.ok ?
+      'Test run: '+data.test_run_id+'\n'+Object.entries(data.checkpoints).map(([name,v])=>name+': '+v.status).join('\n')+
+      '\nOverall: '+data.overall_status+'\nPublishing: '+(data.publishing_globally_paused===true?'PAUSED':'NOT VERIFIED PAUSED')+
+      '\nInstagram Collab: '+(data.instagram_collaborators_in_approved_payload?'VALIDATED APPROVAL, NOT PROOF OF SUBMISSION':'NOT VERIFIED')+
+      '\nNext: '+data.next_required_action : 'Status unavailable. Refresh after the service recovers.';
+  }};
+  </script>
   <div class="progress">
     <div class="progressbar"><div id="bar"></div></div>
     <div class="progress-text" id="progressText"></div>
@@ -503,6 +519,8 @@ async def save_review_asset(token: str, index: int, request: Request):
     request_id = str(session["request_id"])
     row = _request_row(request_id)
     state = json.loads(row["state_json"])
+    if (state.get('schedule_master') or {}).get('shorts_status') in {'sending','accepted'}:
+        raise HTTPException(status_code=409, detail='Submitted copy is frozen; review the existing approval')
     drafts = list(state.get("copy_drafts") or [])
     if index < 0 or index >= len(drafts):
         raise HTTPException(status_code=404, detail="Review asset not found")
@@ -572,6 +590,8 @@ def regenerate_review_asset(token: str, index: int):
     request_id = str(session["request_id"])
     row = _request_row(request_id)
     state = json.loads(row["state_json"])
+    if (state.get('schedule_master') or {}).get('shorts_status') in {'sending','accepted'}:
+        raise HTTPException(status_code=409, detail='Submitted copy is frozen')
     drafts = list(state.get("copy_drafts") or [])
     if index < 0 or index >= len(drafts):
         raise HTTPException(status_code=404, detail="Review asset not found")
@@ -624,6 +644,16 @@ async def confirm_review_creators(token: str, request: Request):
             str(row["user_id"] or "web_review"), body.get("confirmed") is True)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
+    from workflow_test_status import journal
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        latest=db.execute('SELECT state_json FROM telegram_requests WHERE request_id=?',(str(session['request_id']),)).fetchone()
+        current=json.loads(latest['state_json'])
+        current['creator_approval']=approved
+        journal(str(session['request_id']),current,approved)
+        db.execute('UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?',
+            (json.dumps(current),_iso(_now()),str(session['request_id'])))
+        state=current
     if state.get("schedule_requested_at"):
         import telegram_intake as tg
         tg._notify_render_queue_complete(str(session["request_id"]), str(row["chat_id"]))
@@ -645,10 +675,13 @@ def finish_review(token: str):
     if str(state.get("show_id") or "").upper() in {"TCB", "TDOG"} and not approved_batch(request_id):
         raise HTTPException(status_code=409, detail="Confirm the featured creators once at the top of this page")
 
+    if any(d.get('copy_status') not in {'approved','edited'} for d in drafts):
+        raise HTTPException(status_code=409, detail='Approve every selected clip caption before finishing')
     state.pop("awaiting_copy_input", None)
     state["copy_review_completed_at"] = _iso(_now())
     state["schedule_requested_at"] = _iso(_now())
     state["copy_review_source"] = "temporary_web_review"
+    __import__('workflow_test_status').journal(request_id,state,approved_batch(request_id))
 
     with connect() as db:
         db.execute(
@@ -671,3 +704,40 @@ def finish_review(token: str):
     )
     tg._notify_render_queue_complete(request_id, str(row["chat_id"]))
     return {"status": "schedule_requested", "request_id": request_id}
+
+
+@router.get('/api/ripped-shorts/review/{token}/test-status')
+def workflow_status(token: str):
+    # Existing bearer review token, checked without modifying last_opened_at or DB schema.
+    import sqlite3
+    import audio_master_handoff as storage
+    from contextlib import closing
+    from workflow_test_status import project
+    with closing(sqlite3.connect(storage.DB_PATH.resolve().as_uri()+'?mode=ro',uri=True)) as db:
+        db.row_factory=sqlite3.Row
+        session=db.execute('SELECT * FROM copy_review_sessions WHERE token=?',(token,)).fetchone()
+        if not session:
+            raise HTTPException(status_code=404,detail='Review session not found')
+        if datetime.fromisoformat(session['expires_at']) <= _now():
+            raise HTTPException(status_code=410,detail='Review session expired')
+        row=db.execute('SELECT state_json FROM telegram_requests WHERE request_id=?',(session['request_id'],)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404,detail='Request not found')
+        state=json.loads(row['state_json'])
+    scheduler=None
+    target=(os.getenv('SCHEDULE_MASTER_INTERNAL_URL') or os.getenv('SCHEDULE_MASTER_URL') or '').strip().rstrip('/')
+    secret=os.getenv('SCHEDULE_MASTER_SHARED_SECRET','').strip()
+    if (state.get('schedule_master') or {}).get('shorts_status')=='accepted' and target and secret:
+        import requests
+        from urllib.parse import quote
+        try:
+            response=requests.get(target+'/schedule/test-runs/'+quote(session['request_id'],safe=''),
+                headers={'x-schedule-master-secret':secret},timeout=(3,8))
+            response.raise_for_status()
+            scheduler=response.json()
+        except Exception:
+            # Do not show stale permission/preflight success while downstream is unavailable.
+            scheduler={**((state.get('schedule_master') or {}).get('shorts_response') or {}),
+                'publishing_globally_paused':None,'delivery_validation':{'status':'BLOCKED','reason':'SCHEDULER_STATUS_UNAVAILABLE'}}
+    result=project(session['request_id'],state,state.get('creator_approval'),scheduler)
+    return result

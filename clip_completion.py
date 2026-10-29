@@ -275,10 +275,15 @@ def render_complete_clip(video, segment, output, renderer, aspect):
         if abs(actual_duration - (end - start)) > .25:
             raise CompletionReviewRequired("Export duration differs from selected bounds")
         probe = _run([os.getenv("FFPROBE_BINARY", "ffprobe"), "-v", "error",
-                      "-select_streams", "v:0", "-show_entries", "stream=codec_type",
-                      "-of", "default=nw=1:nk=1", str(output)])
-        if "video" not in probe.stdout.lower():
-            raise CompletionReviewRequired("Export has no video stream")
+                      "-show_entries", "stream=codec_type,width,height", "-of", "json", str(output)])
+        streams=json.loads(probe.stdout).get('streams',[])
+        videos=[s for s in streams if s.get('codec_type')=='video']
+        if not videos or not any(s.get('codec_type')=='audio' for s in streams):
+            raise CompletionReviewRequired('Export must have video and audio streams')
+        width,height=float(videos[0].get('width') or 0),float(videos[0].get('height') or 0)
+        ratio=9/16 if aspect=='9:16' else 16/9
+        if height<=0 or abs(width/height-ratio)>ratio*.05:
+            raise CompletionReviewRequired('Export aspect ratio differs from approved format')
     except Exception:
         Path(output).unlink(missing_ok=True)
         raise
@@ -286,6 +291,6 @@ def render_complete_clip(video, segment, output, renderer, aspect):
             "completion_check": {"status": "verified", "version": 2,
                 "basis": "approved_transcript_and_measured_export_speech",
                 "transcript_sentence_end": True, "media_duration": True,
-                "video_stream": True, "word_alignment": False,
+                "video_stream": True, "audio_stream": True, "format_valid": True, "word_alignment": False,
                 "audio_pause": False, "export_edges": True}}
 

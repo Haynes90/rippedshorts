@@ -1,5 +1,6 @@
 """Offline regression tests; no accounts, transcription, or production jobs."""
 import ast
+import json
 import logging
 import math
 import os
@@ -30,12 +31,12 @@ class StoredTranscriptRenderTests(unittest.TestCase):
         self.addCleanup(self.folder.cleanup)
         self.output = Path(self.folder.name) / 'clip.mp4'
         self.api = Mock(side_effect=AssertionError('Rendering must not call speech services'))
-        self.probe = Mock(return_value=SimpleNamespace(stdout='video\n'))
+        self.probe = Mock(return_value=SimpleNamespace(stdout=json.dumps({'streams':[{'codec_type':'video','width':1080,'height':1920},{'codec_type':'audio'}]})))
         self.duration = Mock(side_effect=[100, 5])
         self.edge = Mock(return_value=[{'word':w,'start':i*.7,'end':i*.7+.5}
                                       for i,w in enumerate('This is a complete sentence.'.split())])
         self.semantic = Mock(return_value=dict(complete_start=True,complete_end=True,complete_thought=True))
-        self.env = dict(Path=Path, math=math, os=os, CompletionReviewRequired=RuntimeError,
+        self.env = dict(Path=Path, math=math, os=os, json=json, CompletionReviewRequired=RuntimeError,
                         media_duration=self.duration, _run=self.probe,
                         transcribe_window=self.edge, review_thought=self.semantic,
                         _tokens=lambda words:re.findall(r'\w+', ' '.join(w['word'] for w in words).casefold()),
@@ -46,6 +47,7 @@ class StoredTranscriptRenderTests(unittest.TestCase):
 
     def test_both_aspects_keep_stored_bounds_and_verify_spoken_edges(self):
         for aspect in ('9:16', '16:9'):
+            self.probe.return_value.stdout=json.dumps({'streams':[{'codec_type':'video','width':1080 if aspect=='9:16' else 1920,'height':1920 if aspect=='9:16' else 1080},{'codec_type':'audio'}]})
             with self.subTest(aspect=aspect):
                 self.duration.side_effect = [100, 5]
                 result = self.render(Path('silent-source.mp4'), self.segment, self.output, self.renderer, aspect)
@@ -78,8 +80,8 @@ class StoredTranscriptRenderTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
 
     def test_audio_only_export_is_rejected(self):
-        self.probe.return_value.stdout = ''
-        with self.assertRaisesRegex(RuntimeError, 'no video stream'):
+        self.probe.return_value.stdout = json.dumps({'streams':[{'codec_type':'audio'}]})
+        with self.assertRaisesRegex(RuntimeError, 'video and audio'):
             self.render(Path('source'), self.segment, self.output, self.renderer, '9:16')
         self.assertFalse(self.output.exists())
 

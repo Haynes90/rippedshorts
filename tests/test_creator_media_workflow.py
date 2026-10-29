@@ -278,9 +278,9 @@ def test_outbox_preserves_creator_metadata_and_unowned_sheet_columns(monkeypatch
     # Existing asset is found through the actual asset_id header position.
     headers=['recorded_at','request_id','asset_id','brand_id','youtube_video_id','youtube_channel_id','source_url','source_title',
       'asset_type','candidate_number','drive_url','transcript','duration_seconds','main_theme','keywords','social_caption',
-      'video_title','video_description','hashtags','copy_source','handoff_status','creator_approval_json','custom_formula']
-    values.get().execute.return_value={'values':[headers,['','','asset']+['']*19+['=KEEP()']]}
+      'video_title','video_description','hashtags','copy_source','handoff_status','creator_approval_json','workflow_context_json','copy_status','custom_formula']
+    values.get().execute.return_value={'values':[headers,['','','asset']+['']*21+['=KEEP()']]}
     env[fn.name]({'request_id':'fixture','show_id':'TCB','creator_approval':{'approval_revision':1},'assets':[{'asset_id':'asset'}]})
     data=values.batchUpdate.call_args.kwargs['body']['data']
-    assert not any("!W" in item['range'] for item in data)
+    assert not any("!Y" in item['range'] for item in data)
     assert any(item['range'].endswith('!V2') and json.loads(item['values'][0][0])['approval_revision']==1 for item in data)
