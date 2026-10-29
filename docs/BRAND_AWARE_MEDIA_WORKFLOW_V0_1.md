@@ -162,3 +162,14 @@ This is a **cross-repository implementation requirement** for `Haynes90/Schedule
 This PR remains design documentation only. Implementation belongs in separate reviewed PRs. The batch approval must durably capture approved usernames, approver, timestamp and revision, and the consumer must preserve the exact snapshot through scheduling, outbox recovery and retries. Meta supports at most three collaborators for this flow. Validate usernames before submission. Persist the accepted container ID and submitted list before publishing, then the publishing receipt; do not equate request acceptance with invited users accepting. On a collaboration rejection, hold only the affected delivery for review. Required mocked acceptance cases cover a verified TCB source creator and TDOG standing hosts @andrethefarmer and @urbangardeningwithgray through website approval, Schedule Master intake and the actual adapter request. No live publishing is authorized.
 
 Official references: [media container](https://developers.facebook.com/documentation/instagram-platform/instagram-graph-api/reference/ig-user/media), [collaboration](https://developers.facebook.com/documentation/instagram-platform/instagram-api-with-facebook-login/collaboration).
+
+
+## Correlated internal completion contract (implementation directive)
+
+Reuse the existing Audio JSON job records, Ripped telegram_requests state/creator tables, Schedule Handoff Outbox and Schedule delivery rows. Carry test_run_id, request_id, original brand/source/channel IDs, service job IDs, accepted asset groups, delivery IDs, frozen caption digest and collaborator revision. Do not create a separate workflow database or worker.
+
+Expose authenticated read-only status through the existing review token and service-secret APIs. Retain independent SOURCE_ACCEPTED, MEDIA_READY, TRANSCRIPT_READY, CLIPS_SELECTED, CLIPS_APPROVED, RENDERS_VERIFIED, CREATORS_APPROVED, COPY_APPROVED, SCHEDULER_ACCEPTED, DELIVERY_VALIDATED and READY_FOR_LIVE_CANARY checkpoints; media/transcription may run concurrently. Preserve timestamps, prior successful evidence and sanitized failures. Distinguish waiting for a human, blocked configuration, actual failure, running, not started, passed and not applicable.
+
+Internal simulated success is not real source completion. A canary requires complete real media/transcript/render/approval/asset-ack evidence plus destination preflight and publishing paused. Permission uncertainty blocks readiness. Native invitation submission is separate from recipient acceptance. Completed internal validation and public publication have different records. No public posting, failed-job reset, hold release, secret change, merge or deployment follows automatically from internal completion.
+
+This PR remains documentation only. Application implementation and tests are in Audio #87, Ripped #74 and Schedule #19 (stacked on #18).
