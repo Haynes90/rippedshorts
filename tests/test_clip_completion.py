@@ -45,7 +45,7 @@ def test_missing_invalid_word_transcripts_fail(data):
     with pytest.raises(c.CompletionReviewRequired): c.validate_words(data,10)
 
 
-def test_transcript_retries_empty_response_and_reextracts(monkeypatch):
+def test_deterministic_empty_response_is_not_retried(monkeypatch,tmp_path):
     calls=[]
     def extract(args):
         Path(args[-1]).write_bytes(b'audio'); calls.append(args)
@@ -54,8 +54,9 @@ def test_transcript_retries_empty_response_and_reextracts(monkeypatch):
     monkeypatch.setattr(c,'_run',extract)
     monkeypatch.setattr(c.time,'sleep',lambda _:None)
     monkeypatch.setattr(c.requests,'post',lambda *a,**k:SimpleNamespace(status_code=200,raise_for_status=lambda:None,json=lambda:next(payloads)))
-    result=c.transcribe_window(Path('source'),100,110)
-    assert len(calls)==2 and result[0]['start']==100
+    with pytest.raises(c.TimingReviewRequired, match='No reliable timing'):
+        c.transcribe_window(tmp_path/'source',100,110)
+    assert len(calls)==1
 
 
 def test_overlap_recombines_sentence_crossing_chunk_boundary(monkeypatch):
@@ -96,14 +97,18 @@ def test_real_audio_pause_detection(monkeypatch,tmp_path):
 
 
 @pytest.mark.parametrize('aspect', ['16:9', '9:16'])
-def test_stored_transcript_render_does_not_retranscribe(monkeypatch, tmp_path, aspect):
+def test_stored_bounds_preserved_with_exported_speech_verification(monkeypatch, tmp_path, aspect):
     output = tmp_path / 'clip.mp4'
     monkeypatch.setattr(c, 'media_duration', lambda path: 5 if path == output else 200)
-    monkeypatch.setattr(c, '_run', lambda _: SimpleNamespace(stdout='video'))
+    import json
+    width,height=(1080,1920) if aspect=='9:16' else (1920,1080)
+    monkeypatch.setattr(c, '_run', lambda _: SimpleNamespace(stdout=json.dumps({'streams':[
+        dict(codec_type='video',width=width,height=height),dict(codec_type='audio')]})))
     def forbidden(*args):
         raise AssertionError('No speech service should run during rendering')
-    monkeypatch.setattr(c, 'transcribe_window', forbidden)
-    monkeypatch.setattr(c, 'review_thought', forbidden)
+    monkeypatch.setattr(c, 'transcribe_window', lambda *a:words('A complete sentence.',start=0,step=.6))
+    monkeypatch.setattr(c, 'review_thought', lambda *a:dict(complete_start=True,complete_end=True,complete_thought=True))
+    monkeypatch.setattr(c, 'transcribe_source', forbidden)
     monkeypatch.setattr(c, 'pause_end', forbidden)
     monkeypatch.setattr(c, 'verify_render', forbidden)
     def renderer(video, start, duration, destination):
@@ -112,7 +117,8 @@ def test_stored_transcript_render_does_not_retranscribe(monkeypatch, tmp_path, a
     result = c.render_complete_clip(Path('source'),
         {'start': 10, 'end': 15, 'transcript': 'A complete sentence.'},
         output, renderer, aspect)
-    assert result['completion_check']['basis'] == 'stored_transcript_and_media_bounds'
+    assert result['completion_check']['basis'] == 'approved_transcript_and_measured_export_speech'
+    assert result['completion_check']['export_edges'] is True
     assert result['completion_check']['audio_pause'] is False
 
 
