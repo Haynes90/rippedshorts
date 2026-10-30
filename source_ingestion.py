@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
 import os
 import re
 import subprocess
@@ -109,7 +110,10 @@ def _read_json_asset(asset: dict[str, Any], workdir: Path) -> Any:
 
 
 def _segments_from_json(payload: Any) -> list[dict[str, Any]]:
+    evidence = payload if isinstance(payload, dict) else {}
     if isinstance(payload, dict):
+        if payload.get("sentences"):
+            payload = {**payload, "segments": payload["sentences"]}
         for key in ("segments", "timed_transcript", "transcript"):
             if isinstance(payload.get(key), list):
                 payload = payload[key]
@@ -126,7 +130,11 @@ def _segments_from_json(payload: Any) -> list[dict[str, Any]]:
             duration = float(item["end"]) - start
         if duration is None and item.get("end_seconds") is not None:
             duration = float(item["end_seconds"]) - start
-        segments.append({"start": start, "duration": max(0.01, float(duration or 0.01)), "text": str(item["text"]).strip()})
+        # Preserve measured word/speaker evidence instead of flattening it to punctuation.
+        end = start + max(.01, float(duration or .01))
+        words = [w for w in evidence.get("words", []) if float(w["start"]) >= start and float(w["end"]) <= end]
+        segments.append({**item, "start": start, "end": end, "duration": end-start,
+                         "text": str(item["text"]).strip(), "words": words or item.get("words", [])})
     return segments
 
 
@@ -164,6 +172,36 @@ def _has_audio_stream(path: Path) -> bool:
         return result.returncode == 0 and "audio" in result.stdout.lower()
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def verify_youtube_source(path, video_id, youtube_url):
+    """Bind an entire validated source to its original ID and duration, durably."""
+    receipt = path.parent / f'{video_id}-source-validation.json'
+    fingerprint = {'source_id':video_id,'size':path.stat().st_size,'mtime_ns':path.stat().st_mtime_ns}
+    if receipt.is_file():
+        try:
+            prior = json.loads(receipt.read_text(encoding='utf-8'))
+        except (ValueError, OSError):
+            prior = {}
+        if all(prior.get(k)==v for k,v in fingerprint.items()) and 'source_channel_id' in prior:
+            return prior
+    with YoutubeDL({'quiet':True,'no_warnings':True,'skip_download':True,'noplaylist':True}) as yt:
+        metadata = yt.extract_info(youtube_url,download=False)
+    if metadata.get('id') != video_id or not metadata.get('duration') or metadata.get('is_live'):
+        raise ValueError('Original source identity/duration is unavailable; hold for media review')
+    result = subprocess.run([os.getenv('FFPROBE_BINARY','ffprobe'),'-v','error',
+        '-show_entries','format=duration:stream=codec_type','-of','json',str(path)],
+        capture_output=True,text=True,check=True,timeout=60)
+    data = json.loads(result.stdout)
+    actual = float(data.get('format',{}).get('duration') or 0)
+    expected = float(metadata['duration'])
+    if not math.isfinite(actual) or abs(actual-expected)>max(1,min(3,expected*.001)) or not {'video','audio'} <= {s.get('codec_type') for s in data.get('streams',[])}:
+        raise ValueError('Source is incomplete or lacks video/audio; hold for media review')
+    verified = {**fingerprint,'duration':actual,'expected_duration':expected,'source_channel_id':str(metadata.get('channel_id') or ''),'status':'verified'}
+    temporary = receipt.with_suffix('.tmp')
+    temporary.write_text(json.dumps(verified),encoding='utf-8')
+    temporary.replace(receipt)
+    return verified
 
 
 def _has_usable_audio(path: Path) -> bool:
@@ -238,10 +276,9 @@ def reuse_from_drive(video_id: str, workdir: Path) -> dict[str, Any]:
     video_path = None
     if video_asset:
         suffix = Path(video_asset["name"]).suffix or ".mp4"
-        candidate = download_drive_file(
-            video_asset["id"],
-            workdir / f"{video_id}-source{suffix}",
-        )
+        candidate = workdir / f"{video_id}-source{suffix}"
+        if not candidate.is_file() or not _has_usable_audio(candidate):
+            candidate = download_drive_file(video_asset["id"], candidate)
         if _has_usable_audio(candidate):
             video_path = candidate
         else:
@@ -263,7 +300,36 @@ def reuse_from_drive(video_id: str, workdir: Path) -> dict[str, Any]:
 
 
 
-def ingest_with_audio_master(video_id: str, youtube_url: str, progress=None) -> dict[str, Any]:
+def reuse_audio_master_result(result, video_id, workdir):
+    """Consume exact retained artifact IDs; do not depend on Drive search visibility."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    transcript = result.get("transcript") or {}
+    artifact = (transcript.get("drive_files") or {}).get("json") or {}
+    file_id = artifact.get("file_id") or artifact.get("id")
+    segments = []
+    if file_id:
+        path = workdir / f"{video_id}-audio-master-segments.json"
+        if not path.is_file():
+            download_drive_file(file_id, path)
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if document.get("video_id") != video_id:
+            raise ValueError("Audio Master transcript source identity mismatch")
+        segments = _segments_from_json(document)
+    source = result.get("source_video") or {}
+    video = workdir / f"{video_id}-source.mp4"
+    if source.get("drive_file_id") and (not video.is_file() or not _has_usable_audio(video)):
+        download_drive_file(source["drive_file_id"], video)
+    return {"video_path": video if video.is_file() and _has_usable_audio(video) else None,
+            "segments": segments, "sermon_boundary": None}
+
+
+class AudioMasterIngestError(RuntimeError):
+    def __init__(self, message, result):
+        super().__init__(message)
+        self.result = result
+
+
+def ingest_with_audio_master(video_id: str, youtube_url: str, progress=None, workflow_context=None) -> dict[str, Any]:
     """Run Audio Master's cache/download/transcription path and wait for Drive assets."""
     base = (os.getenv("AUDIO_MASTER_INTERNAL_URL") or "").strip().rstrip("/")
     if base and "://" not in base:
@@ -285,7 +351,7 @@ def ingest_with_audio_master(video_id: str, youtube_url: str, progress=None) -> 
     headers = {"x-ripped-shorts-ingest-secret": secret}
     response = requests.post(
         f"{base}/api/ripped-shorts/ingest",
-        json={"video_id": video_id, "youtube_url": youtube_url, "title": video_id},
+        json={"video_id": video_id, "youtube_url": youtube_url, "title": video_id, "workflow_context":workflow_context},
         headers=headers,
         timeout=(10, 60),
     )
@@ -315,8 +381,19 @@ def ingest_with_audio_master(video_id: str, youtube_url: str, progress=None) -> 
             )
         last = status_response.json()
         status = str(last.get("status") or "").lower()
+        retained = last.get("source_video") or {}
+        source_pending = not retained.get("drive_file_id") and str(retained.get("status") or "").lower() in {
+            "queued", "pending", "starting", "downloading", "uploading_to_drive"
+        }
+        # Transcription failure must not discard a full-video lane still running.
+        if source_pending and (last.get("error_class") == "TRANSCRIPTION_AUTHENTICATION_BLOCKED"
+                or status in {"configuration_blocked", "failed", "error", "transcription_failed"}):
+            time.sleep(poll_seconds)
+            continue
+        if last.get("error_class") == "TRANSCRIPTION_AUTHENTICATION_BLOCKED" or status == "configuration_blocked":
+            raise AudioMasterIngestError("TRANSCRIPTION_AUTHENTICATION_BLOCKED: Audio Master credential access failed", last)
         if status in {"failed", "error", "download_failed", "transcription_failed"}:
-            raise RuntimeError(f"Audio Master ingestion failed: {last.get('error') or last}")
+            raise AudioMasterIngestError("Audio Master ingestion failed; preserve completed artifacts and inspect the saved job", last)
         transcript = last.get("transcript") or {}
         source_video = last.get("source_video") or {}
         source_status = str(source_video.get("status") or "").lower()
@@ -341,18 +418,18 @@ def ingest_with_audio_master(video_id: str, youtube_url: str, progress=None) -> 
                 progress(f"🎧 Audio Master stage: {status}.")
             last_progress_signature = progress_signature
         if source_status in {"failed", "awaiting_route_rerun"}:
-            raise RuntimeError(
+            raise AudioMasterIngestError(
                 "Audio Master's retained source-video path failed: "
-                + str(last.get("error") or source_video)
+                + str(source_status), last
             )
         transcript_ready = bool(transcript.get("drive_files"))
         source_ready = bool(source_video.get("drive_file_id")) or source_status == "ready"
         if transcript_ready and source_ready:
             return last
         time.sleep(poll_seconds)
-    raise RuntimeError(
+    raise AudioMasterIngestError(
         f"Audio Master ingestion timed out after {timeout_seconds}s; "
-        f"last status={last.get('status')}, job_id={job_id}"
+        f"last status={last.get('status')}, job_id={job_id}", last
     )
 
 def _run_rapidapi_profile(

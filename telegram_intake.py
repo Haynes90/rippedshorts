@@ -523,9 +523,12 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
             state["render_queue_completed_at"] = now()
             state["rendered_count"] = rendered
             state["render_failed_count"] = failed
+            from batch_progress import shared_failure
+            shared = shared_failure(state)
             if failed:
-                state["stage"] = "awaiting_render_retry"
-                checkpoint_status = "awaiting_render_retry"
+                state["stage"] = "batch_blocked" if shared else "awaiting_render_retry"
+                checkpoint_status = state["stage"]
+                should_handoff = bool(rendered and not shared and state.get("schedule_requested_at"))
             else:
                 state["stage"] = "awaiting_review"
                 checkpoint_status = "awaiting_review"
@@ -583,7 +586,7 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
         else:
             send(chat_id, message)
 
-    # Never hand off while an approved render is missing.
+    # Clip-specific failures remain retryable; only verified successes are handed off.
     if should_handoff:
         RENDER_EXECUTOR.submit(
             _handoff_shorts_to_schedule_master, request_id, chat_id
@@ -1421,14 +1424,21 @@ def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> 
         "asset_type", "candidate_number", "drive_url", "transcript",
         "duration_seconds", "main_theme", "keywords", "social_caption",
         "video_title", "video_description", "hashtags", "copy_source",
-        "handoff_status",
+        "handoff_status", "creator_approval_json", "workflow_context_json", "copy_status",
     ]
     headers = get_or_create_headers(
         RIPPED_LOG_SHEET_ID, SCHEDULE_OUTBOX_TAB, headers
     )
+    def column(number):
+        value = ""
+        while number:
+            number, remainder = divmod(number - 1, 26)
+            value = chr(65 + remainder) + value
+        return value
+    last_column = column(len(headers))
     result = sheets.spreadsheets().values().get(
         spreadsheetId=RIPPED_LOG_SHEET_ID,
-        range=f"'{SCHEDULE_OUTBOX_TAB}'!A1:U5000",
+        range=f"'{SCHEDULE_OUTBOX_TAB}'!A1:{last_column}5000",
     ).execute()
     values = result.get("values", [])
     existing = {}
@@ -1454,6 +1464,8 @@ def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> 
         "source_url": str(payload.get("source_url") or ""),
         "source_title": str(payload.get("source_title") or ""),
         "handoff_status": status,
+        "creator_approval_json": json.dumps(payload.get("creator_approval")) if payload.get("creator_approval") else "",
+        "workflow_context_json": json.dumps(payload.get("workflow_context")) if payload.get("workflow_context") else "",
     }
     for asset in payload.get("assets") or []:
         row = {
@@ -1469,17 +1481,19 @@ def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> 
             "social_caption": str(asset.get("social_caption") or ""),
             "video_title": str(asset.get("video_title") or asset.get("title") or ""),
             "video_description": str(asset.get("video_description") or ""),
-            "hashtags": _normalize_hashtags(asset.get("hashtags")),
+            "hashtags": str(asset.get("hashtags") or "") if payload.get("workflow_context") else _normalize_hashtags(asset.get("hashtags")),
+            "copy_status": str(asset.get("copy_status") or ""),
             "copy_source": str(asset.get("copy_source") or ""),
         }
-        ordered = [row.get(header, "") for header in headers]
+        ordered = [row.get(header) for header in headers]
         asset_id = row["asset_id"]
         if asset_id in existing:
             row_number = existing[asset_id]
-            updates.append({
-                "range": f"'{SCHEDULE_OUTBOX_TAB}'!A{row_number}:U{row_number}",
-                "values": [ordered],
-            })
+            # Update only owned fields; preserve other columns and formulas.
+            for index, header in enumerate(headers, 1):
+                if header in row:
+                    updates.append({"range": f"'{SCHEDULE_OUTBOX_TAB}'!{column(index)}{row_number}",
+                                    "values": [[row[header]]]})
         else:
             rows_to_append.append(ordered)
     if updates:
@@ -1501,7 +1515,7 @@ def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> 
     )
 
 
-@durable_job("schedule_handoff", idempotent=True)
+@durable_job("schedule_handoff", idempotent=False)
 def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
     """Send all final rendered 9:16 and 16:9 selections downstream once."""
     target = (
@@ -1523,9 +1537,18 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
         if not row:
             return False
         state = json.loads(row["state_json"])
-        schedule = dict(state.get("schedule_master") or {})
-        if schedule.get("shorts_status") in {"sending", "accepted"}:
+        from creator_approval import approved_batch
+        creators = approved_batch(request_id) if str(state.get("show_id") or "").upper() in {"TCB", "TDOG"} else None
+        if str(state.get("show_id") or "").upper() in {"TCB", "TDOG"} and not creators:
+            send(chat_id, "Who's featured? Confirm the creators once at the top of the website review before scheduling.")
             return False
+        schedule = dict(state.get("schedule_master") or {})
+        from batch_progress import shared_failure, submitted_ids
+        if schedule.get("shorts_status") == "sending" or shared_failure(state):
+            return False
+        handed_off = submitted_ids(state)
+        if schedule.get('shorts_status')=='accepted' and not handed_off:
+            return False  # legacy acceptance with no manifest must stay protected
         reviews = dict(state.get("candidate_reviews") or {})
         clips = (state.get("result") or {}).get("segments", [])
         assets = []
@@ -1571,8 +1594,12 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
                     "summary": str(segment.get("summary") or ""),
                 }
             )
+        assets=[a for a in assets if a['asset_id'] not in handed_off]
+        drafts={d.get('asset_id'):d for d in state.get('copy_drafts') or []}
+        if drafts:
+            assets=[a for a in assets if drafts.get(a['asset_id'],{}).get('copy_status') in {'approved','edited'}]
         if not assets:
-            send(chat_id, "No rendered videos were selected for Schedule Master.")
+            send(chat_id, "No new rendered and copy-approved videos are waiting for Schedule Master.")
             return False
         schedule["shorts_status"] = "sending"
         schedule["shorts_started_at"] = now()
@@ -1608,7 +1635,13 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
             }
             for asset in assets
         ]
+    from workflow_test_status import journal, context, copy_revision
+    journal(request_id,state,creators)
+    workflow_context = {**context(request_id,state), 'approved_caption_revision':copy_revision(assets),
+        'approved_collaborator_revision':(creators or {}).get('approval_revision'),
+        'upstream_checkpoints':state['workflow_test']['checkpoints']}
     payload = {
+        "workflow_context":workflow_context,
         "request_id": request_id,
         "youtube_video_id": str(parsed.get("video_id") or ""),
         "youtube_channel_id": str(state.get("youtube_channel_id") or "") or None,
@@ -1617,6 +1650,7 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
         "source_title": _state_vid_title(state),
         # Ripped Shorts only hands off after "Approve Copy & Schedule".
         "copy_approved": True,
+        "creator_approval": creators,
         "assets": assets,
     }
     try:
@@ -1687,6 +1721,7 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
                 }
             )
             latest_state["schedule_master"] = latest_schedule
+            __import__("workflow_test_status").journal(request_id,latest_state,creators)
             db.execute(
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(latest_state), now(), request_id),
@@ -1699,7 +1734,7 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
         )
         send(
             chat_id,
-            f"✅ Selection complete. Schedule Master received {len(assets)} Short(s).",
+            f"✅ Schedule Master received {len(assets)} newly approved clip(s). Failed or pending selections remain in the batch.",
         )
         return True
     except Exception as exc:
@@ -1916,6 +1951,13 @@ def _status_card_text(request_id: str, status: str, state: dict[str, Any]) -> st
         f"16:9: {topic_total} candidates\n"
         f"Renders: {rendered} complete, {active} active\n"
         f"Next: {state.get('next_action') or 'continue'}"
+        + (f"\nBatch: {state['workflow_test']['batch_summary']['status']}"
+           f"\nCompleted: {state['workflow_test']['batch_summary']['completed_clips']}/{state['workflow_test']['batch_summary']['selected_clips']} selected"
+           if (state.get('workflow_test') or {}).get('batch_summary') else '')
+        + (f"\nTest: {state['workflow_test']['overall_status']}"
+           f"\nCheckpoint: {state['workflow_test'].get('blocking_stage') or 'complete'}"
+           f"\nTest next: {state['workflow_test'].get('next_required_action') or 'review'}"
+           if state.get('workflow_test') else '')
         + (
             f"\nError: {classify_error(error)} — {error[:500]}"
             if error
@@ -1992,6 +2034,8 @@ def _update_status_card(
 
 
 def _save(request_id: str, status: str, state: dict[str, Any]) -> None:
+    from workflow_test_status import journal
+    journal(request_id, state)
     state["heartbeat_at"] = now()
     if status != "error":
         state["last_successful_stage"] = str(state.get("stage") or status)
@@ -2084,6 +2128,8 @@ def _sentence_complete_candidate(
         "end": completed_end,
         "duration": round(completed_end - completed_start, 3),
         "transcript": " ".join(text for _, _, text in selected),
+        "words": [word for segment in transcript_segments for word in segment.get("words", [])
+                  if float(word["start"]) >= completed_start and float(word["end"]) <= completed_end],
     }
 
 
@@ -3452,25 +3498,43 @@ def _process(request_id: str) -> None:
                         video_id,
                         parsed["source_value"],
                         progress=lambda message: send(chat_id, message),
+                        workflow_context=__import__("workflow_test_status").context(request_id,state),
                     )
+                    from source_ingestion import reuse_audio_master_result
+                    exact_assets = reuse_audio_master_result(audio_master_result, video_id, work)
+                    video = exact_assets.get("video_path") or video
+                    segments = exact_assets.get("segments") or segments
                     state["audio_master_ingest"] = {
                         "job_id": audio_master_result.get("job_id"),
                         "status": audio_master_result.get("status"),
                         "skip_metadata_podhome": audio_master_result.get("skip_metadata_podhome"),
+                        "checkpoints": audio_master_result.get("checkpoints"),
                     }
                 except Exception as audio_master_error:
+                    partial = getattr(audio_master_error, "result", None)
+                    if partial:
+                        from source_ingestion import reuse_audio_master_result
+                        try:
+                            retained = reuse_audio_master_result(partial, video_id, work)
+                            video = retained.get("video_path") or video
+                            segments = retained.get("segments") or segments
+                        except Exception as artifact_error:
+                            state.setdefault("warnings", []).append(f"Retained artifact access failed: {type(artifact_error).__name__}")
                     # Audio Master is a cache accelerator, not a single point of
                     # failure. Its retained-video path can fail independently
                     # while Ripped Shorts can still download/transcribe directly.
                     state["audio_master_ingest"] = {
                         "status": "fallback_to_ripped_shorts",
+                        "job_id": partial.get("job_id") if partial else None,
+                        "error_class": partial.get("error_class") if partial else None,
+                        "upstream_status": partial.get("status") if partial else None,
                         "error": str(audio_master_error),
                     }
                     state.setdefault("warnings", []).append(
-                        f"Audio Master reusable-source path failed; using Ripped Shorts fallback: {audio_master_error}"
+                        f"Audio Master ingestion incomplete; preserving completed artifacts before fallback: {audio_master_error}"
                     )
                     logger.warning(
-                        "Audio Master source unavailable; continuing with direct Ripped Shorts ingestion "
+                        "Audio Master ingestion incomplete; preserving artifacts and recovering missing lanes "
                         "request_id=%s video_id=%s error=%s",
                         request_id,
                         video_id,
@@ -3478,12 +3542,14 @@ def _process(request_id: str) -> None:
                     )
                     send(
                         chat_id,
-                        "⚠️ Audio Master did not retain a usable source video. "
-                        "Ripped Shorts is continuing with its direct backup path.",
+                        "⚠️ Audio Master did not complete both reusable assets. "
+                        "Ripped Shorts is keeping completed files and recovering only what is missing.",
                     )
 
+                # Persist the acquisition result before any independent fallback can fail.
+                _save(request_id, "processing", {**state, "stage": "source_resolution"})
                 try:
-                    cache = reuse_from_drive(video_id, work)
+                    cache = reuse_from_drive(video_id, work) if not video or not segments else {"video_path":video,"segments":segments}
                 except Exception as cache_error:
                     cache = {"video_path": None, "segments": [], "sermon_boundary": None}
                     state.setdefault("warnings", []).append(
@@ -3520,6 +3586,15 @@ def _process(request_id: str) -> None:
                 else:
                     state.setdefault("warnings", []).append("Approved sermon boundary did not contain reusable transcript segments.")
 
+        if row["source_kind"] == "youtube":
+            from source_ingestion import verify_youtube_source
+            state["source_validation"] = verify_youtube_source(video, video_id, parsed["source_value"])
+            state["youtube_channel_id"] = state["source_validation"].get("source_channel_id") or state.get("youtube_channel_id") or ""
+            state["transcript_evidence"] = {'timed_segments':len(segments),
+                'speech_evidence':bool(segments) and all(str(seg.get('text') or '').strip() and float(seg.get('duration') or (float(seg.get('end') or 0)-float(seg.get('start') or 0)))>0 for seg in segments),
+                'word_count':sum(len(seg.get('words') or []) for seg in segments),
+                'audio_master_job_id':(state.get('audio_master_ingest') or {}).get('job_id'), 'observed_at':now()}
+            _save(request_id, "processing", {**state, "stage":"source_validated"})
         if row["mode"] == "topics":
             _process_topics(
                 request_id,
@@ -4644,6 +4719,7 @@ def _accept_update(
                 return {"status": "not_found"}
             state = json.loads(row["state_json"])
             if state.get("schedule_requested_at"):
+                _notify_render_queue_complete(request_id,chat_id)
                 return {"status": "already_scheduling", "request_id": request_id}
             drafts = list(state.get("copy_drafts") or [])
             if not drafts:
@@ -5169,6 +5245,7 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
                 "rendered_at": now(),
             }
             latest_state["topic_reviews"] = reviews
+            __import__("workflow_test_status").journal(request_id,latest_state)
             db.execute(
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(latest_state), now(), request_id),
@@ -5283,6 +5360,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
                 "rendered_at": rendered_at,
             }
             latest_state["candidate_reviews"] = reviews
+            __import__("workflow_test_status").journal(request_id,latest_state)
             db.execute(
                 "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
                 ("awaiting_review", json.dumps(latest_state), now(), request_id),

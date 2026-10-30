@@ -187,6 +187,9 @@ def upsert_job(spreadsheet_id: str, request_id: str, status: str, state: dict[st
                  if values and str(values[0]) == request_id),
                 None,
             )
+            prior = list(rows[target-1]) if target else []
+            prior += [""] * (len(HEADERS)-len(prior))
+            row.extend(state.get(key) or prior[index] for index,key in enumerate(HEADERS[18:],18))
             if target:
                 sheets.spreadsheets().values().update(
                     spreadsheetId=spreadsheet_id,
