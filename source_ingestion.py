@@ -12,6 +12,8 @@ import subprocess
 import time
 import shutil
 import threading
+import hashlib
+from urllib.parse import urlparse, parse_qs
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
@@ -174,16 +176,153 @@ def _has_audio_stream(path: Path) -> bool:
         return False
 
 
-def verify_youtube_source(path, video_id, youtube_url):
+def _source_digests(path):
+    sha, md5 = hashlib.sha256(), hashlib.md5(usedforsecurity=False)
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            sha.update(chunk)
+            md5.update(chunk)
+    return sha.hexdigest(), md5.hexdigest()
+
+
+def _url_video_id(url):
+    parsed = urlparse(str(url))
+    if parsed.scheme not in {'http', 'https'}:
+        return ''
+    host = str(parsed.hostname or '').lower()
+    if host == 'youtu.be':
+        return parsed.path.strip('/').split('/')[0]
+    if host in {'youtube.com', 'www.youtube.com', 'm.youtube.com'}:
+        parts = parsed.path.strip('/').split('/')
+        return parts[1] if len(parts) == 2 and parts[0] in {'live', 'shorts', 'embed'} else (parse_qs(parsed.query).get('v') or [''])[0]
+    return ''
+
+
+def _verify_retained_source(path, video_id, youtube_url, request_id, job_id, brand_id, test_run_id):
+    """GET authenticated existing evidence; never create a job or download video."""
+    if not request_id or not job_id:
+        return None
+    if not re.fullmatch(r'[A-Za-z0-9-]+', str(job_id)):
+        raise ValueError('Invalid retained Audio Master job identifier')
+    if _url_video_id(youtube_url) != video_id:
+        raise ValueError('Retained source URL/video identity mismatch')
+    base = (os.getenv('AUDIO_MASTER_INTERNAL_URL') or '').strip().rstrip('/')
+    if base and '://' not in base:
+        base = 'https://' + base
+    for suffix in ('/api/ripped-shorts/ingest', '/api/ripped-shorts'):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)].rstrip('/')
+            break
+    secret = (os.getenv('AUDIO_MASTER_INGEST_SECRET') or os.getenv('AUDIO_MASTER_WEBHOOK_SECRET') or '').strip()
+    if not base or not secret:
+        return None
+    response = requests.get(base + '/api/ripped-shorts/ingest/' + str(job_id),
+        headers={'x-ripped-shorts-ingest-secret': secret}, timeout=(10, 30))
+    if response.status_code in {401, 403}:
+        raise RuntimeError('Retained-source Audio Master authorization failed HTTP ' + str(response.status_code))
+    if response.status_code == 404 or response.status_code >= 500:
+        return None
+    if response.status_code != 200:
+        raise RuntimeError('Retained-source evidence unavailable HTTP ' + str(response.status_code))
+    evidence = response.json()
+    if evidence.get('job_id') != job_id or evidence.get('video_id') != video_id or _url_video_id(evidence.get('video_url')) != video_id:
+        raise ValueError('Authenticated Audio Master source identity mismatch')
+    correlation = (evidence.get('workflow_runs') or {}).get(test_run_id or 'TW-' + request_id)
+    if not correlation:
+        return None
+    if correlation.get('request_id') != request_id or correlation.get('source_video_id') != video_id or correlation.get('brand_id') != brand_id:
+        raise ValueError('Authenticated retained-source workflow identity mismatch')
+    source = evidence.get('source_video') or {}
+    proof = source.get('validation') or {}
+    transcript = evidence.get('transcript') or {}
+    checkpoints = evidence.get('checkpoints') or {}
+    if (source.get('status') != 'ready' or not source.get('drive_file_id')
+            or not all(proof.get(k) is True for k in ('video', 'audio', 'duration_matched'))
+            or any((checkpoints.get(k) or {}).get('status') != 'PASSED' for k in ('MEDIA_READY', 'TRANSCRIPT_READY'))):
+        return None
+    expected = float(proof.get('expected_duration') or 0)
+    authenticated_duration = float(proof.get('duration') or 0)
+    if (not math.isfinite(expected) or expected <= 0 or not math.isfinite(authenticated_duration)
+            or authenticated_duration <= 0 or abs(authenticated_duration-expected) > max(1, min(3, expected*.001))):
+        raise ValueError('Invalid authenticated original source duration')
+    service = drive_service()
+    metadata = service.files().get(fileId=source['drive_file_id'],
+        fields='id,size,mimeType,md5Checksum', supportsAllDrives=True).execute()
+    if not metadata.get('md5Checksum'):
+        return None
+    if metadata.get('id') != source['drive_file_id'] or not str(metadata.get('mimeType') or '').startswith('video/'):
+        raise ValueError('Retained Drive media identity/type mismatch')
+    before = path.stat()
+    sha, md5 = _source_digests(path)
+    if before.st_size != int(metadata.get('size') or 0) or md5 != metadata['md5Checksum']:
+        raise ValueError('Retained media checksum/size differs from authenticated Drive artifact')
+    probe = subprocess.run([os.getenv('FFPROBE_BINARY', 'ffprobe'), '-v', 'error',
+        '-show_entries', 'format=duration:stream=codec_type', '-of', 'json', str(path)],
+        capture_output=True, text=True, check=True, timeout=60)
+    data = json.loads(probe.stdout)
+    actual = float(data.get('format', {}).get('duration') or 0)
+    if (not math.isfinite(actual) or actual <= 0 or abs(actual-expected) > max(1, min(3, expected*.001))
+            or not {'video', 'audio'} <= {s.get('codec_type') for s in data.get('streams', [])}):
+        raise ValueError('Retained source is incomplete or lacks valid video/audio streams')
+    # Decode both actual streams, not merely their metadata. Corrupt frames must
+    # not be certified simply because a container reports the expected duration.
+    subprocess.run([os.getenv('FFMPEG_BINARY', 'ffmpeg'), '-v', 'error', '-xerror',
+        '-i', str(path), '-map', '0:v:0', '-map', '0:a:0', '-f', 'null', '-'],
+        capture_output=True, text=True, check=True, timeout=1800)
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise ValueError('Retained source changed during verification')
+    artifact = (transcript.get('drive_files') or {}).get('json') or {}
+    transcript_id = artifact.get('file_id') or artifact.get('id')
+    if not transcript_id or not transcript.get('segments_count'):
+        return None
+    raw = service.files().get_media(fileId=transcript_id, supportsAllDrives=True).execute()
+    document = json.loads(raw)
+    if document.get('video_id') != video_id:
+        raise ValueError('Retained transcript source identity mismatch')
+    from transcript_timing import normalize_response
+    timing = normalize_response({'segments': document.get('segments')}, duration=actual)
+    if len(timing['segments']) != int(transcript['segments_count']):
+        raise ValueError('Retained transcript segment count differs from authenticated job')
+    transcript_path = path.parent / f'{video_id}-audio-master-segments.json'
+    temporary = transcript_path.with_suffix('.tmp')
+    temporary.write_bytes(raw)
+    temporary.replace(transcript_path)
+    return {'source_id': video_id, 'size': after.st_size, 'mtime_ns': after.st_mtime_ns,
+        'source_sha256': sha, 'drive_file_id': source['drive_file_id'], 'drive_md5': md5,
+        'duration': actual, 'expected_duration': expected, 'status': 'verified',
+        'source_channel_id': str(correlation.get('source_channel_id') or ''),
+        'verification_method': 'authenticated_audio_master_retained', 'streams_decoded': True,
+        'request_id': request_id, 'audio_master_job_id': job_id,
+        'transcript_file_id': transcript_id, 'transcript_path': str(transcript_path),
+        'transcript_segments': len(timing['segments']),
+        'timing_basis': document.get('speech_timing_basis'), 'checkpoints': checkpoints}
+
+
+def verify_youtube_source(path, video_id, youtube_url, *, request_id=None,
+                          audio_master_job_id=None, brand_id=None, test_run_id=None, retained_only=False):
     """Bind an entire validated source to its original ID and duration, durably."""
     receipt = path.parent / f'{video_id}-source-validation.json'
     fingerprint = {'source_id':video_id,'size':path.stat().st_size,'mtime_ns':path.stat().st_mtime_ns}
+    if fingerprint['size'] <= 0:
+        raise ValueError('Retained source is missing or empty')
+    verified = _verify_retained_source(path, video_id, youtube_url, request_id,
+                                      audio_master_job_id, brand_id, test_run_id)
+    if verified:
+        temporary = receipt.with_suffix('.tmp')
+        temporary.write_text(json.dumps(verified), encoding='utf-8')
+        temporary.replace(receipt)
+        return verified
+    if retained_only:
+        return None
     if receipt.is_file():
         try:
             prior = json.loads(receipt.read_text(encoding='utf-8'))
         except (ValueError, OSError):
             prior = {}
-        if all(prior.get(k)==v for k,v in fingerprint.items()) and 'source_channel_id' in prior:
+        if (prior.get('verification_method') == 'youtube_metadata'
+                and all(prior.get(k)==v for k,v in fingerprint.items()) and 'source_channel_id' in prior
+                and prior.get('source_sha256') == _source_digests(path)[0]):
             return prior
     with YoutubeDL({'quiet':True,'no_warnings':True,'skip_download':True,'noplaylist':True}) as yt:
         metadata = yt.extract_info(youtube_url,download=False)
@@ -197,7 +336,8 @@ def verify_youtube_source(path, video_id, youtube_url):
     expected = float(metadata['duration'])
     if not math.isfinite(actual) or abs(actual-expected)>max(1,min(3,expected*.001)) or not {'video','audio'} <= {s.get('codec_type') for s in data.get('streams',[])}:
         raise ValueError('Source is incomplete or lacks video/audio; hold for media review')
-    verified = {**fingerprint,'duration':actual,'expected_duration':expected,'source_channel_id':str(metadata.get('channel_id') or ''),'status':'verified'}
+    verified = {**fingerprint,'duration':actual,'expected_duration':expected,'source_channel_id':str(metadata.get('channel_id') or ''),'status':'verified',
+                'verification_method':'youtube_metadata','source_sha256':_source_digests(path)[0]}
     temporary = receipt.with_suffix('.tmp')
     temporary.write_text(json.dumps(verified),encoding='utf-8')
     temporary.replace(receipt)

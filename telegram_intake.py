@@ -3440,6 +3440,7 @@ def _process(request_id: str) -> None:
         send(chat_id, f"⬇️ Retrieving source\nJob ID: {request_id}")
         work = SOURCE_DIR / f"telegram-{request_id}"
         work.mkdir(parents=True, exist_ok=True)
+        retained_validation = None
         if row["source_kind"] == "drive":
             ids = state["parsed"]["drive_ids"]
             video_id = ids[0]
@@ -3460,13 +3461,32 @@ def _process(request_id: str) -> None:
         else:
             parsed = state["parsed"]
             video_id = parsed["video_id"]
-            state["vid_title"] = _youtube_vid_title(parsed["source_value"])
+            retained_job_id = state.get('retained_audio_master_job_id') or (state.get('audio_master_ingest') or {}).get('job_id')
+            if retained_job_id:
+                from source_ingestion import verify_youtube_source
+                retained_validation = verify_youtube_source(work / f'{video_id}-source.mp4',
+                    video_id, parsed['source_value'], request_id=request_id,
+                    audio_master_job_id=retained_job_id, brand_id=state.get('show_id'),
+                    test_run_id=(state.get('workflow_test') or {}).get('test_run_id'), retained_only=True)
+            state["vid_title"] = state.get('vid_title') or _youtube_vid_title(parsed["source_value"])
             boundary = None
             cache = {"video_path": None, "segments": [], "sermon_boundary": None}
             try:
-                send(chat_id, f"🔎 Checking Google Drive for existing files containing YouTube ID {video_id}.")
-                cache = reuse_from_drive(video_id, work)
+                if retained_validation:
+                    cache = {'video_path':work / f'{video_id}-source.mp4', 'sermon_boundary':None,
+                        'segments':[{**s, 'duration':float(s['end'])-float(s['start'])}
+                                    for s in _segments(Path(retained_validation['transcript_path']))]}
+                    state['audio_master_ingest'] = {'job_id':retained_job_id, 'status':'reused_verified',
+                        'checkpoints':retained_validation['checkpoints']}
+                    state['source_validation'] = retained_validation
+                    _save(request_id, 'processing', {**state, 'stage':'retained_source_verified'})
+                    send(chat_id, '✅ Reusing authenticated Audio Master source and timed transcript; no source download or transcription needed.')
+                else:
+                    send(chat_id, f"🔎 Checking Google Drive for existing files containing YouTube ID {video_id}.")
+                    cache = reuse_from_drive(video_id, work)
             except Exception as cache_error:
+                if retained_validation:
+                    raise
                 state.setdefault("warnings", []).append(f"Drive cache lookup failed: {cache_error}")
 
             reusable = _reusable_youtube_job(video_id)
@@ -3590,7 +3610,7 @@ def _process(request_id: str) -> None:
 
         if row["source_kind"] == "youtube":
             from source_ingestion import verify_youtube_source
-            state["source_validation"] = verify_youtube_source(video, video_id, parsed["source_value"])
+            state["source_validation"] = retained_validation or verify_youtube_source(video, video_id, parsed["source_value"])
             state["youtube_channel_id"] = state["source_validation"].get("source_channel_id") or state.get("youtube_channel_id") or ""
             state["transcript_evidence"] = {'timed_segments':len(segments),
                 'speech_evidence':bool(segments) and all(str(seg.get('text') or '').strip() and float(seg.get('duration') or (float(seg.get('end') or 0)-float(seg.get('start') or 0)))>0 for seg in segments),
