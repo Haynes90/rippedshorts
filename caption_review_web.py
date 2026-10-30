@@ -263,6 +263,7 @@ def _card_html(item: dict[str, Any], token: str) -> str:
           <span class="status" id="status-{index}">{status}</span>
         </div>
         {preview}
+        <label><input type="checkbox" id="playback-{index}" style="width:auto" /> I played this clip and confirmed audible audio</label>
         <div class="fields">{fields}</div>
         <div class="actions">
           <button class="secondary" onclick="keepAsset({index})">Keep</button>
@@ -355,7 +356,7 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
       'Test run: '+data.test_run_id+'\n'+Object.entries(data.checkpoints).map(([name,v])=>name+': '+v.status).join('\n')+
       '\nOverall: '+data.overall_status+'\nPublishing: '+(data.publishing_globally_paused===true?'PAUSED':'NOT VERIFIED PAUSED')+
       '\nInstagram Collab: '+(data.instagram_collaborators_in_approved_payload?'VALIDATED APPROVAL, NOT PROOF OF SUBMISSION':'NOT VERIFIED')+
-      '\nNext: '+data.next_required_action : 'Status unavailable. Refresh after the service recovers.';
+      '\nBatch: '+(data.batch_summary?.status||'NOT STARTED')+'\nCompleted clips: '+(data.batch_summary?.completed_clips||0)+'/'+(data.batch_summary?.selected_clips||0)+'\nNext: '+data.next_required_action : 'Status unavailable. Refresh after the service recovers.';
   }};
   </script>
   <div class="progress">
@@ -412,7 +413,7 @@ async function saveAsset(index, action='save') {{
     const response = await fetch(`/api/ripped-shorts/review/${{TOKEN}}/asset/${{index}}`, {{
       method:'POST',
       headers:{{'Content-Type':'application/json'}},
-      body:JSON.stringify(bodyFor(index, action))
+      body:JSON.stringify({{...bodyFor(index, action),playback_verified:document.getElementById('playback-'+index)?.checked===true}})
     }});
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Save failed');
@@ -519,8 +520,6 @@ async def save_review_asset(token: str, index: int, request: Request):
     request_id = str(session["request_id"])
     row = _request_row(request_id)
     state = json.loads(row["state_json"])
-    if (state.get('schedule_master') or {}).get('shorts_status') in {'sending','accepted'}:
-        raise HTTPException(status_code=409, detail='Submitted copy is frozen; review the existing approval')
     drafts = list(state.get("copy_drafts") or [])
     if index < 0 or index >= len(drafts):
         raise HTTPException(status_code=404, detail="Review asset not found")
@@ -528,6 +527,23 @@ async def save_review_asset(token: str, index: int, request: Request):
     body = await request.json()
     action = str(body.get("action") or "save").lower()
     draft = dict(drafts[index])
+    from batch_progress import copy_frozen
+    if copy_frozen(state,str(draft.get('asset_id') or '')):
+        if all(str(body.get(k) or '')==str(draft.get(k) or '') for k in ('social_caption','video_title','video_description','hashtags') if k in body):
+            if body.get('playback_verified') is True:
+                media_url=_media_for_state(state,request_id).get(str(draft.get('asset_id') or ''))
+                if not media_url:
+                    raise HTTPException(status_code=409,detail='Rendered media is unavailable')
+                with connect() as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    latest=db.execute('SELECT state_json FROM telegram_requests WHERE request_id=?',(request_id,)).fetchone()
+                    current=json.loads(latest['state_json'])
+                    current.setdefault('website_playback_checks',{})[draft['asset_id']]={'verified':True,'media_url':media_url,'verified_by':str(row['user_id'] or 'web_review'),'verified_at':_iso(_now())}
+                    db.execute('UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?',(json.dumps(current),_iso(_now()),request_id))
+            return {'status':'already_submitted','asset_index':index,
+                'completed':sum(d.get('copy_status') in {'approved','edited'} for d in drafts),
+                'regenerated':sum(int(d.get('regeneration_count') or 0)>0 for d in drafts)}
+        raise HTTPException(status_code=409,detail='Submitted copy is frozen')
     asset_type = str(draft.get("asset_type") or "")
     changed = False
 
@@ -564,8 +580,26 @@ async def save_review_asset(token: str, index: int, request: Request):
     drafts[index] = draft
     state["copy_drafts"] = drafts
     state["copy_review_index"] = index
+    if body.get('playback_verified') is True:
+        media_url=_media_for_state(state,request_id).get(str(draft.get('asset_id') or ''))
+        if not media_url:
+            raise HTTPException(status_code=409,detail='This clip does not have rendered media yet')
+        state.setdefault('website_playback_checks',{})[draft['asset_id']]={'verified':True,'media_url':media_url,'verified_by':str(row['user_id'] or 'web_review'),'verified_at':_iso(_now())}
 
     with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        latest=db.execute('SELECT state_json FROM telegram_requests WHERE request_id=?',(request_id,)).fetchone()
+        current=json.loads(latest['state_json'])
+        latest_drafts=list(current.get('copy_drafts') or [])
+        matching=next((i for i,d in enumerate(latest_drafts) if d.get('asset_id')==draft.get('asset_id')),None)
+        if matching is None or copy_frozen(current,str(draft.get('asset_id') or '')):
+            raise HTTPException(status_code=409,detail='Clip changed or was submitted while editing; refresh review')
+        latest_drafts[matching]=draft
+        current['copy_drafts']=latest_drafts
+        current['copy_review_index']=matching
+        if body.get('playback_verified') is True:
+            current.setdefault('website_playback_checks',{})[draft['asset_id']]=state['website_playback_checks'][draft['asset_id']]
+        state=current
         db.execute(
             "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
             (json.dumps(state), _iso(_now()), request_id),
@@ -590,9 +624,10 @@ def regenerate_review_asset(token: str, index: int):
     request_id = str(session["request_id"])
     row = _request_row(request_id)
     state = json.loads(row["state_json"])
-    if (state.get('schedule_master') or {}).get('shorts_status') in {'sending','accepted'}:
-        raise HTTPException(status_code=409, detail='Submitted copy is frozen')
     drafts = list(state.get("copy_drafts") or [])
+    from batch_progress import copy_frozen
+    if 0 <= index < len(drafts) and copy_frozen(state,str(drafts[index].get('asset_id') or '')):
+        raise HTTPException(status_code=409,detail='Submitted copy is frozen')
     if index < 0 or index >= len(drafts):
         raise HTTPException(status_code=404, detail="Review asset not found")
 
@@ -670,12 +705,14 @@ def finish_review(token: str):
     if not drafts:
         raise HTTPException(status_code=409, detail="No copy drafts are available")
     if state.get("schedule_requested_at"):
+        import telegram_intake as tg
+        tg._notify_render_queue_complete(request_id,str(row['chat_id']))
         return {"status": "already_scheduling", "request_id": request_id}
     from creator_approval import approved_batch
     if str(state.get("show_id") or "").upper() in {"TCB", "TDOG"} and not approved_batch(request_id):
         raise HTTPException(status_code=409, detail="Confirm the featured creators once at the top of this page")
 
-    if any(d.get('copy_status') not in {'approved','edited'} for d in drafts):
+    if any(d.get('copy_status') not in {'approved','edited'} for d in drafts if str(d.get('asset_id') or '') in _media_for_state(state,request_id)):
         raise HTTPException(status_code=409, detail='Approve every selected clip caption before finishing')
     state.pop("awaiting_copy_input", None)
     state["copy_review_completed_at"] = _iso(_now())

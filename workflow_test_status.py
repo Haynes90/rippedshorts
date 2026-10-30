@@ -129,6 +129,8 @@ def project(request_id, state, creators=None, scheduler=None):
         'internal_validation_completed_at':response.get('internal_validation_completed_at'),
         'internal_test_completed_at':response.get('internal_test_completed_at'),
         'public_publication_complete':False}
+    from batch_progress import summarize
+    result['batch_summary']=summarize(request_id,state,response)
     return result
 
 

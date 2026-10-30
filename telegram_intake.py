@@ -523,9 +523,12 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
             state["render_queue_completed_at"] = now()
             state["rendered_count"] = rendered
             state["render_failed_count"] = failed
+            from batch_progress import shared_failure
+            shared = shared_failure(state)
             if failed:
-                state["stage"] = "awaiting_render_retry"
-                checkpoint_status = "awaiting_render_retry"
+                state["stage"] = "batch_blocked" if shared else "awaiting_render_retry"
+                checkpoint_status = state["stage"]
+                should_handoff = bool(rendered and not shared and state.get("schedule_requested_at"))
             else:
                 state["stage"] = "awaiting_review"
                 checkpoint_status = "awaiting_review"
@@ -583,7 +586,7 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
         else:
             send(chat_id, message)
 
-    # Never hand off while an approved render is missing.
+    # Clip-specific failures remain retryable; only verified successes are handed off.
     if should_handoff:
         RENDER_EXECUTOR.submit(
             _handoff_shorts_to_schedule_master, request_id, chat_id
@@ -1512,7 +1515,7 @@ def _persist_schedule_outbox(payload: dict[str, Any], status: str = "READY") -> 
     )
 
 
-@durable_job("schedule_handoff", idempotent=True)
+@durable_job("schedule_handoff", idempotent=False)
 def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
     """Send all final rendered 9:16 and 16:9 selections downstream once."""
     target = (
@@ -1540,8 +1543,12 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
             send(chat_id, "Who's featured? Confirm the creators once at the top of the website review before scheduling.")
             return False
         schedule = dict(state.get("schedule_master") or {})
-        if schedule.get("shorts_status") in {"sending", "accepted"}:
+        from batch_progress import shared_failure, submitted_ids
+        if schedule.get("shorts_status") == "sending" or shared_failure(state):
             return False
+        handed_off = submitted_ids(state)
+        if schedule.get('shorts_status')=='accepted' and not handed_off:
+            return False  # legacy acceptance with no manifest must stay protected
         reviews = dict(state.get("candidate_reviews") or {})
         clips = (state.get("result") or {}).get("segments", [])
         assets = []
@@ -1587,8 +1594,12 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
                     "summary": str(segment.get("summary") or ""),
                 }
             )
+        assets=[a for a in assets if a['asset_id'] not in handed_off]
+        drafts={d.get('asset_id'):d for d in state.get('copy_drafts') or []}
+        if drafts:
+            assets=[a for a in assets if drafts.get(a['asset_id'],{}).get('copy_status') in {'approved','edited'}]
         if not assets:
-            send(chat_id, "No rendered videos were selected for Schedule Master.")
+            send(chat_id, "No new rendered and copy-approved videos are waiting for Schedule Master.")
             return False
         schedule["shorts_status"] = "sending"
         schedule["shorts_started_at"] = now()
@@ -1723,7 +1734,7 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
         )
         send(
             chat_id,
-            f"✅ Selection complete. Schedule Master received {len(assets)} Short(s).",
+            f"✅ Schedule Master received {len(assets)} newly approved clip(s). Failed or pending selections remain in the batch.",
         )
         return True
     except Exception as exc:
@@ -1940,6 +1951,9 @@ def _status_card_text(request_id: str, status: str, state: dict[str, Any]) -> st
         f"16:9: {topic_total} candidates\n"
         f"Renders: {rendered} complete, {active} active\n"
         f"Next: {state.get('next_action') or 'continue'}"
+        + (f"\nBatch: {state['workflow_test']['batch_summary']['status']}"
+           f"\nCompleted: {state['workflow_test']['batch_summary']['completed_clips']}/{state['workflow_test']['batch_summary']['selected_clips']} selected"
+           if (state.get('workflow_test') or {}).get('batch_summary') else '')
         + (f"\nTest: {state['workflow_test']['overall_status']}"
            f"\nCheckpoint: {state['workflow_test'].get('blocking_stage') or 'complete'}"
            f"\nTest next: {state['workflow_test'].get('next_required_action') or 'review'}"
@@ -4705,6 +4719,7 @@ def _accept_update(
                 return {"status": "not_found"}
             state = json.loads(row["state_json"])
             if state.get("schedule_requested_at"):
+                _notify_render_queue_complete(request_id,chat_id)
                 return {"status": "already_scheduling", "request_id": request_id}
             drafts = list(state.get("copy_drafts") or [])
             if not drafts:
