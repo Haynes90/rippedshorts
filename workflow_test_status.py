@@ -48,6 +48,9 @@ def project(request_id, state, creators=None, scheduler=None):
     stage('SOURCE_ACCEPTED','PASSED' if source_ok else 'WAITING_FOR_HUMAN',
           {'source_video_id':identity['source_video_id'],'brand_id':identity['brand_id']})
     media = state.get('source_validation') or state.get('source_video_validation') or {}
+    upstream_media = ((state.get('audio_master_ingest') or {}).get('checkpoints') or {}).get('MEDIA_READY') or {}
+    if not media and upstream_media.get('status') == 'PASSED':
+        media = {**(upstream_media.get('evidence') or {}), 'status': 'verified', 'verified_by': 'audiomaster'}
     stage('MEDIA_READY','PASSED' if media.get('status')=='verified' else 'NOT_STARTED',media)
     transcript = state.get('transcript_evidence') or {}
     stage('TRANSCRIPT_READY','PASSED' if transcript.get('timed_segments',0)>0 and transcript.get('speech_evidence') else 'NOT_STARTED',transcript)

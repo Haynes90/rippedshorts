@@ -23,6 +23,10 @@ class CompletionReviewRequired(RuntimeError):
     """The selected material cannot safely be exported automatically."""
 
 
+class TimingReviewRequired(CompletionReviewRequired):
+    """Deterministic timing failure: preserve evidence and stop identical retries."""
+
+
 def _run(args):
     result = subprocess.run(args, capture_output=True, text=True, timeout=1800)
     if result.returncode:
@@ -39,18 +43,11 @@ def media_duration(path):
 
 
 def validate_words(data, duration):
-    words = data.get("words") if isinstance(data, dict) else None
-    if not isinstance(words, list) or not words:
-        raise CompletionReviewRequired("Missing word transcript; transcribe again")
-    previous = -1.0
-    for word in words:
-        start, end = float(word["start"]), float(word["end"])
-        if (not all(math.isfinite(x) for x in (start, end)) or start < previous
-                or start < 0 or end < start or end > duration + .1
-                or not str(word.get("word", "")).strip()):
-            raise CompletionReviewRequired("Invalid word timestamps; transcribe again")
-        previous = start
-    return words
+    from transcript_timing import normalize_words, TranscriptTimingError
+    try:
+        return normalize_words(data.get('words'), duration)[0]
+    except TranscriptTimingError as exc:
+        raise TimingReviewRequired(str(exc)) from None
 
 
 def transcribe_window(video, start, end):
@@ -67,21 +64,36 @@ def transcribe_window(video, start, end):
                     "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", str(audio)])
                 if not audio.is_file() or not 0 < audio.stat().st_size < 24 * 1024 * 1024:
                     raise CompletionReviewRequired("Verification audio missing or too large")
-                with _TRANSCRIPTION_GATE:
-                    with audio.open("rb") as stream:
-                        response = requests.post("https://api.openai.com/v1/audio/transcriptions",
-                            headers={"Authorization": f"Bearer {key}"},
-                            data=[("model", "whisper-1"), ("response_format", "verbose_json"),
-                                  ("timestamp_granularities[]", "word")],
-                            files={"file": (audio.name, stream, "audio/mpeg")}, timeout=(15, 900))
+                from transcript_timing import cached_response, normalize_response, TranscriptTimingError
+                def fetch():
+                    with _TRANSCRIPTION_GATE, audio.open('rb') as stream:
+                        response = requests.post('https://api.openai.com/v1/audio/transcriptions',
+                            headers={'Authorization': f'Bearer {key}'},
+                            data=[('model', 'whisper-1'), ('response_format', 'verbose_json'),
+                                  ('timestamp_granularities[]', 'word'), ('timestamp_granularities[]', 'segment')],
+                            files={'file': (audio.name, stream, 'audio/mpeg')}, timeout=(15, 900))
                     if response.status_code in {401, 403}:
-                        raise CompletionReviewRequired("TRANSCRIPTION_AUTHENTICATION_BLOCKED: verify the configured transcription credential")
-                    if response.status_code >= 400:
-                        logger.warning("RIPPED_TRANSCRIPTION_RESPONSE status=%s body=%s", response.status_code, response.text[:240])
-                response.raise_for_status()
-                words = validate_words(response.json(), end - start)
-                return [{**w, "start": float(w["start"]) + start,
-                         "end": float(w["end"]) + start} for w in words]
+                        raise CompletionReviewRequired('TRANSCRIPTION_AUTHENTICATION_BLOCKED: verify the configured transcription credential')
+                    # Provider error bodies can contain sensitive data. Status and
+                    # error type suffice for bounded transient-error retries.
+                    if 400 <= response.status_code < 500 and response.status_code not in {408, 409, 429}:
+                        raise TimingReviewRequired(f'Provider rejected transcription HTTP {response.status_code}')
+                    response.raise_for_status()
+                    try:
+                        return response.json()
+                    except ValueError:
+                        raise TimingReviewRequired('Provider returned invalid transcription JSON') from None
+                payload = cached_response(audio, 'whisper-1', fetch, Path(video).parent / '.speech-evidence')
+                try:
+                    timing = normalize_response(payload, duration=end-start, offset=start)
+                except TranscriptTimingError as exc:
+                    raise TimingReviewRequired(str(exc)) from None
+                if timing['words']:
+                    return timing['words']
+                return [{**s, 'timing_basis': 'provider_segment_timing',
+                         'requires_acoustic_boundary_validation': True} for s in timing['segments']]
+        except TimingReviewRequired:
+            raise
         except requests.RequestException as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             logger.warning("RIPPED_TRANSCRIPTION_RETRY attempt=%s status=%s error=%s", attempt + 1, status, type(exc).__name__)
@@ -121,6 +133,14 @@ def transcribe_source(video, progress=None):
             if progress:
                 progress(f"Transcript progress: {completed}/{len(windows)} chunks verified.")
     words.sort(key=lambda w: (w["start"], w["end"]))
+    if any(w.get('timing_basis') == 'provider_segment_timing' for w in words):
+        # Keep provider segments as segments. Never distribute their times among
+        # caption words. Rendering still checks actual speech and acoustic edges.
+        return [{**w, 'text': w.get('text') or w.get('word'),
+                 'duration': w['end']-w['start'],
+                 'words': [w] if 'word' in w else [],
+                 'timing_basis': 'provider_word_timing' if 'word' in w else 'provider_segment_timing',
+                 'requires_acoustic_boundary_validation': True} for w in words]
     # Independent ASR calls can shift a word across the seam. Remove overlapping
     # copies only; repetitions spoken at distinct times remain intact.
     unique = []
@@ -213,7 +233,23 @@ def pause_end(video, word_end, ceiling):
 
 
 def _tokens(words):
-    return re.findall(r"\w+", " ".join(w["word"] for w in words).casefold())
+    return re.findall(r"\w+", " ".join(w.get('word') or w.get('text') or '' for w in words).casefold())
+
+
+def segment_edge_guard(output, sample_start, sample_end, tail):
+    """Segment ASR cannot prove word endpoints; require measured quiet at the cut."""
+    origin = max(sample_start, sample_end-.5) if tail else sample_start
+    length = sample_end-origin if tail else min(.5, sample_end-origin)
+    scan = _run([os.getenv('FFMPEG_BINARY', 'ffmpeg'), '-hide_banner', '-nostats',
+        '-ss', str(origin), '-i', str(output), '-t', str(length), '-vn', '-af',
+        'silencedetect=noise=-35dB:d=0.08', '-f', 'null', '-'])
+    starts = re.findall(r'silence_start: ([0-9.]+)', scan.stderr)
+    ends = re.findall(r'silence_end: ([0-9.]+)', scan.stderr)
+    quiet = any((float(s)<=length-.08 and (float(ends[i]) if i<len(ends) else length)>=length-.02)
+                if tail else (float(s)<=.015 and (float(ends[i]) if i<len(ends) else length)>=.08)
+                for i,s in enumerate(starts))
+    if not quiet:
+        raise CompletionReviewRequired('Segment timing cannot establish a safe acoustic export edge; review bounds')
 
 
 def verify_render(output, selected, start, end):
@@ -264,6 +300,8 @@ def render_complete_clip(video, segment, output, renderer, aspect):
             sample_start = max(0, end-start-18) if tail else 0
             sample_end = end-start if tail else min(18, end-start)
             heard = transcribe_window(output, sample_start, sample_end)
+            if any(w.get('timing_basis') == 'provider_segment_timing' for w in heard):
+                segment_edge_guard(output, sample_start, sample_end, tail)
             expected_tokens = _tokens(expected[-6:] if tail else expected[:6])
             heard_tokens = _tokens(heard)
             edge = heard_tokens[-len(expected_tokens):] if tail else heard_tokens[:len(expected_tokens)]

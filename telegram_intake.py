@@ -3528,6 +3528,8 @@ def _process(request_id: str) -> None:
                         "job_id": partial.get("job_id") if partial else None,
                         "error_class": partial.get("error_class") if partial else None,
                         "upstream_status": partial.get("status") if partial else None,
+                        "checkpoints": partial.get('checkpoints') if partial else (state.get('audio_master_ingest') or {}).get('checkpoints'),
+                        "source_video": partial.get('source_video') if partial else (state.get('audio_master_ingest') or {}).get('source_video'),
                         "error": str(audio_master_error),
                     }
                     state.setdefault("warnings", []).append(
