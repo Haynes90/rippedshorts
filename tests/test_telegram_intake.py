@@ -302,7 +302,7 @@ class TelegramParsingTests(unittest.TestCase):
 
     def test_16_9_runs_semantic_fallback_when_long_pass_is_empty(self):
         self.assertIn("semantic_fallback: bool = False", SOURCE)
-        self.assertIn('TOPIC_FALLBACK_MIN_SECONDS", "90"', SOURCE)
+        self.assertIn('TOPIC_FALLBACK_MIN_SECONDS", "180"', SOURCE)
         self.assertIn("questions with their full answers", SOURCE)
         self.assertIn("follow-up exchanges that stay on one subject", SOURCE)
         self.assertIn("topic discussions", SOURCE)
@@ -332,12 +332,11 @@ class TelegramParsingTests(unittest.TestCase):
             suggestions,
             minimum_seconds=90,
         )
-        self.assertEqual(len(recovered), 1)
-        self.assertEqual(recovered[0]["duration"], 100)
+        self.assertEqual(recovered, [])  # A 100-second fallback is below the established minimum.
 
-    def test_16_9_builder_accepts_lower_minimum_only_for_fallback(self):
+    def test_16_9_builder_keeps_three_minute_floor_in_fallback(self):
         self.assertIn("minimum_seconds: float | None = None", SOURCE)
-        self.assertIn("max(60.0, float(minimum_seconds))", SOURCE)
+        self.assertIn("max(180.0, float(minimum_seconds))", SOURCE)
         self.assertIn('TOPIC_SEGMENT_MIN_SECONDS", "180"', SOURCE)
 
     def test_topic_review_uses_one_reusable_message(self):

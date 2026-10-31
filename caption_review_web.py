@@ -156,7 +156,7 @@ def _payload_for_session(token: str) -> dict[str, Any]:
     row = _request_row(request_id)
     state = json.loads(row["state_json"])
     drafts = list(state.get("copy_drafts") or [])
-    if not drafts:
+    if not drafts and not state.get("result") and not state.get("topic_result"):
         raise HTTPException(status_code=409, detail="Copy review is not ready yet")
 
     parsed = state.get("parsed") or {}
@@ -180,11 +180,24 @@ def _payload_for_session(token: str) -> dict[str, Any]:
                 "copy_status": str(draft.get("copy_status") or "pending"),
                 "user_edited": bool(draft.get("user_edited")),
                 "regeneration_count": int(draft.get("regeneration_count") or 0),
+                "favorite": bool(draft.get('favorite')),
+                "editorial_hold": bool(draft.get('editorial_hold')),
+                "selection_feedback": str(draft.get('selection_feedback') or ''),
                 "drive_url": drive_url,
                 "preview_url": _drive_preview(drive_url),
             }
         )
 
+    from batch_progress import summarize
+    batch = summarize(request_id,state)
+    candidate_evidence=[]
+    for lane,key,review_key in [('9:16','result','candidate_reviews'),('16:9','topic_result','topic_reviews')]:
+        for number,clip in enumerate((state.get(key) or {}).get('segments') or [],1):
+            review=(state.get(review_key) or {}).get(str(number-1)) or {}
+            candidate_evidence.append({'format':lane,'number':number,'candidate_id':clip.get('candidate_id'),
+                'review_status':review.get('status','pending'),'error':review.get('render_error'),
+                'diagnostics':review.get('render_diagnostics'), 'learning_influence':clip.get('learning_influence'),
+                'framing_plan':clip.get('framing_plan')})
     from creator_approval import suggestions, approved_batch
     creator_brand = str(state.get("show_id") or "").upper()
     creator_required = creator_brand in {"TCB", "TDOG"}
@@ -197,6 +210,8 @@ def _payload_for_session(token: str) -> dict[str, Any]:
     regenerated = sum(item["regeneration_count"] > 0 for item in items)
     return {
         "request_id": request_id,
+        "batch_summary": batch,
+        "candidate_evidence": candidate_evidence,
         "creator_brand": creator_brand,
         "creator_required": creator_required,
         "creator_suggestions": creator_suggestions,
@@ -265,6 +280,10 @@ def _card_html(item: dict[str, Any], token: str) -> str:
         {preview}
         <label><input type="checkbox" id="playback-{index}" style="width:auto" /> I played this clip and confirmed audible audio</label>
         <div class="fields">{fields}</div>
+        <label><input type="checkbox" id="favorite-{index}" style="width:auto" {'checked' if item.get('favorite') else ''} /> Favorite — suggest more related quality material</label>
+        <label><input type="checkbox" id="hold-{index}" style="width:auto" {'checked' if item.get('editorial_hold') else ''} /> Hold this clip from scheduling</label>
+        <label>Selection feedback (optional)</label>
+        <textarea id="feedback-{index}" rows="2">{html.escape(item.get('selection_feedback',''))}</textarea>
         <div class="actions">
           <button class="secondary" onclick="keepAsset({index})">Keep</button>
           <button class="secondary" onclick="regenAsset({index})">Regenerate</button>
@@ -280,6 +299,11 @@ def _page(payload: dict[str, Any], token: str) -> str:
     creator_section = section()
     creator_script = SCRIPT
     cards = "".join(_card_html(item, token) for item in payload["items"])
+    failure_cards=''.join('<p>'+html.escape(str(c['format'])+' clip '+str(c['number'])+': '+str(c['error']))+'</p>'
+        for c in payload.get('candidate_evidence',[]) if c.get('error'))
+    learning_cards=''.join('<details><summary>'+html.escape(str(c['format'])+' clip '+str(c['number'])+' — recommendation/framing evidence')+'</summary><pre>'+html.escape(json.dumps(c,indent=2))+'</pre></details>'
+        for c in payload.get('candidate_evidence',[]) if c.get('learning_influence') or c.get('framing_plan'))
+    cards='<aside aria-label="Per-clip failures">'+failure_cards+'</aside>'+cards+learning_cards
     expires = html.escape(payload["expires_at"][:10])
     thumb = (
         f'<img class="source-thumb" src="{html.escape(payload["thumbnail_url"])}" '
@@ -356,7 +380,7 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
       'Test run: '+data.test_run_id+'\n'+Object.entries(data.checkpoints).map(([name,v])=>name+': '+v.status).join('\n')+
       '\nOverall: '+data.overall_status+'\nPublishing: '+(data.publishing_globally_paused===true?'PAUSED':'NOT VERIFIED PAUSED')+
       '\nInstagram Collab: '+(data.instagram_collaborators_in_approved_payload?'VALIDATED APPROVAL, NOT PROOF OF SUBMISSION':'NOT VERIFIED')+
-      '\nBatch: '+(data.batch_summary?.status||'NOT STARTED')+'\nCompleted clips: '+(data.batch_summary?.completed_clips||0)+'/'+(data.batch_summary?.selected_clips||0)+'\nNext: '+data.next_required_action : 'Status unavailable. Refresh after the service recovers.';
+      '\nBatch: '+(data.batch_summary?.status||'NOT STARTED')+'\nCompleted clips: '+(data.batch_summary?.completed_clips||0)+'/'+(data.batch_summary?.selected_clips||0)+'\nScheduled deliveries:\n'+(data.batch_summary?.clips||[]).flatMap(c=>(c.deliveries||[]).map(d=>c.format+' • '+d.destination_id+' • '+d.scheduled_at)).join('\n')+'\nNext: '+data.next_required_action : 'Status unavailable. Refresh after the service recovers.';
   }};
   </script>
   <div class="progress">
@@ -394,7 +418,9 @@ updateProgress();
 function bodyFor(index, action='save') {{
   const card = document.getElementById(`asset-${{index}}`);
   const type = card.dataset.type;
-  const body = {{action}};
+  const body = {{action,favorite:document.getElementById('favorite-'+index)?.checked===true,
+    editorial_hold:document.getElementById('hold-'+index)?.checked===true,
+    selection_feedback:document.getElementById('feedback-'+index)?.value||''}};
   if (type === '9:16_SHORT') {{
     body.social_caption = document.getElementById(`caption-${{index}}`).value;
     body.hashtags = document.getElementById(`hashtags-${{index}}`).value;
@@ -529,6 +555,8 @@ async def save_review_asset(token: str, index: int, request: Request):
     draft = dict(drafts[index])
     from batch_progress import copy_frozen
     if copy_frozen(state,str(draft.get('asset_id') or '')):
+        if any(k in body and body[k]!=draft.get(k, False if k!='selection_feedback' else '') for k in ('favorite','editorial_hold','selection_feedback')):
+            raise HTTPException(status_code=409,detail='Submitted approvals and holds are frozen')
         if all(str(body.get(k) or '')==str(draft.get(k) or '') for k in ('social_caption','video_title','video_description','hashtags') if k in body):
             if body.get('playback_verified') is True:
                 media_url=_media_for_state(state,request_id).get(str(draft.get('asset_id') or ''))
@@ -576,6 +604,13 @@ async def save_review_asset(token: str, index: int, request: Request):
                     if key in body
                 }
             )
+    for key in ('favorite','editorial_hold'):
+        if key in body:
+            if type(body[key]) is not bool:
+                raise HTTPException(status_code=400,detail='Feedback flags must be boolean')
+            draft[key]=body[key]
+    if 'selection_feedback' in body:
+        draft['selection_feedback']=str(body['selection_feedback'] or '')[:2000]
     draft["web_review_saved_at"] = _iso(_now())
     drafts[index] = draft
     state["copy_drafts"] = drafts
@@ -606,6 +641,11 @@ async def save_review_asset(token: str, index: int, request: Request):
         )
 
     import telegram_intake as tg
+    from intelligence_workflow import observe
+    try:
+        observe(request_id,state)
+    except Exception:
+        __import__('logging').getLogger(__name__).exception('Review evidence projection pending')
     tg._checkpoint_copy_edit(request_id, state, draft, str(row["user_id"] or "web_review"))
     tg._refresh_copy_review(str(row["chat_id"]), request_id, index=index)
 
@@ -782,6 +822,9 @@ def _workflow_result(request_id, state):
             scheduler={**((state.get('schedule_master') or {}).get('shorts_response') or {}),
                 'publishing_globally_paused':None,'delivery_validation':{'status':'BLOCKED','reason':'SCHEDULER_STATUS_UNAVAILABLE'}}
     result=project(request_id,state,state.get('creator_approval'),scheduler)
+    if state.get('source_intelligence'):
+        from production_intelligence import analysis_status
+        result['source_analyses']=analysis_status(state['source_intelligence']['map_id'])
     return result
 
 

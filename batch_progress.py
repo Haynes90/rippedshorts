@@ -62,14 +62,15 @@ def summarize(request_id,state,scheduler=None):
         playable=bool(rendered and url and (playback.get(asset) or {}).get('media_url')==url and (playback.get(asset) or {}).get('verified'))
         copy_ok=drafts.get(asset,{}).get('copy_status') in {'approved','edited'}
         creator=state.get('creator_approval') or {}
-        approval_ok=copy_ok and (state.get('show_id') not in {'TCB','TDOG'} or bool(creator.get('approved_at')))
+        held=bool(drafts.get(asset,{}).get('editorial_hold'))
+        approval_ok=copy_ok and not held and (state.get('show_id') not in {'TCB','TDOG'} or bool(creator.get('approved_at')))
         ids=expected.get(asset,set())
         delivery_rows=[actual[i] for i in ids if i in actual]
         scheduled=bool(ids and len(delivery_rows)==len(ids) and all(r.get('scheduled_at') and r.get('destination_id') and r.get('schedule_record_valid') for r in delivery_rows))
         complete=bool(rendered and playable and approval_ok and scheduled)
         for key,value in [('rendered_audio_verified',rendered),('playable',playable),('handed_off',bool(ids)),('scheduled',scheduled),('completed',complete)]:
             count[key]+=int(bool(value))
-        cause='RENDER_FAILED' if review.get('status')=='render_failed' else 'RENDER_PENDING' if not rendered else 'PLAYBACK_NOT_VERIFIED' if not playable else 'HUMAN_APPROVAL_PENDING' if not approval_ok else 'SCHEDULER_RECORDS_INCOMPLETE' if not scheduled else None
+        cause='HELD_BY_OWNER' if held else 'RENDER_FAILED' if review.get('status')=='render_failed' else 'RENDER_PENDING' if not rendered else 'PLAYBACK_NOT_VERIFIED' if not playable else 'HUMAN_APPROVAL_PENDING' if not approval_ok else 'SCHEDULER_RECORDS_INCOMPLETE' if not scheduled else None
         assets.append(dict(asset_id=asset,format='9:16' if lane=='short' else '16:9',completed=complete,
             cause=cause,render_error=review.get('render_error') if review.get('status')=='render_failed' else None,
             deliveries=delivery_rows))
