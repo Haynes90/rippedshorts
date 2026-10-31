@@ -16,6 +16,8 @@ Framing plans are thread-local to the render and saved beside the output, then r
 
 **15 passed, 0 failed.** Includes actual FFmpeg encoding/decoding of synthetic two-person side-by-side, two-person stacked, three-camera, four-camera and camera/presentation layouts. Tests check output 1080×1920 dimensions, stream decoding, expected panel/context pixels, nonempty output and audible-tone energy. Other cases cover absent separators, unstable layouts, ambiguous mixed audio and conservative speaker handoffs.
 
+The initial GitHub stored-render job failed two cases because its direct `python tests/test_stored_transcript_render.py -v` harness did not put the repository root on sys.path. The new production framing-evidence import therefore could not resolve active_speaker. The focused harness correction adds the existing repository root; it does not mock out the import, alter application behavior or relax assertions. The PR's latest check is authoritative for CI revalidation status.
+
 Combined stack regression: **341 passed, 29 baseline failures, 2 skipped, 4 HTTP tests deferred**. See PRODUCTION_INTELLIGENCE_VALIDATION.md and PRODUCTION_INTELLIGENCE_EVIDENCE.json on the base review branch. Counts overlap and must not be summed.
 
 ## Unverified limitations

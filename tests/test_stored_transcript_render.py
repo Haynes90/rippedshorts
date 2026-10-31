@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
@@ -16,6 +17,8 @@ from unittest.mock import Mock
 ROOT = Path(__file__).resolve().parent
 if not (ROOT / 'clip_completion.py').exists():
     ROOT = ROOT.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def load_function(filename, name, namespace):
