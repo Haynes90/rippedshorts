@@ -8,6 +8,16 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import threading
+
+_PLAN = threading.local()
+
+def reset_framing_plan():
+    _PLAN.value = None
+
+def last_framing_plan():
+    return getattr(_PLAN, "value", None)
+
 from pathlib import Path
 from statistics import median
 from typing import Optional
@@ -277,7 +287,15 @@ def build_active_speaker_filter(
     load_cascade,
 ) -> Optional[str]:
     """Return an FFmpeg graph switching A/B/stacked, or None when uncertain."""
+    _PLAN.value = None
     try:
+        from camera_layout import build
+        cascade = load_cascade() if callable(load_cascade) else None
+        tile_result = build(video_path,start,duration,width,height,cascade,_audio_rms(video_path,start,duration)) if cascade is not None else None
+        if tile_result:
+            graph, proof = tile_result
+            _PLAN.value = proof
+            return graph
         samples = _detect_tracks(video_path, start, duration, load_cascade)
         energy = _audio_rms(video_path, start, duration)
         sections = _stable_layout_sections(samples, energy, duration)

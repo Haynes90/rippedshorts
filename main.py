@@ -983,6 +983,8 @@ def _assert_render_audio(
 
 
 def create_clip_file(video_path: Path, start: float, duration: float, output_path: Path) -> None:
+    from active_speaker import reset_framing_plan
+    reset_framing_plan()
     vertical_filter, complex_filter = _build_vertical_filter(
         video_path, start, duration
     )
@@ -1027,13 +1029,11 @@ def create_clip_file(video_path: Path, start: float, duration: float, output_pat
         )
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise RuntimeError(f"FFmpeg render produced no usable clip: {output_path}")
-    _assert_render_audio(
-        video_path,
-        output_path,
-        start=start,
-        duration=duration,
-        aspect="9:16",
-    )
+    _assert_render_audio(video_path, output_path, start=start, duration=duration, aspect="9:16")
+    from active_speaker import last_framing_plan
+    plan = last_framing_plan()
+    if plan:
+        output_path.with_suffix('.framing.json').write_text(json.dumps(plan),encoding='utf-8')
 
 
 def create_topic_segment_file(
