@@ -12,6 +12,7 @@ FUNCTIONS = {
     and node.name in {
         "parse_request",
         "validate_complete_candidates",
+        "_sentence_complete_candidate",
         "_build_contiguous_topic_segments",
     }
 }
@@ -24,6 +25,7 @@ namespace = {
 exec("YOUTUBE_RE = re.compile(r'https?://(?:(?:www\\.|m\\.)?youtube\\.com/(?:watch\\?[^\\s]*v=|shorts/|live/|embed/)|youtu\\.be/)([A-Za-z0-9_-]{6,20})', re.I)\nDRIVE_RE = re.compile(r'https?://drive\\.google\\.com/(?:file/d/|open\\?id=|uc\\?(?:[^\\s]*&)?id=)([A-Za-z0-9_-]+)', re.I)", namespace)
 exec(compile(ast.Module(body=[FUNCTIONS["parse_request"]], type_ignores=[]), "telegram-functions", "exec"), namespace)
 parse_request = namespace["parse_request"]
+exec(compile(ast.Module(body=[FUNCTIONS["_sentence_complete_candidate"]], type_ignores=[]), "sentence-functions", "exec"), namespace)
 exec(compile(ast.Module(body=[FUNCTIONS["validate_complete_candidates"]], type_ignores=[]), "candidate-functions", "exec"), namespace)
 validate_complete_candidates = namespace["validate_complete_candidates"]
 exec(
