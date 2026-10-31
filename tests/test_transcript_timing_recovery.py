@@ -61,6 +61,7 @@ def window_fixture(monkeypatch,tmp_path,fetch):
     import clip_completion as clip
     from pathlib import Path
     monkeypatch.setenv('OPENAI_API_KEY','test-only')
+    monkeypatch.setenv('DATA_DIR',str(tmp_path))
     monkeypatch.setattr(clip,'_run',lambda args:Path(args[-1]).write_bytes(b'isolated audio'))
     monkeypatch.setattr(clip.time,'sleep',lambda _:None)
     monkeypatch.setattr(clip.requests,'post',fetch)

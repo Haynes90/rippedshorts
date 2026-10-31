@@ -18,11 +18,12 @@ def test_render_failure_includes_ffmpeg_diagnostics():
     assert "(completed.stderr or completed.stdout)[-3000:]" in source
 
 
-def test_selector_aims_for_twenty_and_collects_future_learning_metadata():
-    source = (ROOT / "main.py").read_text()
-    assert "Target 18–20 final clips" in source
-    assert '\"content_type\"' in source
-    assert '\"keywords\"' in source
+def test_selector_uses_quality_without_quota_and_collects_learning_metadata():
+    from main import openai_clip_prompt
+    prompt = openai_clip_prompt([], None)
+    assert "Do not force a clip count" in prompt
+    assert '"content_type"' in prompt
+    assert '"keywords"' in prompt
 
 
 def test_approvals_use_bounded_pool_and_are_idempotent():
@@ -80,12 +81,12 @@ def test_reused_video_render_creates_output_directory():
     assert 'workdir.mkdir(parents=True, exist_ok=True)' in source
 
 
-def test_selector_targets_twenty_and_allows_distinct_overlap():
+def test_selector_uses_quality_and_allows_distinct_overlap():
     prompt_source = (ROOT / "main.py").read_text()
     intake_source = (ROOT / "telegram_intake.py").read_text()
     selector_source = (ROOT / "source_ingestion.py").read_text()
-    assert "Target 18–20 final clips" in prompt_source
-    assert "return 20" in prompt_source
+    assert "Do not force a clip count" in prompt_source
+    assert "return 20" not in prompt_source
     assert "Clips MAY overlap in time" in prompt_source
     assert "allow_overlap=True" in intake_source
     assert "normalized_text" in selector_source
