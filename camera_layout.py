@@ -32,7 +32,10 @@ def detect_regions(frame, faces):
     """Require visible separators plus at least two actual participant regions."""
     height, width = frame.shape[:2]
     xs, ys = separators(frame, 1), separators(frame, 0)
-    if len(xs) > 1 or len(ys) > 1:
+    three_columns = len(xs) == 2 and not ys and all(
+        .25 * width <= right-left <= .42 * width
+        for left, right in zip([0]+xs, xs+[width]))
+    if (len(xs) > 1 or len(ys) > 1) and not three_columns:
         return None  # busy graphics or an unknown many-window layout
     boxes = []
     xedges, yedges = [0]+xs+[width], [0]+ys+[height]
@@ -127,11 +130,20 @@ def composition_graph(regions, primary=None, label='0:v', suffix='0'):
     return ';'.join(graph)
 
 
+def conservative_group_view(face_observations):
+    """An uncertain/changing group must not fall into a two-person face crop."""
+    if sum(len(faces)>=2 for faces in face_observations)<2:
+        return None
+    return {'layout':'uncertain_group','regions':[{'id':'source','rect':[0,0,960,540],
+            'kind':'context','faces':[]}], 'confidence':0.0,
+            'basis':'multiple_faces_but_unstable_camera_boundaries', 'requires_framing_review':True}
+
+
 def analyze(video, start, duration, cascade):
     import cv2
     import numpy as np
     capture=cv2.VideoCapture(str(video))
-    observations=[];frames=[]
+    observations=[];frames=[];face_observations=[]
     try:
         for fraction in (.05,.25,.5,.75,.95):
             capture.set(cv2.CAP_PROP_POS_MSEC,(start+duration*fraction)*1000)
@@ -141,10 +153,11 @@ def analyze(video, start, duration, cascade):
             frame=cv2.resize(frame,(960,540))
             gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
             faces=list(cascade.detectMultiScale(gray,scaleFactor=1.1,minNeighbors=5,minSize=(30,30)))
-            observations.append(detect_regions(frame,faces));frames.append(frame)
+            observations.append(detect_regions(frame,faces));frames.append(frame);face_observations.append(faces)
         layout=stable_regions(observations,960,540)
         if not layout:
-            return None
+            group=conservative_group_view(face_observations)
+            return (group,[]) if group else None
         samples=[];previous={}
         for t in np.arange(0,duration,.5):
             capture.set(cv2.CAP_PROP_POS_MSEC,(start+float(t))*1000)
@@ -193,4 +206,4 @@ def build(video,start,duration,width,height,cascade,energy):
             return None
         graphs.append(graph);outputs.append(f'[vc{i}]')
     graphs.append(''.join(outputs)+f'concat=n={len(outputs)}:v=1:a=0[v]')
-    return ';'.join(graphs),{'layout':layout,'sections':sections,'basis':'visual_tiles_and_correlated_mouth_motion','recipient_identity_inferred':False}
+    return ';'.join(graphs),{'layout':layout,'sections':sections,'basis':layout.get('basis','visual_tiles_and_correlated_mouth_motion'),'recipient_identity_inferred':False}

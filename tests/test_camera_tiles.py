@@ -107,3 +107,29 @@ def test_real_ffmpeg_output_preserves_tiles_dimensions_audio_and_pixels(tmp_path
         # Original presentation/context quadrant remains visible, not discarded.
         assert image[1080,810,1]>150
     assert target.stat().st_size>1000
+
+
+def test_three_side_by_side_whole_tiles_are_supported():
+    frame=np.zeros((360,640,3),np.uint8)
+    frame[:,:212]=[20,20,200];frame[:,212:428]=[200,200,20];frame[:,428:]=[20,200,20]
+    result=detect_regions(frame,[(60,80,70,70),(280,80,70,70),(490,80,70,70)])
+    assert result['layout']=='side_by_side'
+    assert [r['rect'] for r in result['regions']]==[[0,0,212,360],[212,0,216,360],[428,0,212,360]]
+    graph=composition_graph(result['regions'])
+    assert 'crop=208:356:2:2' in graph and 'crop=212:356:214:2' in graph
+
+
+def test_multiple_graphic_lines_without_faces_do_not_invent_three_participants():
+    frame=np.zeros((360,640,3),np.uint8)
+    frame[:,:212]=[20,20,200];frame[:,212:428]=[200,200,20];frame[:,428:]=[20,200,20]
+    assert detect_regions(frame,[]) is None
+
+
+def test_uncertain_three_person_layout_preserves_source_not_two_face_crop():
+    from camera_layout import conservative_group_view
+    faces=[[(20,20,50,50),(220,20,50,50)],[],[(20,20,50,50),(220,20,50,50),(420,20,50,50)]]
+    group=conservative_group_view(faces)
+    assert group['requires_framing_review'] and group['confidence']==0
+    assert group['regions'][0]['rect']==[0,0,960,540]
+    assert 'crop=' not in composition_graph(group['regions'])
+    assert conservative_group_view([[(20,20,50,50)]]*5) is None

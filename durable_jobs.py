@@ -10,7 +10,7 @@ import logging
 import os
 import sqlite3
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
@@ -66,7 +66,7 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 def claim(db_path: Path, job_id: str, action: str, lease_seconds: int = LEASE_SECONDS) -> bool:
     now = _utc_now()
     until = (now + timedelta(seconds=lease_seconds)).isoformat()
-    with _connect(db_path) as db:
+    with closing(_connect(db_path)) as db:
         db.execute("BEGIN IMMEDIATE")
         row = db.execute(
             "SELECT owner, lease_until, state, attempt_count FROM durable_job_leases "
@@ -80,7 +80,7 @@ def claim(db_path: Path, job_id: str, action: str, lease_seconds: int = LEASE_SE
                 expiry = datetime.fromisoformat(str(row["lease_until"]).replace("Z", "+00:00"))
             except ValueError:
                 expiry = now - timedelta(seconds=1)
-            if expiry > now and row["owner"] != OWNER:
+            if expiry > now:
                 db.execute("COMMIT")
                 return False
             db.execute(
@@ -103,7 +103,7 @@ def claim(db_path: Path, job_id: str, action: str, lease_seconds: int = LEASE_SE
 def finish(db_path: Path, job_id: str, action: str, error: str = "", *, complete: bool = False) -> None:
     now = _utc_now().isoformat()
     state = "RETRY_WAIT" if error else ("COMPLETE" if complete else "RELEASED")
-    with _connect(db_path) as db:
+    with closing(_connect(db_path)) as db:
         db.execute(
             "UPDATE durable_job_leases SET state=?, lease_until=?, last_error=?, updated_at=? "
             "WHERE job_id=? AND action=? AND owner=?",
@@ -134,7 +134,7 @@ def durable_job(action: str, *, idempotent: bool = False):
 
 
 def lease_snapshot(db_path: Path) -> dict:
-    with _connect(db_path) as db:
+    with closing(_connect(db_path)) as db:
         rows = db.execute(
             "SELECT state, COUNT(*) AS count FROM durable_job_leases GROUP BY state"
         ).fetchall()

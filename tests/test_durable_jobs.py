@@ -25,6 +25,10 @@ class DurableJobsTests(unittest.TestCase):
         finally:
             durable_jobs.OWNER = original
 
+    def test_same_worker_cannot_reenter_live_action(self):
+        self.assertTrue(durable_jobs.claim(self.path, "same-worker", "process"))
+        self.assertFalse(durable_jobs.claim(self.path, "same-worker", "process"))
+
     def test_released_processing_job_can_resume(self):
         self.assertTrue(durable_jobs.claim(self.path, "job-2", "process"))
         durable_jobs.finish(self.path, "job-2", "process")
@@ -40,7 +44,8 @@ class DurableJobsTests(unittest.TestCase):
         )
 
     def test_schema_includes_outbox(self):
-        with sqlite3.connect(self.path) as db:
+        from contextlib import closing
+        with closing(sqlite3.connect(self.path)) as db:
             durable_jobs.ensure_schema(db)
             names = {
                 row[0]

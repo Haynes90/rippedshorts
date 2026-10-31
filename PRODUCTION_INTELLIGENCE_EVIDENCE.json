@@ -89,5 +89,31 @@
   "deployment_performed": false,
   "real_program_media_acceptance": "NOT VERIFIED",
   "live_topic_sheet_write_readback": "NOT VERIFIED",
-  "mocked_topic_sheet_retry_readback": "PASS"
+  "mocked_topic_sheet_retry_readback": "PASS",
+  "acceptance_2026_10_31": {
+    "http": {
+      "passed": 4,
+      "failed": 0
+    },
+    "source_focused": {
+      "passed": 136,
+      "failed": 0
+    },
+    "combined": {
+      "passed": 355,
+      "failed": 23,
+      "skipped": 2
+    },
+    "live_isolated_sheet_sync": {
+      "first": 4,
+      "repeat": 0,
+      "readbacks": "PASS",
+      "intended_railway_identity": true,
+      "production_workbook_modified": false
+    },
+    "real_media": "limited source/8-second samples; full five-clip exports not accepted",
+    "production_request_resumed": false,
+    "production_record_writes_issued": false,
+    "acceptance_report": "PR77_78_ACCEPTANCE.md"
+  }
 }

@@ -1,3 +1,5 @@
+> **2026-10-31 acceptance update:** See [PR77_78_ACCEPTANCE.md](PR77_78_ACCEPTANCE.md). Real TDOG changing group footage exposed unsafe two-person fallback; it now uses whole-source framing with explicit review evidence. Three-column support added. Real speaker switching and dedicated two/four-person fixtures remain NOT VERIFIED. Final combined tests: 355 passed, 23 baseline failures, 2 skipped. Keep draft.
+
 # Camera-tile composition — review evidence
 
 Status: **DRAFT; NOT PRODUCTION ACCEPTED.** Depends on `feat/source-intelligence-20261030`.

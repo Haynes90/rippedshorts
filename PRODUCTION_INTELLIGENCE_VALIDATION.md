@@ -1,3 +1,5 @@
+> **2026-10-31 update:** Historical evidence below is superseded where noted by [PR77_78_ACCEPTANCE.md](PR77_78_ACCEPTANCE.md). The four HTTP tests and real service-identity Sheets synchronization now pass. Final combined regression: 355 passed, 23 baseline failures, 2 skipped. Acceptance remains incomplete; keep both PRs draft.
+
 # Ripped Shorts — TCB/TDOG production-intelligence evidence
 
 Date: 2026-10-30. Status: **IMPLEMENTED FOR REVIEW; ACCEPTANCE INCOMPLETE; NOT READY FOR DEPLOYMENT.**

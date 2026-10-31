@@ -2236,7 +2236,11 @@ def validate_complete_candidates(
             candidate.update(
                 {"start": start, "end": end, "duration": round(end - start, 3)}
             )
-            valid.append(candidate)
+            if any(abs(item["start"]-start)<.001 and abs(item["end"]-end)<.001 for item in valid):
+                rejected.append({"start": start, "end": end,
+                                 "reason": "Duplicate interval after sentence-boundary expansion"})
+            else:
+                valid.append(candidate)
         else:
             rejected.append(
                 {
