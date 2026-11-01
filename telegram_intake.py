@@ -3924,7 +3924,7 @@ def _process(request_id: str) -> None:
         if str(state.get("show_id") or "").upper() in {"TCB","TDOG"}:
             supplemental = ("Find all distinct, quality-qualified complete thoughts across the full source. "
                 "There is no prescribed clip count. Shorts may come from any topic, independently of highlights. "
-                "Do not repeat the same previously reviewed complete thought. " + learning_prompt)
+                "Previously suggested or approved clips remain eligible when they meet the current quality standards; do not force novelty. " + learning_prompt)
         framework_prompt = _configured_short_framework_prompt()
         prompt_layers = [
             text
