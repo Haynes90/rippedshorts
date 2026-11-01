@@ -124,6 +124,7 @@ class RealVideoRenderTests(unittest.TestCase):
     def _render_env(self):
         env = dict(
             Path=Path,
+            json=json,
             subprocess=subprocess,
             os=os,
             re=re,
