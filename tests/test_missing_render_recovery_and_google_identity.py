@@ -43,6 +43,18 @@ def test_watchdog_recovers_stuck_failed_approved_renders_once():
     assert "_queue_missing_approved_renders" in INTAKE
 
 
-def test_failed_approved_renders_block_schedule_handoff():
-    assert "Never hand off while an approved render is missing" in INTAKE
-    assert "if should_handoff:" in INTAKE
+def test_individual_failure_does_not_block_successful_handoff():
+    # Owner explicitly authorized independent successful clips to progress, not all-or-nothing batches.
+    from acceptance_fixtures import copy_review_fixture
+    from unittest.mock import Mock,patch
+    import json
+    with copy_review_fixture() as f:
+        state=f.read();state.update({'candidate_reviews':{'0':{'status':'rendered'},'1':{'status':'render_failed','render_error':'individual encoding error'}},'schedule_requested_at':'now'})
+        with f.tg._telegram_db() as db:db.execute('UPDATE telegram_requests SET state_json=? WHERE request_id=?',(json.dumps(state),'first'))
+        executor=Mock()
+        with patch.object(f.tg,'RENDER_EXECUTOR',executor),patch.object(f.tg,'_save'),patch.object(f.tg,'_refresh_copy_review'):
+            f.tg._notify_render_queue_complete('first','chat')
+        assert executor.submit.call_count==1
+        assert executor.submit.call_args.args==(f.tg._handoff_shorts_to_schedule_master,'first','chat')
+        saved=f.read();assert saved['candidate_reviews']['1']['status']=='render_failed'
+        assert saved['rendered_count']==1 and saved['render_failed_count']==1

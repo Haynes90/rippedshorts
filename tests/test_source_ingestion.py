@@ -46,10 +46,10 @@ def test_telegram_path_does_not_use_rapidapi_downloader():
 
 
 def test_prompt_requires_distinct_non_overlapping_complete_thoughts():
-    source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
-    assert "Clips MUST NOT overlap in time" in source
-    assert "Prefer fewer excellent complete thoughts" in source
-    assert "beginning, middle, and end" in source
+    from source_ingestion import select_non_overlapping
+    clips=[{'start':0,'end':30,'score':90,'transcript':'First complete thought.'},{'start':20,'end':50,'score':80,'transcript':'Overlapping thought.'},{'start':60,'end':90,'score':85,'transcript':'Distinct full thought.'}]
+    selected=select_non_overlapping(clips,allow_overlap=False)
+    assert [(x['start'],x['end']) for x in selected]==[(0.,30.),(60.,90.)]
 
 
 def test_cached_drive_source_must_have_audio_before_reuse():

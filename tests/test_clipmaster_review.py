@@ -16,10 +16,17 @@ def test_universal_review_endpoint_and_polling_exist():
 
 
 def test_review_carries_origin_and_callback_without_reintake():
-    assert '"event": "clipmaster_review_completed"' in REVIEW_SOURCE
-    assert '"origin_job_id": state.get("origin_job_id")' in REVIEW_SOURCE
-    assert "callback_url" in REVIEW_SOURCE
-    assert "/api/ripped-shorts/intake" not in REVIEW_SOURCE
+    import clipmaster_review as review
+    from unittest.mock import Mock,patch
+    from types import SimpleNamespace
+    state={'review_id':'review','origin_job_id':'existing-job','source_service':'ripped','video_id':'source','service_segments':[{'start':0,'end':200}],'callback_url':'https://origin.test/completion'}
+    post=Mock(return_value=SimpleNamespace(status_code=200))
+    with patch.object(review.requests,'post',post),patch.object(review,'_save'):
+        assert review._deliver(state)['status']=='approved'
+        assert review._deliver(state)['status']=='already_delivered'
+    assert post.call_count==1 and post.call_args.args[0]==state['callback_url']
+    assert post.call_args.kwargs['json']['origin_job_id']=='existing-job'
+    assert post.call_args.kwargs['json']['sections']==state['service_segments']
 
 
 def test_telegram_routes_clipmaster_before_ripped_shorts():

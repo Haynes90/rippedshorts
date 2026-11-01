@@ -115,5 +115,24 @@
     "production_request_resumed": false,
     "production_record_writes_issued": false,
     "acceptance_report": "PR77_78_ACCEPTANCE.md"
+  },
+  "focused_completion": {
+    "combined": {
+      "passed": 378,
+      "failed": 0,
+      "skipped": 2
+    },
+    "source_only": {
+      "passed": 360,
+      "failed": 0,
+      "skipped": 2
+    },
+    "legacy_replacements": 23,
+    "comparison_videos": 20,
+    "comparison_files_verified_private": true,
+    "approved_boundaries_changed": false,
+    "production_request_resumed": false,
+    "real_speaker_handoff_verified": false,
+    "real_four_person_verified": false
   }
 }
