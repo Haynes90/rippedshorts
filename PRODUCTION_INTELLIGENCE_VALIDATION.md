@@ -1,3 +1,5 @@
+> **Latest acceptance:** [PR77_78_ACCEPTANCE.md](PR77_78_ACCEPTANCE.md). Combined regression **378 passed, 0 failed, 2 local skips**; source-only **360 passed, 0 failed, 2 local skips**. The 23 legacy failures now have behavioral replacements. Five cut comparisons await owner decisions; real speaker handoffs/four-person footage remain unverified. Keep draft/unmerged.
+
 > **2026-10-31 update:** Historical evidence below is superseded where noted by [PR77_78_ACCEPTANCE.md](PR77_78_ACCEPTANCE.md). The four HTTP tests and real service-identity Sheets synchronization now pass. Final combined regression: 355 passed, 23 baseline failures, 2 skipped. Acceptance remains incomplete; keep both PRs draft.
 
 # Ripped Shorts — TCB/TDOG production-intelligence evidence

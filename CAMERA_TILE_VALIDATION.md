@@ -1,3 +1,5 @@
+> **Focused acceptance completion:** Combined regression is **378 passed, 0 failed, 2 local FFprobe-dependent skips**. See [PR77_78_ACCEPTANCE.md](PR77_78_ACCEPTANCE.md). Twenty private original/proposed/context videos await owner boundary decisions. Real 2664–2674s two-person footage verifies a whole-source 1080x1920 fallback with non-silent audio; it does not verify high-confidence speaker handoffs. Four-person real media remains unverified. Keep draft/unmerged.
+
 > **2026-10-31 acceptance update:** See [PR77_78_ACCEPTANCE.md](PR77_78_ACCEPTANCE.md). Real TDOG changing group footage exposed unsafe two-person fallback; it now uses whole-source framing with explicit review evidence. Three-column support added. Real speaker switching and dedicated two/four-person fixtures remain NOT VERIFIED. Final combined tests: 355 passed, 23 baseline failures, 2 skipped. Keep draft.
 
 # Camera-tile composition — review evidence

@@ -1,0 +1,117 @@
+[
+  {
+    "file": "test_audio_master_ingestion.py",
+    "test": "test_missing_assets_are_delegated_to_audio_master",
+    "replacement_test": "test_missing_assets_are_delegated_to_audio_master"
+  },
+  {
+    "file": "test_clipmaster_review.py",
+    "test": "test_review_carries_origin_and_callback_without_reintake",
+    "replacement_test": "test_review_carries_origin_and_callback_without_reintake"
+  },
+  {
+    "file": "test_concurrent_render_safety.py",
+    "test": "test_already_rendered_youtube_id_skips_gpt_selection",
+    "replacement_test": "test_saved_source_analysis_does_not_repeat_model_selection"
+  },
+  {
+    "file": "test_concurrent_render_safety.py",
+    "test": "test_under_ten_reviewed_shorts_triggers_additional_search",
+    "replacement_test": "test_quality_selector_does_not_pad_to_a_review_quota"
+  },
+  {
+    "file": "test_concurrent_render_safety.py",
+    "test": "test_telegram_uses_short_not_candidate_label",
+    "replacement_test": "test_telegram_uses_short_not_candidate_label"
+  },
+  {
+    "file": "test_concurrent_render_safety.py",
+    "test": "test_short_selection_uses_sheet_approval_learning",
+    "replacement_test": "test_short_selection_uses_sheet_approval_learning"
+  },
+  {
+    "file": "test_concurrent_render_safety.py",
+    "test": "test_plain_link_starts_shorts_and_horizontal_topic_lanes",
+    "replacement_test": "test_plain_link_starts_shorts_and_horizontal_topic_lanes"
+  },
+  {
+    "file": "test_concurrent_render_safety.py",
+    "test": "test_horizontal_segments_cover_full_timeline_without_overlap",
+    "replacement_test": "test_semantic_highlights_leave_weak_gaps_and_keep_minimum"
+  },
+  {
+    "file": "test_concurrent_render_safety.py",
+    "test": "test_shorts_expand_to_complete_sentence_boundaries",
+    "replacement_test": "test_shorts_expand_to_complete_sentence_boundaries"
+  },
+  {
+    "file": "test_concurrent_render_safety.py",
+    "test": "test_topic_coherence_precedes_eight_minute_reference",
+    "replacement_test": "test_topic_coherence_precedes_eight_minute_reference"
+  },
+  {
+    "file": "test_missing_render_recovery_and_google_identity.py",
+    "test": "test_failed_approved_renders_block_schedule_handoff",
+    "replacement_test": "test_individual_failure_does_not_block_successful_handoff"
+  },
+  {
+    "file": "test_rapidapi_source_race.py",
+    "test": "test_source_winner_is_logged_to_console_and_jsonl",
+    "replacement_test": "test_source_winner_is_logged_and_durably_recorded"
+  },
+  {
+    "file": "test_render_fallback.py",
+    "test": "test_renderer_does_not_use_removed_mediapipe_package_attribute",
+    "replacement_test": "test_opencv_detector_loads_and_missing_model_falls_back"
+  },
+  {
+    "file": "test_render_fallback.py",
+    "test": "test_renderer_has_opencv_and_center_crop_fallbacks",
+    "replacement_test": "test_renderer_has_opencv_and_center_crop_fallbacks"
+  },
+  {
+    "file": "test_source_ingestion.py",
+    "test": "test_prompt_requires_distinct_non_overlapping_complete_thoughts",
+    "replacement_test": "test_prompt_requires_distinct_non_overlapping_complete_thoughts"
+  },
+  {
+    "file": "test_telegram_intake.py",
+    "test": "test_16_9_waits_for_explicit_shorts_confirmation",
+    "replacement_test": "test_16_9_waits_for_explicit_shorts_confirmation"
+  },
+  {
+    "file": "test_telegram_intake.py",
+    "test": "test_copy_reply_is_bound_to_exact_prompt_and_preserves_route",
+    "replacement_test": "test_copy_reply_is_bound_to_exact_prompt_and_preserves_route"
+  },
+  {
+    "file": "test_telegram_intake.py",
+    "test": "test_copy_reply_updates_existing_prompt_instead_of_sending_status_spam",
+    "replacement_test": "test_copy_reply_updates_existing_prompt_instead_of_sending_status_spam"
+  },
+  {
+    "file": "test_telegram_intake.py",
+    "test": "test_edited_caption_stays_visible_as_final_reviewed_copy",
+    "replacement_test": "test_edited_caption_stays_visible_as_final_reviewed_copy"
+  },
+  {
+    "file": "test_telegram_intake.py",
+    "test": "test_schedule_handoff_prefers_durable_caption_checkpoint",
+    "replacement_test": "test_schedule_handoff_prefers_durable_caption_checkpoint"
+  },
+  {
+    "file": "test_telegram_intake.py",
+    "test": "test_short_caption_keeps_hashtags_separate_and_clean",
+    "replacement_test": "test_short_caption_keeps_hashtags_separate_and_clean"
+  },
+  {
+    "file": "test_telegram_intake.py",
+    "test": "test_webhook_monitor_distinguishes_stale_errors_and_group_privacy",
+    "replacement_test": "test_webhook_monitor_distinguishes_stale_errors_and_group_privacy"
+  },
+  {
+    "file": "test_weighted_learning_and_fresh_start_menu.py",
+    "test": "test_short_learning_uses_weighted_wins_and_losses",
+    "replacement_test": "test_short_learning_uses_weighted_wins_and_losses"
+  }
+]

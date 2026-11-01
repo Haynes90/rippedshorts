@@ -11,10 +11,11 @@ def test_reviewed_shorts_menu_offers_fresh_start():
 
 
 def test_short_learning_uses_weighted_wins_and_losses():
-    assert "WEIGHTED CATEGORY WINS/LOSSES" in INTAKE
-    assert "WEIGHTED CONTENT-TYPE WINS/LOSSES" in INTAKE
-    assert "signed_weight = weight if decision == \"approved\" else -weight" in INTAKE
-    assert "same-video reviews and recent reviews carry" in INTAKE
+    from acceptance_fixtures import learning_rows
+    with learning_rows() as (tg,_):prompt=tg._short_learning_prompt('source')
+    assert 'useful: +' in prompt and 'weak: -' in prompt
+    assert 'weight=6.00' in prompt and 'weight=2.00' in prompt
+    assert 'Learn the qualities, not exact wording or timestamps' in prompt
 
 
 def test_complete_thought_validation_checks_opening_and_ending():
