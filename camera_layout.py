@@ -113,10 +113,13 @@ def composition_graph(regions, primary=None, label='0:v', suffix='0'):
     """Preserve complete camera rectangles with letterboxing, never face-only crops."""
     cameras=[r for r in regions if r['kind']=='camera']
     context=[r for r in regions if r['kind']=='context']
-    if context or not cameras or primary is None:
+    if context or not cameras or len(cameras)>=3 or primary not in {r['id'] for r in cameras}:
         return blurred_full_frame(label, output=f'v{suffix}', suffix=suffix)
     cameras=sorted(cameras,key=lambda r: (r['id']!=primary,r['id'])) if primary is not None else cameras
     n=len(cameras)
+    if n==1:
+        left,top,cw,ch=cameras[0]['rect']
+        return f'[{label}]crop={cw}:{ch}:{left}:{top}[whole{suffix}];'+blurred_full_frame(f'whole{suffix}',output=f'v{suffix}',suffix=suffix)
     if n==2:
         panels=[(1080,1280,0,0),(1080,640,0,1280)] if primary is not None else [(1080,960,0,0),(1080,960,0,960)]
     elif n==3:
@@ -203,17 +206,24 @@ def build(video,start,duration,width,height,cascade,energy):
     for region in layout['regions']:
         x,y,w,h=region['rect']
         region['rect']=[int(x*width/960),int(y*height/540),int(w*width/960),int(h*height/540)]
-    sections=speaker_sections(samples,energy,duration)
+    raw_sections=speaker_sections(samples,energy,duration)
+    cameras=[r for r in layout['regions'] if r['kind']=='camera']
+    preserve_source=len(cameras)>=3 or any(r['kind']=='context' for r in layout['regions'])
+    sections=[(t,None if preserve_source else primary) for t,primary in raw_sections]
     graphs=[];outputs=[]
     for i,(t,primary) in enumerate(sections):
         end=sections[i+1][0] if i+1<len(sections) else duration
-        if primary is not None and len(layout['regions'])>=4:
-            # If secondary faces would be unreadable, retain the larger stable grid.
-            primary=None
         graphs.append(f'[0:v]trim=start={t:.3f}:end={end:.3f},setpts=PTS-STARTPTS[camera{i}]')
         graph=composition_graph(layout['regions'],primary,label=f'camera{i}',suffix=f'c{i}')
         if not graph:
             return None
         graphs.append(graph);outputs.append(f'[vc{i}]')
     graphs.append(''.join(outputs)+f'concat=n={len(outputs)}:v=1:a=0[v]')
-    return ';'.join(graphs),{'layout':layout,'sections':sections,'basis':layout.get('basis','visual_tiles_and_correlated_mouth_motion'),'recipient_identity_inferred':False}
+    smart=any(primary is not None for _,primary in sections)
+    fallback=any(primary is None for _,primary in sections)
+    return ';'.join(graphs),{'layout':layout,'sections':sections,
+        'framing_policy':'whole-tile-or-blurred-v2',
+        'framing_method':'mixed_smart_and_blurred' if smart and fallback else 'whole_camera_tiles' if smart else 'blurred_full_frame',
+        'layout_confidence':layout.get('confidence',0), 'speaker_confidence':'supported_by_audio_mouth_correlation' if smart else 'uncertain',
+        'requires_framing_review':fallback,
+        'basis':layout.get('basis','visual_tiles_and_correlated_mouth_motion'),'recipient_identity_inferred':False}

@@ -1027,8 +1027,10 @@ def create_clip_file(video_path: Path, start: float, duration: float, output_pat
     _assert_render_audio(video_path, output_path, start=start, duration=duration, aspect="9:16")
     from active_speaker import last_framing_plan
     plan = last_framing_plan()
+    if not plan:
+        plan = {'layout':'blurred_full_frame','framing_method':'blurred_full_frame','framing_policy':'whole-tile-or-blurred-v2','speaker_confidence':'uncertain','requires_framing_review':True,'basis':'tracking_disabled_or_insufficient'}
     if framing_mode == 'blurred':
-        plan = {'layout': 'blurred_full_frame', 'basis': 'owner_selected_full_frame', 'requires_framing_review': False}
+        plan = {'layout': 'blurred_full_frame', 'framing_method':'blurred_full_frame', 'framing_policy':'whole-tile-or-blurred-v2', 'speaker_confidence':'not_inferred_owner_chose_full_frame', 'basis': 'owner_selected_full_frame', 'requires_framing_review': False}
     if plan:
         output_path.with_suffix('.framing.json').write_text(json.dumps(plan),encoding='utf-8')
 
@@ -1342,7 +1344,6 @@ def prepare_framing_review(request_id, asset_id, source, original, rendered):
         'verified_media': True, 'preview_bounds': [start,end], 'timing_provenance': 'existing_verified_render',
         'optional_reference': True,
         'explanation': 'Optional framing reference. Review the verified finished video on its main card; request a framing adjustment only if needed.'}, notify=False)
-
 
 
 def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optional[str]) -> str:
