@@ -847,6 +847,7 @@ def _send_copy_review(
 ) -> None:
     """Present copy review as one evolving Telegram message."""
     _refresh_copy_review(chat_id, request_id, index=0)
+    __import__('review_navigation').notify_safely(request_id, 'final')
 
 
 def _regenerate_copy_draft(request_id: str, index: int, chat_id: str) -> None:
@@ -1606,7 +1607,8 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
                     "summary": str(segment.get("summary") or ""),
                 }
             )
-        assets=[a for a in assets if a['asset_id'] not in handed_off]
+        blocked = {item.split(': ', 1)[0] for item in __import__('clip_review_state').delivery_blockers(request_id, state)}
+        assets=[a for a in assets if a['asset_id'] not in handed_off and a['asset_id'] not in blocked]
         drafts={d.get('asset_id'):d for d in state.get('copy_drafts') or []}
         if drafts:
             assets=[a for a in assets if drafts.get(a['asset_id'],{}).get('copy_status') in {'approved','edited'} and not drafts.get(a['asset_id'],{}).get('editorial_hold')]
@@ -2975,6 +2977,7 @@ def _send_candidates(
     # review message. Both cards are edited in place from here forward.
     _send_short_confirmation(chat_id, request_id)
     _refresh_short_review_message(chat_id, request_id, page_number=page)
+    __import__('review_navigation').notify_safely(request_id, 'shorts')
 
 
 def _transcribe(video_path: Path, progress=None) -> list[dict]:
@@ -3319,6 +3322,7 @@ def _send_topic_candidates(
     """Present 16:9 review in one evolving Telegram message."""
     _send_short_confirmation(chat_id, request_id)
     _refresh_topic_review(chat_id, request_id, index=0)
+    __import__('review_navigation').notify_safely(request_id, 'highlights')
 
 
 def _process_topics(
@@ -5336,13 +5340,15 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
         _refresh_topic_review(chat_id, request_id, index=index)
         _send_short_confirmation(chat_id, request_id)
         segment = state["topic_result"]["segments"][index]
+        from clip_review_state import prepare_segment, preserve_selection
+        prepared, review_revisions = prepare_segment(request_id, f'{request_id}:highlight:{index+1}', segment)
         video = _ensure_render_source(request_id, state)
         video_id = state["parsed"].get("video_id", request_id)
         vid_title = _state_vid_title(state)
         import main
 
         rendered = main.attach_topic_segment_asset(
-            dict(segment),
+            prepared,
             video_id,
             video,
             index + 1,
@@ -5354,11 +5360,12 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
             ).fetchone()
             latest_state = json.loads(latest["state_json"])
             reviews = dict(latest_state.get("topic_reviews") or {})
-            latest_state["topic_result"]["segments"][index] = rendered
+            latest_state["topic_result"]["segments"][index] = preserve_selection(segment, rendered) if review_revisions else rendered
             reviews[str(index)] = {
                 **reviews.get(str(index), {}),
                 "status": "rendered",
                 "segment_url": rendered.get("segment_url"),
+                "rendered_review_revisions": review_revisions,
                 "folder_id": rendered.get("folder_id"),
                 "rendered_at": now(),
             }
@@ -5370,6 +5377,7 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
             )
         _refresh_topic_review(chat_id, request_id, index=index)
         _send_short_confirmation(chat_id, request_id)
+        __import__('review_navigation').notify_safely(request_id, 'final', str(rendered.get('segment_url') or index))
         _notify_render_queue_complete(request_id, chat_id)
     except Exception as exc:
         logger.exception(
@@ -5450,7 +5458,9 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         vid_title = _state_vid_title(state)
         import main
 
-        payload_candidate = dict(candidate)
+        from clip_review_state import prepare_segment, preserve_selection, verify_render_choice
+        identity = f'{request_id}:short:{int(candidate.get("candidate_number") or index+1)}'
+        payload_candidate, review_revisions = prepare_segment(request_id, identity, candidate)
         payload_candidate["candidate_number"] = int(
             candidate.get("candidate_number") or index + 1
         )
@@ -5463,6 +5473,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             vid_title=vid_title,
         )
         clip = rendered["segments"][0]
+        verify_render_choice(payload_candidate, clip)
         rendered_at = now()
         with _LOCK, _telegram_db() as db:
             latest = db.execute(
@@ -5470,11 +5481,12 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             ).fetchone()
             latest_state = json.loads(latest["state_json"])
             reviews = dict(latest_state.get("candidate_reviews") or {})
-            latest_state["result"]["segments"][index] = clip
+            latest_state["result"]["segments"][index] = preserve_selection(candidate, clip) if review_revisions else clip
             reviews[str(index)] = {
                 **reviews.get(str(index), {}),
                 "status": "rendered",
                 "clip_url": clip.get("clip_url"),
+                "rendered_review_revisions": review_revisions,
                 "folder_id": clip.get("folder_id"),
                 "rendered_at": rendered_at,
             }
@@ -5494,8 +5506,16 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             clip_url=clip.get("clip_url", ""),
             rendered_at=rendered_at,
         )
+        try:
+            if hasattr(main, 'prepare_framing_review'):
+                main.prepare_framing_review(request_id, identity, video, candidate, clip)
+        except Exception:
+            # A preview failure must not erase the successful export. The
+            # framing gate still prevents it from entering scheduling.
+            logger.exception('Framing preview unavailable request_id=%s asset=%s', request_id, identity)
         _refresh_short_review_message(chat_id, request_id)
         _send_short_confirmation(chat_id, request_id)
+        __import__('review_navigation').notify_safely(request_id, 'final', str(clip.get('clip_url') or identity))
         _notify_render_queue_complete(request_id, chat_id)
     except Exception as exc:
         logger.exception(

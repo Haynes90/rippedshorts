@@ -1,3 +1,5 @@
+> Updated November 1: see [REVIEW_WORKFLOW_ACCEPTANCE.md](REVIEW_WORKFLOW_ACCEPTANCE.md) for the current implementation, 389/371 passing final regression results, isolated website/media evidence and outstanding live-delivery authorization. The older counts and production-website limitations below describe the earlier acceptance pass.
+
 # PR #77 + #78 — Focused Acceptance Completion
 
 Date: 2026-10-31 (owner timezone). **NEEDS ATTENTION — keep both PRs draft/unmerged. No production deployment authorized or performed.**
