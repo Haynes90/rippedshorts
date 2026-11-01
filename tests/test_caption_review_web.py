@@ -40,4 +40,5 @@ def test_finish_saves_current_written_copy_before_scheduling():
     assert "Saving edits…" in PORTAL
     assert "document.querySelectorAll('.asset')" in PORTAL
     assert "await saveAsset(index, 'save')" in PORTAL
-    assert "final written copy was saved and sent" in PORTAL
+    assert "Scheduling is pending; no successful handoff is claimed" in PORTAL
+    assert "data.status === 'scheduler_accepted'" in PORTAL

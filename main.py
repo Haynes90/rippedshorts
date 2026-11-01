@@ -1340,7 +1340,9 @@ def prepare_framing_review(request_id, asset_id, source, original, rendered):
     review.register(request_id, asset_id, 'framing', [float(original['start']), float(original['end'])],
         [start,end], media, {'source_video_id': state['parsed']['video_id'], 'source_duration': media_duration(source),
         'verified_media': True, 'preview_bounds': [start,end], 'timing_provenance': 'existing_verified_render',
-        'explanation': 'Whole-frame sharp foreground over moving blurred background. Smart alternative is shown only when audiovisual tile evidence supports it.'})
+        'optional_reference': True,
+        'explanation': 'Optional framing reference. Review the verified finished video on its main card; request a framing adjustment only if needed.'}, notify=False)
+
 
 
 def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optional[str]) -> str:

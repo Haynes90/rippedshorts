@@ -3082,6 +3082,10 @@ def _topic_break_suggestions(
                 parsed = json.loads(data)
                 if not isinstance(parsed,dict) or not isinstance(parsed.get('segments'),list):
                     raise RuntimeError('Highlight response omitted its candidate array')
+                from production_intelligence import prompt_evidence
+                evidence = prompt_evidence(payload['model'], prompt, '16:9')
+                for candidate in parsed['segments']:
+                    candidate['selection_provenance'] = evidence
                 return parsed['segments']
             last_error = f"HTTP {response.status_code}"
             if response.status_code in {400,401,403,404}:
@@ -3165,6 +3169,7 @@ def _build_contiguous_topic_segments(
                 "_selection_score": float(suggestion.get("score", 0) or 0),
                 "score": float(suggestion["score"]) if suggestion.get("score") is not None else None,
                 "original_ai_rank": proposal_rank,
+                "selection_provenance": suggestion.get('selection_provenance') or {},
             }
         )
 

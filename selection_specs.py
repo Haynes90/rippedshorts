@@ -4,20 +4,23 @@ import math
 from pathlib import Path
 import threading
 import time
+import hashlib
 
 REFERENCE='1QyDKGKJscc107U38QsWtLP6fhqv8VPZhdoSwIC-bQdM'
 _lock=threading.Lock()
 _cache=None
 _at=0.
 _disabled=False
+_provenance={}
 
 
 def highlight_framework():
-    global _cache,_at,_disabled
+    global _cache,_at,_disabled,_provenance
     with _lock:
         if _cache is not None and (time.monotonic()-_at<600 or _disabled):
             return _cache
         reference=os.getenv('RIPPED_16X9_SELECTION_DOC',REFERENCE).strip()
+        origin='google_doc'
         try:
             if not reference:
                 raise ValueError('No editable highlight reference configured')
@@ -29,8 +32,15 @@ def highlight_framework():
             # Do not repeatedly request a document that this service cannot read.
             _disabled=any(t in str(exc).lower() for t in ('403','404','permission','forbidden','not found'))
             text=(Path(__file__).parent/'ripped_shorts_16x9_framework.txt').read_text(encoding='utf-8')
+            origin='packaged_approved_fallback'
+        _provenance={'source':origin,'document_id':reference if origin=='google_doc' else None,
+                     'content_sha256':hashlib.sha256(text.encode()).hexdigest()}
         _cache,_at=text,time.monotonic()
         return text
+
+
+def framework_provenance():
+    return dict(_provenance)  # evidence only; never performs a new network read
 
 
 def selector_result(response):

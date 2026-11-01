@@ -3,6 +3,47 @@ import html
 import json
 
 
+def finished_cards(items, token):
+    from urllib.parse import quote
+    cards = []
+    reasons = [('poor_topic','Poor topic choice'),('weak_hook','Weak hook'),('incomplete_thought','Incomplete thought'),('unnecessary_length','Unnecessary length'),('inaccurate_transcript','Inaccurate transcript'),('unsuitable_framing','Unsuitable framing'),('bad_audio','Bad audio')]
+    for item in items:
+        asset = item['asset_id']; key = asset.replace(':','-'); decision = item['decision']
+        video = '<p role="status">Finished video unavailable — '+html.escape(str(item.get('error') or item['render_status']))+'. No source preview is presented as a final export.</p>'
+        if item['finished']:
+            video = f'<video controls playsinline preload="metadata" style="width:100%;max-height:70vh" src="/api/ripped-shorts/review/{token}/clip/{quote(asset,safe="")}/media"></video>'
+        disabled = 'disabled' if item['frozen'] else ''
+        approve_disabled = 'disabled' if item['frozen'] or not item['finished'] else ''
+        why = item.get('reason') or 'No selection explanation was saved for this legacy candidate.'
+        evidence = item.get('provenance') or {'status':'NOT_RECORDED — legacy candidate; no prompt/map revision inferred retroactively'}
+        saved_status = 'Previous approval needs renewed review for this render' if decision.get('choice')=='approve' and not item['approval_current'] else str(decision.get('choice') or 'Undecided')
+        options = ''.join(f'<option value="{code}" {"selected" if decision.get("reason")==code else ""}>{label}</option>' for code,label in reasons)
+        cards.append(f'''<article class="clip-card" id="clip-{key}" data-asset="{html.escape(asset)}" data-version="{decision.get('version',0)}" style="border:1px solid #315163;border-radius:16px;padding:14px;margin:16px 0">
+<span class="pill">{item['format']}</span><h2>{html.escape(str(item['title']))}</h2>
+<p>Category: {html.escape(str(item['category']))} · Clip {item['number']}</p>
+<details><summary>Complete excerpt transcript{' — awaiting final render' if not item['finished'] else ''}</summary><p style="white-space:pre-wrap">{html.escape(item['transcript'])}</p></details>
+{video}<p><strong>Why selected:</strong> {html.escape(str(why))}</p>
+<details><summary>Selection evidence</summary><pre style="white-space:pre-wrap">{html.escape(json.dumps(evidence,indent=2))}</pre></details>
+<label><input type="checkbox" id="clip-playback-{key}" style="width:auto"> I watched this finished clip and heard its audio</label>
+<label for="clip-reason-{key}">Reason if rejecting</label><select id="clip-reason-{key}"><option value="">Choose a reason</option>{options}</select>
+<label for="clip-feedback-{key}">Optional feedback / adjustment request</label><textarea id="clip-feedback-{key}">{html.escape(str(decision.get('feedback') or ''))}</textarea>
+<label for="clip-edit-{key}">If requesting an adjustment</label><select id="clip-edit-{key}"><option value="boundaries">Boundaries</option><option value="topic_context">Topic/context</option><option value="caption">Caption</option><option value="framing">Framing</option><option value="audio">Audio</option></select>
+<div class="actions"><button type="button" {approve_disabled} onclick="clipDecision('{asset}','approve')">Approve Clip</button><button type="button" {disabled} onclick="clipDecision('{asset}','reject')">Reject Clip</button><button type="button" {disabled} onclick="clipDecision('{asset}','request_adjustment')">Request Adjustment</button></div>
+<button type="button" class="secondary" onclick="document.getElementById('editing-workflow').open=true;document.getElementById('editing-workflow').scrollIntoView()">Edit / compare alternatives</button>
+<p id="clip-status-{key}" role="status">Saved clip decision: {html.escape(saved_status)}</p>
+<p class="meta">Clip approval does not approve copy, invite collaborators or start scheduling.</p></article>''')
+    return ''.join(cards) + '''<script>
+async function clipDecision(asset,choice){
+ const key=asset.replaceAll(':','-'),card=document.getElementById('clip-'+key),status=document.getElementById('clip-status-'+key);
+ try{
+  const response=await fetch('/api/ripped-shorts/review/'+TOKEN+'/clip/'+encodeURIComponent(asset),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice,version:Number(card.dataset.version),reason:document.getElementById('clip-reason-'+key).value,feedback:document.getElementById('clip-feedback-'+key).value,changed_fields:choice==='request_adjustment'?[document.getElementById('clip-edit-'+key).value]:[],playback_verified:document.getElementById('clip-playback-'+key).checked})});
+  const result=await response.json();if(!response.ok)throw new Error(result.detail||'Save failed');
+  card.dataset.version=result.decision.version;status.textContent='Saved: '+result.decision.choice+'. No rendering, scheduling or collaborator invitation started.';
+ }catch(error){status.textContent='Not saved: '+error.message;}
+}
+</script>'''
+
+
 def sections(reviews, token):
     groups = {'editorial': [], 'framing': []}
     for review in sorted(reviews, key=lambda r: (r['format'] != '9:16', int(r['asset_id'].rsplit(':', 1)[-1]))):

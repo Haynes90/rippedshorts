@@ -219,6 +219,7 @@ def _payload_for_session(token: str) -> dict[str, Any]:
         "batch_summary": batch,
         "candidate_evidence": candidate_evidence,
         "comparisons": __import__('clip_review_state').reviews(request_id),
+        "clips": __import__('finished_clip_review').clips(request_id, state, __import__('clip_review_state').reviews(request_id)),
         "creator_brand": creator_brand,
         "creator_required": creator_required,
         "creator_suggestions": creator_suggestions,
@@ -246,17 +247,7 @@ def _card_html(item: dict[str, Any], token: str) -> str:
     status = "Edited" if item["user_edited"] else (
         "Kept" if item["copy_status"] == "approved" else "Pending"
     )
-    preview = ""
-    if item["preview_url"]:
-        preview = (
-            f'<iframe class="preview" src="{html.escape(item["preview_url"])}" '
-            'allow="autoplay; encrypted-media" allowfullscreen></iframe>'
-        )
-    elif item["drive_url"]:
-        preview = (
-            f'<a class="watch" target="_blank" rel="noopener" '
-            f'href="{html.escape(item["drive_url"])}">Open video in Drive</a>'
-        )
+    preview = ""  # verified finished playback lives on the primary clip card
 
     if kind == "9:16_SHORT":
         fields = f"""
@@ -396,7 +387,10 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
     <div class="progress-text" id="progressText"></div>
   </div>
 
+  <section id="finished-clips"><h2>Review finished clips</h2>{__import__('clip_review_ui').finished_cards(payload.get('clips', []), token)}</section>
+  <details id="editing-workflow" {'open' if payload.get('stage') in {'editorial','framing'} else ''}><summary>Edit boundaries or framing / compare alternatives</summary>
   {__import__('clip_review_ui').sections(payload.get('comparisons', []), token)}
+  </details>
   <section id="shorts"><h2>9:16 candidate review</h2><p>Candidate selection remains in Telegram; saved selections are preserved.</p></section>
   <section id="highlights"><h2>16:9 candidate review</h2><p>Highlight selection follows Shorts confirmation in Telegram.</p></section>
   <section id="final"><h2>Final rendered video and copy approval</h2><section id="assets">{cards}</section></section>
@@ -512,8 +506,8 @@ async function finishReview() {{
     const response = await fetch(`/api/ripped-shorts/review/${{TOKEN}}/finish`, {{method:'POST'}});
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Finish failed');
-    button.textContent = 'Sent to Schedule Master ✓';
-    globalStatus.textContent = 'Your final written copy was saved and sent with the Drive videos.';
+    button.textContent = data.status === 'scheduler_accepted' ? 'Schedule Master acknowledged ✓' : 'Scheduling requested';
+    globalStatus.textContent = data.status === 'scheduler_accepted' ? 'Receipt confirmed. Check the actual delivery dates below.' : 'Your copy and scheduling request were saved. Scheduling is pending; no successful handoff is claimed.';
   }} catch(error) {{
     button.disabled = false;
     button.textContent = 'Finish & Schedule';
@@ -526,7 +520,7 @@ async function finishReview() {{
 
 
 @router.get("/review/{token}")
-def copy_review_page(token: str):
+def copy_review_page(token: str, stage: str = 'final'):
     try:
         payload = _payload_for_session(token)
     except HTTPException as exc:
@@ -543,6 +537,7 @@ def copy_review_page(token: str):
                 status_code=410,
             )
         raise
+    payload['stage'] = stage
     return Response(content=_page(payload, token), media_type="text/html")
 
 
@@ -565,14 +560,18 @@ async def save_comparison(token: str, revision: str, request: Request):
 @router.get('/api/ripped-shorts/review/{token}/comparison/{revision}/media/{variant}')
 def comparison_media(token: str, revision: str, variant: str):
     """Stream only a registered artifact belonging to this bearer review session."""
-    from pathlib import Path
-    from fastapi.responses import FileResponse
-    from audio_master_handoff import DATA_DIR
     session = _session(token)
     review = next((r for r in __import__('clip_review_state').reviews(str(session['request_id'])) if r['revision_id'] == revision), None)
     artifact = (review or {}).get('media', {}).get(variant)
     if not artifact:
         raise HTTPException(status_code=404, detail='Preview not found')
+    return _preview_response(artifact)
+
+
+def _preview_response(artifact):
+    from pathlib import Path
+    from fastapi.responses import FileResponse
+    from audio_master_handoff import DATA_DIR
     root = Path(DATA_DIR).resolve()
     if artifact.get('local_path'):
         path = Path(artifact['local_path']).resolve()
@@ -609,6 +608,27 @@ def comparison_media(token: str, revision: str, variant: str):
             if hashlib.file_digest(stream, 'sha256').hexdigest() != artifact['sha256']:
                 raise HTTPException(status_code=409, detail='Preview fingerprint changed')
     return FileResponse(path, media_type='video/mp4', headers={'Cache-Control': 'private, no-store', 'Referrer-Policy': 'no-referrer'})
+
+
+@router.post('/api/ripped-shorts/review/{token}/clip/{asset_id}')
+async def save_clip_decision(token: str, asset_id: str, request: Request):
+    session = _session(token)
+    try:
+        return __import__('finished_clip_review').save(str(session['request_id']), asset_id, await request.json())
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.get('/api/ripped-shorts/review/{token}/clip/{asset_id}/media')
+def finished_clip_media(token: str, asset_id: str):
+    session = _session(token)
+    row = _request_row(str(session['request_id']))
+    items = __import__('finished_clip_review').clips(str(session['request_id']), json.loads(row['state_json']))
+    item = next((c for c in items if c['asset_id'] == asset_id and c['finished']), None)
+    match = _DRIVE_ID_RE.search(item['media_url']) if item else None
+    if not match:
+        raise HTTPException(status_code=409, detail='Verified finished media unavailable; diagnostic comparisons are not final exports')
+    return _preview_response({'drive_file_id': match.group(1)})
 
 
 @router.post("/api/ripped-shorts/review/{token}/asset/{index}")
@@ -814,6 +834,13 @@ def finish_review(token: str):
     state = json.loads(row["state_json"])
     if state.get('acceptance_demo'):
         raise HTTPException(status_code=409, detail='Isolated demo cannot schedule or publish')
+    from finished_clip_review import clips, blocked_assets
+    accepted = (state.get('schedule_master') or {}).get('shorts_response') or {}
+    if (state.get('schedule_master') or {}).get('shorts_status') == 'accepted' and accepted.get('asset_group_ids'):
+        return {'status':'scheduler_accepted','request_id':request_id,'receipt':accepted}
+    finished = [c for c in clips(request_id,state) if c['finished'] and c['approval_current'] and c['asset_id'] not in blocked_assets(request_id,state)]
+    if not finished:
+        raise HTTPException(status_code=409, detail='No approved verified final renders are available. Your saved review choices are preserved; nothing was sent to Schedule Master.')
     playable = set(_media_for_state(state, request_id))
     blockers = [b for b in __import__('clip_review_state').delivery_blockers(request_id, state) if b.split(': ', 1)[0] in playable]
     if blockers:
@@ -824,12 +851,14 @@ def finish_review(token: str):
     if state.get("schedule_requested_at"):
         import telegram_intake as tg
         tg._notify_render_queue_complete(request_id,str(row['chat_id']))
-        return {"status": "already_scheduling", "request_id": request_id}
+        accepted = (state.get('schedule_master') or {}).get('shorts_response') or {}
+        return {"status": "scheduler_accepted" if accepted.get('asset_group_ids') else "schedule_requested", "request_id": request_id, 'receipt': accepted}
     from creator_approval import approved_batch
     if str(state.get("show_id") or "").upper() in {"TCB", "TDOG"} and not approved_batch(request_id):
         raise HTTPException(status_code=409, detail="Confirm the featured creators once at the top of this page")
 
-    if any(d.get('copy_status') not in {'approved','edited'} for d in drafts if str(d.get('asset_id') or '') in _media_for_state(state,request_id)):
+    eligible_ids = {c['asset_id'] for c in finished}
+    if any(d.get('copy_status') not in {'approved','edited'} for d in drafts if str(d.get('asset_id') or '') in eligible_ids):
         raise HTTPException(status_code=409, detail='Approve every selected clip caption before finishing')
     state.pop("awaiting_copy_input", None)
     state["copy_review_completed_at"] = _iso(_now())
