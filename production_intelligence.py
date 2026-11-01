@@ -217,8 +217,14 @@ def model_topic_map(timeline):
               'response_format': {'type': 'json_object'}}, timeout=(15, 600))
     response.raise_for_status()
     result = json.loads(response.json()['choices'][0]['message']['content'])
-    result['provenance'] = {'provider': 'openai', 'model': model, 'evidence': 'full_verified_timed_transcript'}
+    result['provenance'] = {'provider': 'openai', 'model': model, 'evidence': 'full_verified_timed_transcript',
+        'prompt_version':'semantic-source-map-v1','prompt_sha256':hashlib.sha256(prompt.encode()).hexdigest()}
     return result
+
+
+def prompt_evidence(model, prompt, lane):
+    return {'prompt_version':'complete-excerpt-v2', 'prompt_sha256':hashlib.sha256(prompt.encode()).hexdigest(),
+            'model':model, 'format':lane, 'source':'actual_selector_request'}
 
 
 def candidate_records(mapping, lane, result, context):
@@ -226,10 +232,18 @@ def candidate_records(mapping, lane, result, context):
         candidate_id = candidate.get('candidate_id') or identity(mapping['map_id'], lane, candidate['start'], candidate['end'])
         associated = [t['topic_id'] for t in mapping['topics'] if candidate['start'] < t['end'] and candidate['end'] > t['start']]
         candidate.update(candidate_id=candidate_id, topic_ids=associated, map_id=mapping['map_id'])
+        candidate['topic_titles'] = [t.get('title') for t in mapping['topics'] if t['topic_id'] in associated and t.get('title')]
+        candidate['selection_provenance'] = {**(result.get('selection_provenance') or {}), **(candidate.get('selection_provenance') or {}),
+            'map_id':mapping['map_id'], 'map_analysis_version':mapping.get('analysis_version'),
+            'topic_map_revision':identity(mapping['topics']),
+            'transcript_revision':mapping['transcript_revision'], 'brand_id':mapping['source']['brand_id'],
+            'show_id':mapping['source'].get('show_id'), 'learning_evidence_ids':[e['evidence_id'] for e in context.get('examples') or []],
+            'learning_confidence':context.get('confidence'), 'topic_ids':associated}
         record('candidate', candidate_id, {'candidate_id': candidate_id, 'map_id': mapping['map_id'],
             **mapping['source'], 'format': lane, 'ai_rank': candidate.get('original_ai_rank',rank), 'ai_score': candidate.get('score') if candidate.get('ai_score_available',True) else None,
             'start': candidate['start'], 'end': candidate['end'], 'category': candidate.get('category') or candidate.get('highlight_type'),
             'topic_ids': associated, 'reason': candidate.get('reason'), 'learning_evidence': context,
+            'selection_provenance':candidate['selection_provenance'],
             'transcript_ref': {'revision': mapping['transcript_revision'], 'start': candidate['start'], 'end': candidate['end']}})
         with database() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -255,17 +269,20 @@ def feedback_snapshot(request_id, state):
             candidate_id = clip.get('candidate_id') or identity(request_id, lane,clip.get('candidate_number'),clip.get('start'),clip.get('end'))
             asset_id = f"{request_id}:{'short' if lane=='9:16' else 'highlight'}:{clip.get('candidate_number') or index+1}"
             draft = next((d for d in state.get('copy_drafts') or [] if d.get('asset_id') == asset_id), {})
+            website = (state.get('website_clip_reviews') or {}).get(asset_id) or {}
             data = {'candidate_id': candidate_id, 'request_id': request_id, 'asset_id': asset_id,
                     'source_video_id': (state.get('parsed') or {}).get('video_id'), 'brand_id': brand,
                     'show_id': state.get('show_id'), 'format': lane, 'topic_ids': clip.get('topic_ids', []),
                     'category': clip.get('category') or clip.get('highlight_type'), 'ai_rank': index+1,
-                    'ai_score': clip.get('score'), 'decision': review.get('status', 'proposed'),
-                    'feedback': review.get('feedback') or review.get('instruction'), 'review': review,
+                    'ai_score': clip.get('score'), 'decision': {'approve':'approved','reject':'rejected','request_adjustment':'edited'}.get(website.get('choice'),review.get('status', 'proposed')),
+                    'feedback': website.get('feedback') or review.get('feedback') or review.get('instruction'), 'review': review,
+                    'rejection_reason': website.get('reason'), 'changed_fields':website.get('changed_fields') or [],
+                    'website_clip_decision':website,
                     'bounds': {'start': clip.get('start'), 'end': clip.get('end')},
                     'copy_revision': draft, 'render': clip.get('completion_check'),
                     'media_url': review.get('clip_url') or review.get('segment_url'),
                     'scheduler': state.get('schedule_master') or {},
-                    'explicit_feedback': bool(review.get('feedback') or review.get('instruction'))}
+                    'explicit_feedback': bool(website.get('feedback') or website.get('reason') or review.get('feedback') or review.get('instruction'))}
             response=(state.get('schedule_master') or {}).get('shorts_response') or {}
             data['delivery_ids']=[d['delivery_id'] for d in response.get('delivery_manifest') or [] if d.get('asset_group_id')==asset_id and d.get('delivery_id')]
             data['scheduled_deliveries']=[{k:d.get(k) for k in ('delivery_id','scheduled_at','destination_id','schedule_record_valid','publisher_status','platform_post_id_url')} for d in (response.get('delivery_validation') or {}).get('deliveries') or [] if d.get('asset_group_id')==asset_id or d.get('delivery_id') in data['delivery_ids']]
@@ -304,6 +321,8 @@ def learning_context(source, lane, topics=()):
             continue  # untouched items are skipped, not an explicit editorial rejection
         draft=item.get('copy_revision') or {}
         sign = 1 if decision in {'approve','approved','queued','rendering','rendered','favorite','favorited'} else -1 if decision in {'reject','rejected'} else 0
+        if item.get('rejection_reason') in {'inaccurate_transcript','unsuitable_framing','bad_audio','unnecessary_length','incomplete_thought'}:
+            sign=0  # production/boundary faults are not a blanket dislike of the topic
         if draft.get('favorite'):
             sign=1
         if not sign and not item.get('explicit_feedback') and not draft.get('selection_feedback') and decision != 'edited' and not item.get('framing_choice'):
@@ -320,6 +339,7 @@ def learning_context(source, lane, topics=()):
                          'feedback': item.get('feedback') or draft.get('selection_feedback'), 'bounds': item.get('bounds'),
                          'boundary_changes':{'before':item.get('before'),'after':item.get('after')} if item.get('decision')=='edited' else None,
                          'framing_choice': item.get('framing_choice'), 'review_kind': item.get('review_kind'),
+                         'rejection_reason':item.get('rejection_reason'), 'changed_fields':item.get('changed_fields') or [],
                          'topic_similarity':similarity,
                          'copy_changes': {k: v for k,v in (item.get('copy_revision') or {}).items() if k in {'user_edited','social_caption','video_title','video_description'}},
                          'confidence': min(.85, .25+.1*weight)})

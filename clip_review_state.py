@@ -163,6 +163,8 @@ def render_selection(request_id, asset_id):
     result = {'review_revisions': {}, 'framing_mode': None, 'bounds': None}
     for review in chosen:
         decision = review['decision']
+        if review['provenance'].get('optional_reference') is True and decision is None:
+            continue  # no fabricated framing approval; primary finished-clip approval is still required
         if decision not in {'original', 'proposed', 'smart', 'blurred'}:
             raise ValueError('Editorial/framing review is pending')
         result['review_revisions'][review['kind']] = review['revision_id'] + ':' + str(review['version'])
@@ -192,8 +194,10 @@ def delivery_blockers(request_id, state):
         except ValueError:
             errors.append(asset_id + ': review pending')
             continue
-        if (assets.get(asset_id) or {}).get('rendered_review_revisions') != expected:
+        if expected and (assets.get(asset_id) or {}).get('rendered_review_revisions') != expected:
             errors.append(asset_id + ': approved revision requires verified rendering')
+    from finished_clip_review import blocked_assets
+    errors.extend(asset + ': clip approval pending or rendered media changed' for asset in blocked_assets(request_id,state))
     return errors
 
 

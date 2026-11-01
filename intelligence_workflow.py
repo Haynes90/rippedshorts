@@ -28,7 +28,9 @@ def analyze_highlights(mapping, segments, video):
     context = intelligence.learning_context(mapping['source'], '16:9', mapping['topics'])
     from selection_specs import highlight_framework
     specification=highlight_framework()
+    brand_context = ('TDOG: practical gardening explanations, host/guest discussions, stories and memorable exchanges.' if mapping['source'].get('show_id')=='TDOG' else 'TCB: insightful, useful, funny or memorable source-show discussions with attribution context.')
     prompt = specification+'\nCURRENT OWNER WORKFLOW: Analyze both formats concurrently; only presentation and approval wait for Shorts confirmation. Retain all editorial and timing requirements from the specification.\nSHARED FULL-SOURCE TOPIC MAP:\n'+intelligence.encoded(mapping)+intelligence.learning_prompt(context)
+    prompt += '\nSHOW CONTEXT: '+brand_context+'\nDiscover valuable tangents and unusual moments throughout the source, including outside major topics. Never force a quota.'
     def analyze():
         suggestions = tg._topic_break_suggestions(segments, intelligence_context=prompt)
         topics = tg._preflight_candidates(video, tg._build_contiguous_topic_segments(segments, suggestions))
@@ -36,9 +38,13 @@ def analyze_highlights(mapping, segments, video):
             suggestions = tg._topic_break_suggestions(segments, semantic_fallback=True, intelligence_context=prompt)
             topics = tg._preflight_candidates(video, tg._build_contiguous_topic_segments(segments, suggestions, minimum_seconds=180))
         result = intelligence.rank_with_evidence({'segments': topics, 'selection': 'shared_full_source_map'}, context)
+        from selection_specs import framework_provenance
+        result['selection_provenance']={'specification_sha256':__import__('hashlib').sha256(specification.encode()).hexdigest(), 'specification':framework_provenance()}
         result['segments'].sort(key=lambda c:c['start'])
         return intelligence.candidate_records(mapping, '16:9', result, context)
-    return intelligence.cached_analysis(mapping['map_id']+':16:9:'+intelligence.identity(os.getenv('OPENAI_MODEL'), specification, 'minimum-180-v1'), analyze)
+    # Freeze the completed lane for this unchanged source/specification. New
+    # feedback applies to future sources, not a silent rerun of this batch.
+    return intelligence.cached_analysis(mapping['map_id']+':16:9:'+intelligence.identity(os.getenv('OPENAI_MODEL'), specification, brand_context, 'minimum-180-v2'), analyze)
 
 
 def start(state, segments, video, short_prompt):
@@ -53,6 +59,12 @@ def start(state, segments, video, short_prompt):
             from selection_specs import selector_result
             from source_ingestion import select_non_overlapping
             result = tg.validate_complete_candidates(selector_result(main.call_openai_for_clips(segments, prompt)), segments)
+            result['selection_provenance'] = intelligence.prompt_evidence(main.OPENAI_MODEL, main.openai_clip_prompt(segments,prompt), '9:16')
+            result['selection_provenance']['specification_sha256'] = __import__('hashlib').sha256(short_prompt.encode()).hexdigest()
+            live = getattr(tg,'_SHORT_FRAMEWORK_LIVE_CACHE','')
+            result['selection_provenance']['specification'] = {'source':'google_doc' if live and live in short_prompt else 'packaged_or_supplied_approved_rules',
+                'document_id':getattr(tg,'_SHORT_FRAMEWORK_LIVE_REFERENCE',None) if live and live in short_prompt else None,
+                'content_sha256':__import__('hashlib').sha256((live if live and live in short_prompt else short_prompt).encode()).hexdigest()}
             result['segments']=select_non_overlapping(result['segments'],limit=len(result['segments']),allow_overlap=False)
             result = intelligence.rank_with_evidence(result, context)
             return intelligence.candidate_records(mapping, '9:16', result, context)
