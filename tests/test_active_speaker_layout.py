@@ -19,9 +19,14 @@ class ActiveSpeakerLayoutTests(unittest.TestCase):
         self.assertIn("ACTIVE_SPEAKER_MIN_HOLD_SECONDS", ACTIVE)
 
     def test_dynamic_sections_are_concatenated(self):
-        self.assertIn("trim=start=", ACTIVE)
-        self.assertIn("concat=n=", ACTIVE)
-        self.assertIn("vstack=2", ACTIVE)
+        from unittest.mock import patch
+        import camera_layout
+        layout={'regions':[{'id':'0','kind':'camera','rect':[0,0,480,540]}, {'id':'1','kind':'camera','rect':[480,0,480,540]}]}
+        with patch.object(camera_layout,'analyze',return_value=(layout,[])), patch.object(camera_layout,'speaker_sections',return_value=[(0.,'0'),(5.,'1')]):
+            graph,proof=camera_layout.build('isolated',0,10,640,360,None,[])
+        self.assertIn('trim=start=5.000:end=10.000',graph)
+        self.assertIn('concat=n=2',graph)
+        self.assertEqual(proof['sections'],[(0.,'0'),(5.,'1')])
 
     def test_active_speaker_crops_respect_participant_lanes(self):
         self.assertIn("def _participant_horizontal_zones(", ACTIVE)
@@ -43,10 +48,14 @@ class ActiveSpeakerLayoutTests(unittest.TestCase):
         self.assertIn("timestamp - last_change >= minimum_hold", ACTIVE)
 
     def test_failure_retains_deterministic_fallback(self):
-        self.assertIn("return None", ACTIVE)
-        self.assertIn("if active_filter:", MAIN)
-        self.assertIn("_estimate_dual_participant_tracks", MAIN)
-        self.assertIn("_build_crop_filter(video_path, start, duration)", MAIN)
+        from unittest.mock import patch
+        import active_speaker
+        with patch('camera_layout.build',return_value=None), patch.object(active_speaker,'_audio_rms',return_value=[]):
+            graph=active_speaker.build_active_speaker_filter(Path('isolated'),0,10,640,360,lambda:object())
+        self.assertIn('gblur=',graph)
+        self.assertIn('force_original_aspect_ratio=decrease',graph)
+        self.assertTrue(active_speaker.last_framing_plan()['requires_framing_review'])
+        self.assertNotIn('_build_crop_filter(video_path, start, duration)', MAIN)
 
 
 if __name__ == "__main__":

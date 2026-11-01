@@ -57,7 +57,8 @@ def test_layout_changes_or_inconsistent_faces_use_existing_fallback():
 def test_mixed_screen_share_is_preserved_in_full_source_view():
     frame,faces=fixture('mixed');regions=detect_regions(frame,faces)['regions']
     graph=composition_graph(regions,primary='0')
-    assert 'crop=' not in graph and 'force_original_aspect_ratio=decrease' in graph
+    assert '[fg0]scale=1080:1920:force_original_aspect_ratio=decrease' in graph
+    assert 'gblur=' in graph and 'overlay=' in graph
 
 
 def test_audio_spike_without_distinct_mouth_evidence_never_identifies_a_speaker():
@@ -91,21 +92,12 @@ def test_real_ffmpeg_output_preserves_tiles_dimensions_audio_and_pixels(tmp_path
     assert ok and image.shape[:2]==(1920,1080)
     audio=subprocess.run([executable,'-v','error','-i',str(target),'-vn','-f','f32le','-ac','1','-ar','16000','-'],capture_output=True,check=True,timeout=30).stdout
     assert np.sqrt(np.mean(np.frombuffer(audio,np.float32)**2))>.01
-    if layout in {'side_by_side','stacked'}:
-        assert image[480,540,2]>image[480,540,0]+80
-        assert image[1440,540,0]>image[1440,540,2]+80
-    elif layout=='grid':
-        assert image[480,270,2]>100 and image[480,270,0]<60
-        assert image[480,810,0]>100 and image[480,810,2]<90
-        assert image[1440,270,0]>150 and image[1440,270,1]<60
-        assert image[1440,810,1]>150 and image[1440,810,2]>150
-    elif layout=='three':
-        assert image[540,540,2]>100 and image[540,540,0]<60
-        assert image[1500,270,0]>100 and image[1500,270,2]<90
-        assert image[1500,810,0]>150 and image[1500,810,1]<60
-    elif layout=='mixed':
-        # Original presentation/context quadrant remains visible, not discarded.
-        assert image[1080,810,1]>150
+    # Uncertain speaker => ALL source pixels remain in the sharp foreground,
+    # including all four corners, camera tiles and presentation content.
+    expected=cv2.resize(frame,(1080,608))
+    foreground=image[656:1264]
+    assert np.mean(np.abs(foreground.astype(float)-expected.astype(float)))<8
+    assert np.mean(image[:500])>5  # moving source background, not black bars
     assert target.stat().st_size>1000
 
 
@@ -115,7 +107,7 @@ def test_three_side_by_side_whole_tiles_are_supported():
     result=detect_regions(frame,[(60,80,70,70),(280,80,70,70),(490,80,70,70)])
     assert result['layout']=='side_by_side'
     assert [r['rect'] for r in result['regions']]==[[0,0,212,360],[212,0,216,360],[428,0,212,360]]
-    graph=composition_graph(result['regions'])
+    graph=composition_graph(result['regions'], primary='0')
     assert 'crop=208:356:2:2' in graph and 'crop=212:356:214:2' in graph
 
 
@@ -131,5 +123,7 @@ def test_uncertain_three_person_layout_preserves_source_not_two_face_crop():
     group=conservative_group_view(faces)
     assert group['requires_framing_review'] and group['confidence']==0
     assert group['regions'][0]['rect']==[0,0,960,540]
-    assert 'crop=' not in composition_graph(group['regions'])
+    graph=composition_graph(group['regions'])
+    assert '[fg0]scale=1080:1920:force_original_aspect_ratio=decrease' in graph
+    assert 'gblur=' in graph
     assert conservative_group_view([[(20,20,50,50)]]*5) is None

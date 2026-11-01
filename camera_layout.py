@@ -99,12 +99,22 @@ def speaker_sections(samples, energy, duration):
     return sections
 
 
+def blurred_full_frame(label='0:v', output='v', suffix='safe'):
+    """Moving blurred backdrop; the sharp foreground always contains the whole source."""
+    return (f'[{label}]split=2[bg{suffix}][fg{suffix}];'
+            f'[bg{suffix}]scale=1080:1920:force_original_aspect_ratio=increase,'
+            f'crop=1080:1920,gblur=sigma=24:steps=2,eq=brightness=-0.12:saturation=0.85[b{suffix}];'
+            f'[fg{suffix}]scale=1080:1920:force_original_aspect_ratio=decrease[f{suffix}];'
+            f'[b{suffix}][f{suffix}]overlay=(W-w)/2:(H-h)/2:shortest=1,'
+            f'setsar=1,fps=30,format=yuv420p[{output}]')
+
+
 def composition_graph(regions, primary=None, label='0:v', suffix='0'):
     """Preserve complete camera rectangles with letterboxing, never face-only crops."""
     cameras=[r for r in regions if r['kind']=='camera']
     context=[r for r in regions if r['kind']=='context']
-    if context or not cameras:
-        return f'[{label}]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v{suffix}]'
+    if context or not cameras or primary is None:
+        return blurred_full_frame(label, output=f'v{suffix}', suffix=suffix)
     cameras=sorted(cameras,key=lambda r: (r['id']!=primary,r['id'])) if primary is not None else cameras
     n=len(cameras)
     if n==2:

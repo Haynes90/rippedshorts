@@ -876,16 +876,9 @@ def _build_vertical_filter(
         )
         if active_filter:
             return active_filter, True
-    dual = _estimate_dual_participant_tracks(video_path, start, duration)
-    if dual is not None and os.getenv("DUAL_SPEAKER_STACKED_ENABLED", "true").lower() not in {
-        "0", "false", "no", "off"
-    }:
-        logger.info(
-            "Vertical layout=stacked participants_left=%.3f participants_right=%.3f",
-            dual[0], dual[1],
-        )
-        return _stacked_participant_filter(width, height, dual), True
-    return _build_crop_filter(video_path, start, duration), False
+    # Face locations or a disabled tracker do not establish a safe camera-tile crop.
+    from camera_layout import blurred_full_frame
+    return blurred_full_frame(), True
 
 def _build_crop_filter(video_path: Path, start: float, duration: float) -> str:
     width, height = _probe_video_dimensions(video_path)
@@ -982,12 +975,14 @@ def _assert_render_audio(
     )
 
 
-def create_clip_file(video_path: Path, start: float, duration: float, output_path: Path) -> None:
+def create_clip_file(video_path: Path, start: float, duration: float, output_path: Path, *, framing_mode=None) -> None:
     from active_speaker import reset_framing_plan
     reset_framing_plan()
-    vertical_filter, complex_filter = _build_vertical_filter(
-        video_path, start, duration
-    )
+    if framing_mode == 'blurred':
+        from camera_layout import blurred_full_frame
+        vertical_filter, complex_filter = blurred_full_frame(), True
+    else:
+        vertical_filter, complex_filter = _build_vertical_filter(video_path, start, duration)
     command = [
         "ffmpeg",
         "-y",
@@ -1032,6 +1027,8 @@ def create_clip_file(video_path: Path, start: float, duration: float, output_pat
     _assert_render_audio(video_path, output_path, start=start, duration=duration, aspect="9:16")
     from active_speaker import last_framing_plan
     plan = last_framing_plan()
+    if framing_mode == 'blurred':
+        plan = {'layout': 'blurred_full_frame', 'basis': 'owner_selected_full_frame', 'requires_framing_review': False}
     if plan:
         output_path.with_suffix('.framing.json').write_text(json.dumps(plan),encoding='utf-8')
 
@@ -1291,9 +1288,11 @@ def attach_clip_assets(
         # Keep the user-facing Drive filename predictable while ensuring
         # simultaneous FFmpeg processes never write to the same local path.
         output_path = workdir / f".render-{uuid.uuid4().hex}-{clip_name}"
-        segment.update(render_complete_clip(
-            video_path, segment, output_path, create_clip_file, "9:16"
-        ))
+        renderer = create_clip_file
+        if segment.get('framing_mode') == 'blurred':
+            from functools import partial
+            renderer = partial(create_clip_file, framing_mode='blurred')
+        segment.update(render_complete_clip(video_path, segment, output_path, renderer, "9:16"))
         clip_info = upload_clip_to_drive(
             output_path, clip_name, vid_title=resolved_vid_title
         )
@@ -1301,6 +1300,47 @@ def attach_clip_assets(
         segment["clip_url"] = clip_info["clip_url"]
         segment["folder_id"] = clip_info["folder_id"]
     return clips_payload
+
+
+def prepare_framing_review(request_id, asset_id, source, original, rendered):
+    """Preview generation inside the existing explicit render action, not a worker."""
+    import hashlib
+    import clip_review_state as review
+    if any(r['asset_id'] == asset_id and r['kind'] == 'framing' for r in review.reviews(request_id)):
+        return
+    from audio_master_handoff import DATA_DIR
+    target = DATA_DIR / 'review-previews' / request_id
+    target.mkdir(parents=True, exist_ok=True)
+    start, end = float(rendered['start']), float(rendered['end'])
+    path = target / (hashlib.sha256(f'{asset_id}:{start}:{end}:blur-v1'.encode()).hexdigest() + '.mp4')
+    # Existing renderer validates streams, dimensions, duration and audible audio.
+    if not path.is_file():
+        temporary = path.with_name(path.stem + '-pending.mp4')
+        try:
+            create_clip_file(source, start, end-start, temporary, framing_mode='blurred')
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+            temporary.with_suffix('.framing.json').unlink(missing_ok=True)
+    from clip_completion import media_duration
+    if _probe_video_dimensions(path) != (1080,1920) or abs(media_duration(path) - (end-start)) > .25:
+        raise ValueError('Framing preview dimensions or duration invalid')
+    _assert_render_audio(source, path, start=start, duration=end-start, aspect='9:16')
+    with path.open('rb') as stream:
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    media = {'blurred': {'local_path': str(path), 'size': path.stat().st_size, 'sha256': digest}}
+    plan = rendered.get('framing_plan') or {}
+    if plan.get('sections') and all(primary is not None for _, primary in plan['sections']) and not plan.get('requires_framing_review'):
+        match = re.search(r'/file/d/([A-Za-z0-9_-]+)', rendered.get('clip_url') or '')
+        if match:
+            media['smart'] = {'drive_file_id': match.group(1)}
+    with __import__('contextlib').closing(review.connect()) as db:
+        row = db.execute('SELECT state_json FROM telegram_requests WHERE request_id=?', (request_id,)).fetchone()
+        state = json.loads(row['state_json'])
+    review.register(request_id, asset_id, 'framing', [float(original['start']), float(original['end'])],
+        [start,end], media, {'source_video_id': state['parsed']['video_id'], 'source_duration': media_duration(source),
+        'verified_media': True, 'preview_bounds': [start,end], 'timing_provenance': 'existing_verified_render',
+        'explanation': 'Whole-frame sharp foreground over moving blurred background. Smart alternative is shown only when audiovisual tile evidence supports it.'})
 
 
 def openai_clip_prompt(transcript_segments: List[dict], prompt_override: Optional[str]) -> str:

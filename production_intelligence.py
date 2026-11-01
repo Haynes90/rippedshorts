@@ -296,7 +296,8 @@ def learning_context(source, lane, topics=()):
     examples, seen = [], set()
     for row in rows:
         item = json.loads(row['payload'])
-        if item['candidate_id'] in seen or item.get('brand_id') != source['brand_id'] or item.get('format') != lane:
+        evidence_key = (item['candidate_id'], item.get('review_kind') or 'selection')
+        if evidence_key in seen or item.get('brand_id') != source['brand_id'] or item.get('format') != lane:
             continue
         decision = item.get('decision')
         if (item.get('review') or {}).get('selection_complete_skip'):
@@ -305,9 +306,9 @@ def learning_context(source, lane, topics=()):
         sign = 1 if decision in {'approve','approved','queued','rendering','rendered','favorite','favorited'} else -1 if decision in {'reject','rejected'} else 0
         if draft.get('favorite'):
             sign=1
-        if not sign and not item.get('explicit_feedback') and not draft.get('selection_feedback'):
+        if not sign and not item.get('explicit_feedback') and not draft.get('selection_feedback') and decision != 'edited' and not item.get('framing_choice'):
             continue  # a hold/render/provider failure is not a negative editorial vote
-        seen.add(item['candidate_id'])
+        seen.add(evidence_key)
         weight = 1 + int(item.get('show_id') == source.get('show_id'))
         if item.get('source_video_id') == source.get('source_video_id'):
             weight += 1
@@ -318,6 +319,7 @@ def learning_context(source, lane, topics=()):
                          'weight': weight, 'sign': sign, 'category': item.get('category'),
                          'feedback': item.get('feedback') or draft.get('selection_feedback'), 'bounds': item.get('bounds'),
                          'boundary_changes':{'before':item.get('before'),'after':item.get('after')} if item.get('decision')=='edited' else None,
+                         'framing_choice': item.get('framing_choice'), 'review_kind': item.get('review_kind'),
                          'topic_similarity':similarity,
                          'copy_changes': {k: v for k,v in (item.get('copy_revision') or {}).items() if k in {'user_edited','social_caption','video_title','video_description'}},
                          'confidence': min(.85, .25+.1*weight)})

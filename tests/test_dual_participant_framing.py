@@ -22,8 +22,15 @@ class DualParticipantFramingTests(unittest.TestCase):
         self.assertIn("def _bounded_crop_x(", SOURCE)
         self.assertIn("crop vertically rather than stealing pixels from the other speaker", SOURCE)
 
-    def test_single_speaker_path_remains_fallback(self):
-        self.assertIn("return _build_crop_filter(video_path, start, duration), False", SOURCE)
+    def test_uncertain_speaker_preserves_entire_frame_in_blurred_fallback(self):
+        from unittest.mock import patch
+        import main
+        with patch.object(main,'_probe_video_dimensions',return_value=(640,360)), patch.object(main,'_load_face_cascade',return_value=None):
+            graph,complex_filter=main._build_vertical_filter(Path('isolated'),0,10)
+        self.assertTrue(complex_filter)
+        self.assertIn('gblur=',graph)
+        self.assertIn('force_original_aspect_ratio=decrease',graph)
+        self.assertIn('overlay=(W-w)/2:(H-h)/2',graph)
 
     def test_horizontal_renderer_is_not_changed_to_vertical_layout(self):
         horizontal = SOURCE[SOURCE.index("def create_topic_segment_file("):]

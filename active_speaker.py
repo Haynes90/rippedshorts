@@ -296,29 +296,13 @@ def build_active_speaker_filter(
             graph, proof = tile_result
             _PLAN.value = proof
             return graph
-        samples = _detect_tracks(video_path, start, duration, load_cascade)
-        energy = _audio_rms(video_path, start, duration)
-        sections = _stable_layout_sections(samples, energy, duration)
-        if not sections:
-            return None
-        boundaries = [item[0] for item in sections] + [duration]
-        graphs = []
-        outputs = []
-        for index, (_, layout, left, right) in enumerate(sections):
-            section_start, section_end = boundaries[index], boundaries[index + 1]
-            label = f"s{index}"
-            graphs.append(
-                f"[0:v]trim=start={section_start:.3f}:end={section_end:.3f},"
-                f"setpts=PTS-STARTPTS[{label}]"
-            )
-            graphs.append(_section_filter(label, layout, left, right, width, height))
-            outputs.append(f"[v{index}]")
-        graphs.append("".join(outputs) + f"concat=n={len(outputs)}:v=1:a=0[v]")
-        logger.info(
-            "Vertical active-speaker layouts=%s",
-            ",".join(item[1] for item in sections),
-        )
-        return ";".join(graphs)
+        from camera_layout import blurred_full_frame
+        _PLAN.value = {'layout': 'blurred_full_frame', 'confidence': 0.0,
+                       'requires_framing_review': True, 'basis': 'speaker_or_tile_evidence_insufficient'}
+        return blurred_full_frame()
     except Exception:
-        logger.exception("Active-speaker analysis failed; using deterministic fallback")
-        return None
+        logger.exception("Active-speaker analysis failed; preserving full source in blurred backdrop")
+        from camera_layout import blurred_full_frame
+        _PLAN.value = {'layout': 'blurred_full_frame', 'confidence': 0.0,
+                       'requires_framing_review': True, 'basis': 'analysis_failed'}
+        return blurred_full_frame()
