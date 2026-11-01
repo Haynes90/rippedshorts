@@ -108,7 +108,8 @@ def test_three_side_by_side_whole_tiles_are_supported():
     assert result['layout']=='side_by_side'
     assert [r['rect'] for r in result['regions']]==[[0,0,212,360],[212,0,216,360],[428,0,212,360]]
     graph=composition_graph(result['regions'], primary='0')
-    assert 'crop=208:356:2:2' in graph and 'crop=212:356:214:2' in graph
+    assert 'gblur=' in graph and '[fg0]scale=1080:1920:force_original_aspect_ratio=decrease' in graph
+    assert 'tile0_' not in graph  # three people retain the complete source, even with a proposed primary
 
 
 def test_multiple_graphic_lines_without_faces_do_not_invent_three_participants():

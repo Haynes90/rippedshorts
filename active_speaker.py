@@ -298,11 +298,13 @@ def build_active_speaker_filter(
             return graph
         from camera_layout import blurred_full_frame
         _PLAN.value = {'layout': 'blurred_full_frame', 'confidence': 0.0,
+                       'framing_method':'blurred_full_frame', 'framing_policy':'whole-tile-or-blurred-v2', 'speaker_confidence':'uncertain',
                        'requires_framing_review': True, 'basis': 'speaker_or_tile_evidence_insufficient'}
         return blurred_full_frame()
     except Exception:
         logger.exception("Active-speaker analysis failed; preserving full source in blurred backdrop")
         from camera_layout import blurred_full_frame
         _PLAN.value = {'layout': 'blurred_full_frame', 'confidence': 0.0,
+                       'framing_method':'blurred_full_frame', 'framing_policy':'whole-tile-or-blurred-v2', 'speaker_confidence':'uncertain',
                        'requires_framing_review': True, 'basis': 'analysis_failed'}
         return blurred_full_frame()

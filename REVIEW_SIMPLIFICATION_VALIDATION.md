@@ -30,3 +30,6 @@ Retained real TDOG source/diagnostic previews provide existing two/three-person 
 Live finished-card playback, fresh full-batch approval and actual scheduler delivery creation are NOT VERIFIED for this undeployed change.
 Review both stacked PRs before separately authorizing merge/paused deployment. Back up persistent records; disable auto-deploy; ensure one worker with no overlap; preserve volume, credentials, selections, approvals, holds, receipts and schedules. Keep publishing disabled and Agape disabled.
 After authorization, use a fresh normal full-batch workflow under the live selection Docs and topic-map revision. Do not impose clip quotas or choose clips for the owner. Require actual completed media, owner approval and durable scheduler receipts before claiming completion.
+
+## GitHub renderer harness correction
+The first dependent stored-render CI run exposed an AST-isolated test namespace missing json after framing evidence became unconditional. The production module already imports json. The harness now supplies that existing dependency; every audible-audio/render assertion is retained. Final CI result must be checked on the correction commit.
