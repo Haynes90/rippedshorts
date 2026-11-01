@@ -5,6 +5,8 @@ on:
       - 'clip_completion.py'
       - 'telegram_intake.py'
       - 'main.py'
+      - 'production_intelligence.py'
+      - 'tests/test_topic_map_reference_contract.py'
       - 'tests/test_stored_transcript_render.py'
       - '.github/workflows/stored-transcript-render.yml'
 permissions:
@@ -18,3 +20,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Test stored transcript rendering
         run: python tests/test_stored_transcript_render.py -v
+  topic-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install focused test dependencies
+        run: python -m pip install pytest fastapi google-api-python-client requests
+      - name: Test bounded topic references and durable diagnostics
+        env:
+          DATA_DIR: ${{ runner.temp }}/topic-contract-data
+          PYTHONPATH: .
+        run: python -m pytest tests/test_topic_map_reference_contract.py -q
