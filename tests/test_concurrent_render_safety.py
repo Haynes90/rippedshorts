@@ -18,11 +18,12 @@ def test_render_failure_includes_ffmpeg_diagnostics():
     assert "(completed.stderr or completed.stdout)[-3000:]" in source
 
 
-def test_selector_aims_for_twenty_and_collects_future_learning_metadata():
-    source = (ROOT / "main.py").read_text()
-    assert "Target 18–20 final clips" in source
-    assert '\"content_type\"' in source
-    assert '\"keywords\"' in source
+def test_selector_uses_quality_without_quota_and_collects_learning_metadata():
+    from main import openai_clip_prompt
+    prompt = openai_clip_prompt([], None)
+    assert "Do not force a clip count" in prompt
+    assert '"content_type"' in prompt
+    assert '"keywords"' in prompt
 
 
 def test_approvals_use_bounded_pool_and_are_idempotent():
@@ -67,12 +68,16 @@ def test_restart_recovers_only_approved_unfinished_sheet_clips():
     assert "Rendering only those shorts now" in source
 
 
-def test_already_rendered_youtube_id_skips_gpt_selection():
-    source = (ROOT / "telegram_intake.py").read_text()
-    assert "if rendered_clips:" in source
-    assert '"stage": "already_rendered"' in source
-    assert "GPT selection was not run again" in source
-    assert "existing_clip_links" in source
+def test_saved_source_analysis_does_not_repeat_model_selection():
+    from acceptance_fixtures import intelligence_db
+    import production_intelligence as pi
+    from unittest.mock import Mock
+    with intelligence_db():
+        analyze=Mock(return_value={'segments':[{'start':10,'end':30,'asset_id':'existing'}]})
+        first=pi.cached_analysis('source:immutable-transcript:9:16',analyze)
+        second=pi.cached_analysis('source:immutable-transcript:9:16',analyze)
+        assert first==second and second['segments'][0]['asset_id']=='existing'
+        assert analyze.call_count==1
 
 
 def test_reused_video_render_creates_output_directory():
@@ -80,29 +85,36 @@ def test_reused_video_render_creates_output_directory():
     assert 'workdir.mkdir(parents=True, exist_ok=True)' in source
 
 
-def test_selector_targets_twenty_and_allows_distinct_overlap():
+def test_selector_uses_quality_and_allows_distinct_overlap():
     prompt_source = (ROOT / "main.py").read_text()
     intake_source = (ROOT / "telegram_intake.py").read_text()
     selector_source = (ROOT / "source_ingestion.py").read_text()
-    assert "Target 18–20 final clips" in prompt_source
-    assert "return 20" in prompt_source
+    assert "Do not force a clip count" in prompt_source
+    assert "return 20" not in prompt_source
     assert "Clips MAY overlap in time" in prompt_source
     assert "allow_overlap=True" in intake_source
     assert "normalized_text" in selector_source
 
 
-def test_under_ten_reviewed_shorts_triggers_additional_search():
-    source = (ROOT / "telegram_intake.py").read_text()
-    assert "def _reviewed_short_history_from_sheet" in source
-    assert "if len(prior_shorts) >= 10:" in source
-    assert "Searching again for up to {needed} additional distinct shorts" in source
-    assert "PREVIOUSLY REVIEWED SHORTS" in source
+def test_quality_selector_does_not_pad_to_a_review_quota():
+    # Approved quality-over-quota policy replaces forced replenishment to ten.
+    from main import openai_clip_prompt
+    from source_ingestion import select_non_overlapping
+    prompt=openai_clip_prompt([],None)
+    assert 'Do not force a clip count' in prompt and 'full transcript' in prompt.lower()
+    clips=[{'start':0,'end':20,'score':95,'transcript':'One strong complete thought.'}]
+    assert select_non_overlapping(clips,limit=20)==clips
+    assert select_non_overlapping([],limit=20)==[]
 
 
 def test_telegram_uses_short_not_candidate_label():
-    source = (ROOT / "telegram_intake.py").read_text()
-    assert 'f"Short {short_number}' in source
-    assert "Approve only the shorts you want created" in source
+    import telegram_intake as tg
+    state={'result':{'segments':[{'start':10,'end':30,'duration':20,'candidate_number':9,'transcript':'Approved full thought.'}]},'candidate_reviews':{}}
+    text,markup=tg._short_review_page_payload('existing',state,1)
+    assert 'SHORT 9' in text and 'Approved full thought.' in text
+    buttons=[b for row in markup['inline_keyboard'] for b in row]
+    assert any(b.get('callback_data')=='rs:approve:existing:0' for b in buttons)
+    assert state['candidate_reviews']=={}
 
 
 def test_opencv_speaker_tracking_and_center_fallback():
@@ -126,13 +138,13 @@ def test_repeat_video_prompts_for_rerip_choice():
 
 
 def test_short_selection_uses_sheet_approval_learning():
-    source = (ROOT / "telegram_intake.py").read_text()
-    assert "def _short_learning_prompt" in source
-    assert "LEARNING FROM DEREK'S SHORT REVIEWS" in source
-    assert "APPROVED SHORTS" in source
-    assert "REJECTED SHORTS" in source
-    assert "Reject scripture-only readings" in source
-    assert "generic blurbs without a payoff" in source
+    from acceptance_fixtures import learning_rows
+    with learning_rows() as (tg,service):
+        prompt=tg._short_learning_prompt('source')
+    assert 'Approved complete useful explanation.' in prompt
+    assert 'Rejected weak setup.' in prompt
+    assert 'complete standalone thought' in prompt and 'payoff' in prompt
+    assert service.spreadsheets.return_value.values.return_value.get.call_args.kwargs['range'].endswith('!A:U')
 
 
 def test_rerip_is_fresh_but_may_reselect_strong_approvals():
@@ -167,20 +179,27 @@ def test_tracker_holds_on_loss_and_requires_consistent_speaker_switch():
 
 
 def test_plain_link_starts_shorts_and_horizontal_topic_lanes():
-    source = (ROOT / "telegram_intake.py").read_text()
-    assert 'mode = "both"' in source
-    assert 'if row["mode"] in {"topics", "both"}:' in source
-    assert "state = _process_topics(" in source
+    import telegram_intake as tg
+    import production_intelligence as pi
+    from threading import Event
+    assert tg.parse_request('https://youtu.be/abcdefghijk')['mode']=='both'
+    a,b=Event(),Event()
+    def short():
+        a.set();assert b.wait(2);return {'shorts':[1,2]}
+    def highlight():
+        b.set();assert a.wait(2);return {'highlights':[3]}
+    futures=pi.parallel_analyses(short,highlight)
+    assert futures['9:16'].result(timeout=3)=={'shorts':[1,2]}
+    assert futures['16:9'].result(timeout=3)=={'highlights':[3]}
 
 
-def test_horizontal_segments_cover_full_timeline_without_overlap():
-    source = (ROOT / "telegram_intake.py").read_text()
-    assert "def _build_contiguous_topic_segments" in source
-    assert 'TOPIC_SEGMENT_REFERENCE_SECONDS", "480"' in source
-    assert 'TOPIC_SEGMENT_MIN_SECONDS", "181"' in source
-    assert 'boundaries = [timeline_start]' in source
-    assert "boundaries.append(timeline_end)" in source
-    assert '"coverage": "full_eligible_timeline"' in source
+def test_semantic_highlights_leave_weak_gaps_and_keep_minimum():
+    # Semantic selections may leave weak intervals uncovered; no arbitrary full-source slices.
+    import telegram_intake as tg
+    transcript=[{'start':0,'end':240,'text':'Complete first explanation.'},{'start':240,'end':400,'text':'Weak interlude.'},{'start':400,'end':650,'text':'Complete second discussion.'}]
+    selected=tg._build_contiguous_topic_segments(transcript,[{'start':0,'end':240,'score':90},{'start':400,'end':650,'score':95},{'start':240,'end':400,'score':99}])
+    assert [(x['start'],x['end']) for x in selected]==[(0,240),(400,650)]
+    assert all(x['duration']>=180 for x in selected)
 
 
 def test_horizontal_segments_have_separate_review_and_renderer():
@@ -195,16 +214,18 @@ def test_horizontal_segments_have_separate_review_and_renderer():
 
 
 def test_shorts_expand_to_complete_sentence_boundaries():
-    source = (ROOT / "telegram_intake.py").read_text()
-    assert "def _sentence_complete_candidate" in source
-    assert "Finish the current sentence" in source
-    assert "complete sentence/thought boundary" in source
-    assert "end - start <= 90" in source
+    import telegram_intake as tg
+    segments=[{'start':0,'end':15,'text':'A setup that continues'},{'start':15,'end':30,'text':'and ends with the full payoff.'}]
+    result=tg.validate_complete_candidates({'segments':[{'start':15,'end':30,'transcript':'and ends with the full payoff.'}]},segments)
+    assert len(result['segments'])==1
+    assert result['segments'][0]['start']==0 and result['segments'][0]['end']==30
+    assert result['segments'][0]['transcript']=='A setup that continues and ends with the full payoff.'
 
 
 def test_topic_coherence_precedes_eight_minute_reference():
-    source = (ROOT / "telegram_intake.py").read_text()
-    assert "Semantic boundaries are authoritative" in source
-    assert "ignore the eight-minute reference entirely" in source
-    assert "This is the only place the eight-minute reference is used" in source
-    assert "TOPIC_SEGMENT_FALLBACK_MAX_SECONDS" in source
+    import telegram_intake as tg
+    segments=[{'start':0,'end':900,'text':'A complete long explanation.'}]
+    result=tg._build_contiguous_topic_segments(segments,[{'start':0,'end':900,'score':95,'title':'Full explanation'}])
+    assert len(result)==1 and result[0]['duration']==900
+    assert result[0]['transcript']==segments[0]['text']
+    assert tg._build_contiguous_topic_segments([{'start':0,'end':100,'text':'Too short.'}],[{'start':0,'end':100}],minimum_seconds=90)==[]

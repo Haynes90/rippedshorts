@@ -75,7 +75,7 @@ def test_legacy_handoff_applies_sheet_copy_after_generation():
     text = source.read_text(encoding="utf-8")
     import textwrap
     start = text.index("    reviewed_copy = {", text.index("def _handoff_shorts_to_schedule_master"))
-    end = text.index("    payload = {", start)
+    end = text.index("    from workflow_test_status import", start)
     namespace = dict(
         state={}, assets=[{"asset_id": "a"}], request_id="r",
         _state_vid_title=lambda state: "Title",

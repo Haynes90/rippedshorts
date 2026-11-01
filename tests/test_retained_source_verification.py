@@ -177,12 +177,15 @@ def test_forged_retained_receipt_does_not_replace_live_authenticated_binding(ret
     assert retained.get.call_count==2
 
 
-def test_existing_process_reuses_authenticated_assets_before_candidate_generation(retained,monkeypatch):
+@pytest.mark.parametrize('measured_words',[False,True])
+def test_existing_process_reuses_authenticated_assets_before_candidate_generation(retained,monkeypatch,measured_words):
     import ast
     import logging
     import os
     import threading
     root=retained.path.parent
+    if measured_words:
+        retained.document['words']=[{'word':'Measured.', 'start':0,'end':1}]
     work=root/'telegram-request';work.mkdir()
     retained.path=retained.path.rename(work/retained.path.name)
     state={'parsed':{'source_kind':'youtube','video_id':VIDEO,'source_value':URL},
@@ -215,4 +218,5 @@ def test_existing_process_reuses_authenticated_assets_before_candidate_generatio
     assert final['transcript_evidence']['audio_master_job_id']=='audio-job'
     assert final['transcript_evidence']['timed_segments']==2
     assert final['source_validation']['verification_method']=='authenticated_audio_master_retained'
+    assert final['transcript_evidence']['word_count']==int(measured_words)
     retained.forbidden.assert_not_called()

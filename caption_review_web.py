@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -17,6 +18,7 @@ router = APIRouter()
 
 _REVIEW_TTL_DAYS = max(1, int(os.getenv("COPY_REVIEW_TTL_DAYS", "14")))
 _DRIVE_ID_RE = re.compile(r"/file/d/([A-Za-z0-9_-]+)")
+_PREVIEW_LOCK = threading.Lock()
 
 
 def _now() -> datetime:
@@ -88,8 +90,11 @@ def ensure_review_session(request_id: str) -> dict[str, str]:
     }
 
 
-def review_url_for_request(request_id: str) -> str:
-    return ensure_review_session(request_id).get("url", "")
+def review_url_for_request(request_id: str, stage: str = 'final') -> str:
+    if stage not in {'shorts', 'highlights', 'editorial', 'framing', 'final'}:
+        raise ValueError('Unknown review stage')
+    url = ensure_review_session(request_id).get("url", "")
+    return url + '?stage=' + stage + '#' + stage if url else ''
 
 
 def _session(token: str):
@@ -156,7 +161,7 @@ def _payload_for_session(token: str) -> dict[str, Any]:
     row = _request_row(request_id)
     state = json.loads(row["state_json"])
     drafts = list(state.get("copy_drafts") or [])
-    if not drafts:
+    if not drafts and not state.get("result") and not state.get("topic_result"):
         raise HTTPException(status_code=409, detail="Copy review is not ready yet")
 
     parsed = state.get("parsed") or {}
@@ -180,11 +185,24 @@ def _payload_for_session(token: str) -> dict[str, Any]:
                 "copy_status": str(draft.get("copy_status") or "pending"),
                 "user_edited": bool(draft.get("user_edited")),
                 "regeneration_count": int(draft.get("regeneration_count") or 0),
+                "favorite": bool(draft.get('favorite')),
+                "editorial_hold": bool(draft.get('editorial_hold')),
+                "selection_feedback": str(draft.get('selection_feedback') or ''),
                 "drive_url": drive_url,
                 "preview_url": _drive_preview(drive_url),
             }
         )
 
+    from batch_progress import summarize
+    batch = summarize(request_id,state)
+    candidate_evidence=[]
+    for lane,key,review_key in [('9:16','result','candidate_reviews'),('16:9','topic_result','topic_reviews')]:
+        for number,clip in enumerate((state.get(key) or {}).get('segments') or [],1):
+            review=(state.get(review_key) or {}).get(str(number-1)) or {}
+            candidate_evidence.append({'format':lane,'number':number,'candidate_id':clip.get('candidate_id'),
+                'review_status':review.get('status','pending'),'error':review.get('render_error'),
+                'diagnostics':review.get('render_diagnostics'), 'learning_influence':clip.get('learning_influence'),
+                'framing_plan':clip.get('framing_plan')})
     from creator_approval import suggestions, approved_batch
     creator_brand = str(state.get("show_id") or "").upper()
     creator_required = creator_brand in {"TCB", "TDOG"}
@@ -197,6 +215,10 @@ def _payload_for_session(token: str) -> dict[str, Any]:
     regenerated = sum(item["regeneration_count"] > 0 for item in items)
     return {
         "request_id": request_id,
+        "acceptance_demo": bool(state.get('acceptance_demo')),
+        "batch_summary": batch,
+        "candidate_evidence": candidate_evidence,
+        "comparisons": __import__('clip_review_state').reviews(request_id),
         "creator_brand": creator_brand,
         "creator_required": creator_required,
         "creator_suggestions": creator_suggestions,
@@ -265,6 +287,10 @@ def _card_html(item: dict[str, Any], token: str) -> str:
         {preview}
         <label><input type="checkbox" id="playback-{index}" style="width:auto" /> I played this clip and confirmed audible audio</label>
         <div class="fields">{fields}</div>
+        <label><input type="checkbox" id="favorite-{index}" style="width:auto" {'checked' if item.get('favorite') else ''} /> Favorite — suggest more related quality material</label>
+        <label><input type="checkbox" id="hold-{index}" style="width:auto" {'checked' if item.get('editorial_hold') else ''} /> Hold this clip from scheduling</label>
+        <label>Selection feedback (optional)</label>
+        <textarea id="feedback-{index}" rows="2">{html.escape(item.get('selection_feedback',''))}</textarea>
         <div class="actions">
           <button class="secondary" onclick="keepAsset({index})">Keep</button>
           <button class="secondary" onclick="regenAsset({index})">Regenerate</button>
@@ -280,6 +306,11 @@ def _page(payload: dict[str, Any], token: str) -> str:
     creator_section = section()
     creator_script = SCRIPT
     cards = "".join(_card_html(item, token) for item in payload["items"])
+    failure_cards=''.join('<p>'+html.escape(str(c['format'])+' clip '+str(c['number'])+': '+str(c['error']))+'</p>'
+        for c in payload.get('candidate_evidence',[]) if c.get('error'))
+    learning_cards=''.join('<details><summary>'+html.escape(str(c['format'])+' clip '+str(c['number'])+' — recommendation/framing evidence')+'</summary><pre>'+html.escape(json.dumps(c,indent=2))+'</pre></details>'
+        for c in payload.get('candidate_evidence',[]) if c.get('learning_influence') or c.get('framing_plan'))
+    cards='<aside aria-label="Per-clip failures">'+failure_cards+'</aside>'+cards+learning_cards
     expires = html.escape(payload["expires_at"][:10])
     thumb = (
         f'<img class="source-thumb" src="{html.escape(payload["thumbnail_url"])}" '
@@ -333,6 +364,7 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
 </head>
 <body>
 <main>
+  {'<p role="status">ISOLATED ACCEPTANCE DEMO — decisions here do not change the production TDOG request.</p>' if payload.get('acceptance_demo') else ''}
   <section class="source">
     {thumb}
     <div class="source-copy">
@@ -356,7 +388,7 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
       'Test run: '+data.test_run_id+'\n'+Object.entries(data.checkpoints).map(([name,v])=>name+': '+v.status).join('\n')+
       '\nOverall: '+data.overall_status+'\nPublishing: '+(data.publishing_globally_paused===true?'PAUSED':'NOT VERIFIED PAUSED')+
       '\nInstagram Collab: '+(data.instagram_collaborators_in_approved_payload?'VALIDATED APPROVAL, NOT PROOF OF SUBMISSION':'NOT VERIFIED')+
-      '\nBatch: '+(data.batch_summary?.status||'NOT STARTED')+'\nCompleted clips: '+(data.batch_summary?.completed_clips||0)+'/'+(data.batch_summary?.selected_clips||0)+'\nNext: '+data.next_required_action : 'Status unavailable. Refresh after the service recovers.';
+      '\nBatch: '+(data.batch_summary?.status||'NOT STARTED')+'\nCompleted clips: '+(data.batch_summary?.completed_clips||0)+'/'+(data.batch_summary?.selected_clips||0)+'\nScheduled deliveries:\n'+(data.batch_summary?.clips||[]).flatMap(c=>(c.deliveries||[]).map(d=>c.format+' • '+d.destination_id+' • '+d.scheduled_at)).join('\n')+'\nNext: '+data.next_required_action : 'Status unavailable. Refresh after the service recovers.';
   }};
   </script>
   <div class="progress">
@@ -364,7 +396,10 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
     <div class="progress-text" id="progressText"></div>
   </div>
 
-  <section id="assets">{cards}</section>
+  {__import__('clip_review_ui').sections(payload.get('comparisons', []), token)}
+  <section id="shorts"><h2>9:16 candidate review</h2><p>Candidate selection remains in Telegram; saved selections are preserved.</p></section>
+  <section id="highlights"><h2>16:9 candidate review</h2><p>Highlight selection follows Shorts confirmation in Telegram.</p></section>
+  <section id="final"><h2>Final rendered video and copy approval</h2><section id="assets">{cards}</section></section>
 </main>
 
 <div class="finish">
@@ -394,7 +429,9 @@ updateProgress();
 function bodyFor(index, action='save') {{
   const card = document.getElementById(`asset-${{index}}`);
   const type = card.dataset.type;
-  const body = {{action}};
+  const body = {{action,favorite:document.getElementById('favorite-'+index)?.checked===true,
+    editorial_hold:document.getElementById('hold-'+index)?.checked===true,
+    selection_feedback:document.getElementById('feedback-'+index)?.value||''}};
   if (type === '9:16_SHORT') {{
     body.social_caption = document.getElementById(`caption-${{index}}`).value;
     body.hashtags = document.getElementById(`hashtags-${{index}}`).value;
@@ -466,7 +503,7 @@ async function finishReview() {{
   try {{
     // Finish must use exactly what is currently written in the review fields,
     // even if the user did not tap Save on each individual card first.
-    const cards = Array.from(document.querySelectorAll('.asset'));
+    const cards = Array.from(document.querySelectorAll('.asset')).filter(card => card.hasAttribute('data-index'));
     for (const card of cards) {{
       const index = Number(card.dataset.index);
       await saveAsset(index, 'save');
@@ -514,6 +551,66 @@ def review_data(token: str):
     return _payload_for_session(token)
 
 
+@router.post('/api/ripped-shorts/review/{token}/comparison/{revision}')
+async def save_comparison(token: str, revision: str, request: Request):
+    session = _session(token)
+    body = await request.json()
+    try:
+        return __import__('clip_review_state').decide(str(session['request_id']), revision,
+            body.get('choice'), body.get('feedback') or '', body.get('version', 0))
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.get('/api/ripped-shorts/review/{token}/comparison/{revision}/media/{variant}')
+def comparison_media(token: str, revision: str, variant: str):
+    """Stream only a registered artifact belonging to this bearer review session."""
+    from pathlib import Path
+    from fastapi.responses import FileResponse
+    from audio_master_handoff import DATA_DIR
+    session = _session(token)
+    review = next((r for r in __import__('clip_review_state').reviews(str(session['request_id'])) if r['revision_id'] == revision), None)
+    artifact = (review or {}).get('media', {}).get(variant)
+    if not artifact:
+        raise HTTPException(status_code=404, detail='Preview not found')
+    root = Path(DATA_DIR).resolve()
+    if artifact.get('local_path'):
+        path = Path(artifact['local_path']).resolve()
+        if not path.is_relative_to(root):
+            raise HTTPException(status_code=403, detail='Preview outside retained storage')
+    else:
+        # Cache exact private artifact IDs, never arbitrary URLs. A failed download
+        # leaves no usable partial file; successful verified files are reused.
+        from audio_master_handoff import drive_metadata, download_drive
+        file_id = artifact['drive_file_id']
+        path = root / 'review-previews' / (file_id + '.mp4')
+        with _PREVIEW_LOCK:
+            if not path.is_file():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                partial = path.with_suffix('.partial')
+                try:
+                    metadata = drive_metadata(file_id)
+                    if metadata.get('mimeType') != 'video/mp4' or metadata.get('trashed') or int(metadata.get('size') or 0) <= 0:
+                        raise ValueError('Not an available MP4 review artifact')
+                    download_drive(file_id, partial, metadata)
+                    if partial.stat().st_size != int(metadata['size']):
+                        raise ValueError('Incomplete private preview')
+                    partial.replace(path)
+                except Exception:
+                    partial.unlink(missing_ok=True)
+                    raise HTTPException(status_code=503, detail='Private preview unavailable; saved decisions are preserved')
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise HTTPException(status_code=404, detail='Retained preview missing')
+    if artifact.get('size') and path.stat().st_size != int(artifact['size']):
+        raise HTTPException(status_code=409, detail='Preview integrity check failed')
+    if artifact.get('sha256'):
+        import hashlib
+        with path.open('rb') as stream:
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != artifact['sha256']:
+                raise HTTPException(status_code=409, detail='Preview fingerprint changed')
+    return FileResponse(path, media_type='video/mp4', headers={'Cache-Control': 'private, no-store', 'Referrer-Policy': 'no-referrer'})
+
+
 @router.post("/api/ripped-shorts/review/{token}/asset/{index}")
 async def save_review_asset(token: str, index: int, request: Request):
     session = _session(token)
@@ -529,6 +626,8 @@ async def save_review_asset(token: str, index: int, request: Request):
     draft = dict(drafts[index])
     from batch_progress import copy_frozen
     if copy_frozen(state,str(draft.get('asset_id') or '')):
+        if any(k in body and body[k]!=draft.get(k, False if k!='selection_feedback' else '') for k in ('favorite','editorial_hold','selection_feedback')):
+            raise HTTPException(status_code=409,detail='Submitted approvals and holds are frozen')
         if all(str(body.get(k) or '')==str(draft.get(k) or '') for k in ('social_caption','video_title','video_description','hashtags') if k in body):
             if body.get('playback_verified') is True:
                 media_url=_media_for_state(state,request_id).get(str(draft.get('asset_id') or ''))
@@ -576,6 +675,13 @@ async def save_review_asset(token: str, index: int, request: Request):
                     if key in body
                 }
             )
+    for key in ('favorite','editorial_hold'):
+        if key in body:
+            if type(body[key]) is not bool:
+                raise HTTPException(status_code=400,detail='Feedback flags must be boolean')
+            draft[key]=body[key]
+    if 'selection_feedback' in body:
+        draft['selection_feedback']=str(body['selection_feedback'] or '')[:2000]
     draft["web_review_saved_at"] = _iso(_now())
     drafts[index] = draft
     state["copy_drafts"] = drafts
@@ -606,6 +712,11 @@ async def save_review_asset(token: str, index: int, request: Request):
         )
 
     import telegram_intake as tg
+    from intelligence_workflow import observe
+    try:
+        observe(request_id,state)
+    except Exception:
+        __import__('logging').getLogger(__name__).exception('Review evidence projection pending')
     tg._checkpoint_copy_edit(request_id, state, draft, str(row["user_id"] or "web_review"))
     tg._refresh_copy_review(str(row["chat_id"]), request_id, index=index)
 
@@ -701,6 +812,12 @@ def finish_review(token: str):
     request_id = str(session["request_id"])
     row = _request_row(request_id)
     state = json.loads(row["state_json"])
+    if state.get('acceptance_demo'):
+        raise HTTPException(status_code=409, detail='Isolated demo cannot schedule or publish')
+    playable = set(_media_for_state(state, request_id))
+    blockers = [b for b in __import__('clip_review_state').delivery_blockers(request_id, state) if b.split(': ', 1)[0] in playable]
+    if blockers:
+        raise HTTPException(status_code=409, detail='Editorial/framing review or verified rendering required: ' + '; '.join(blockers))
     drafts = list(state.get("copy_drafts") or [])
     if not drafts:
         raise HTTPException(status_code=409, detail="No copy drafts are available")
@@ -782,6 +899,9 @@ def _workflow_result(request_id, state):
             scheduler={**((state.get('schedule_master') or {}).get('shorts_response') or {}),
                 'publishing_globally_paused':None,'delivery_validation':{'status':'BLOCKED','reason':'SCHEDULER_STATUS_UNAVAILABLE'}}
     result=project(request_id,state,state.get('creator_approval'),scheduler)
+    if state.get('source_intelligence'):
+        from production_intelligence import analysis_status
+        result['source_analyses']=analysis_status(state['source_intelligence']['map_id'])
     return result
 
 

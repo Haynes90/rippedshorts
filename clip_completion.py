@@ -21,6 +21,9 @@ _TRANSCRIPTION_GATE = threading.Semaphore(1)
 
 class CompletionReviewRequired(RuntimeError):
     """The selected material cannot safely be exported automatically."""
+    def __init__(self, message, diagnostics=None):
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
 
 
 class TimingReviewRequired(CompletionReviewRequired):
@@ -83,7 +86,7 @@ def transcribe_window(video, start, end):
                         return response.json()
                     except ValueError:
                         raise TimingReviewRequired('Provider returned invalid transcription JSON') from None
-                payload = cached_response(audio, 'whisper-1', fetch, Path(video).parent / '.speech-evidence')
+                payload = cached_response(audio, 'whisper-1', fetch, Path(os.getenv('DATA_DIR', 'data')) / '.speech-evidence')
                 try:
                     timing = normalize_response(payload, duration=end-start, offset=start)
                 except TranscriptTimingError as exc:
@@ -300,14 +303,20 @@ def render_complete_clip(video, segment, output, renderer, aspect):
             sample_start = max(0, end-start-18) if tail else 0
             sample_end = end-start if tail else min(18, end-start)
             heard = transcribe_window(output, sample_start, sample_end)
-            if any(w.get('timing_basis') == 'provider_segment_timing' for w in heard):
+            segment_timed = any(w.get('timing_basis') == 'provider_segment_timing' for w in heard)
+            if segment_timed:
                 segment_edge_guard(output, sample_start, sample_end, tail)
             expected_tokens = _tokens(expected[-6:] if tail else expected[:6])
             heard_tokens = _tokens(heard)
             edge = heard_tokens[-len(expected_tokens):] if tail else heard_tokens[:len(expected_tokens)]
             if not expected_tokens or edge != expected_tokens:
-                raise CompletionReviewRequired("Actual exported speech does not match approved boundary words")
-            if not heard or (tail and sample_end-heard[-1]["end"] < .08):
+                raise CompletionReviewRequired("Actual exported speech does not match approved boundary words", diagnostics={
+                    "stage":"export_boundary_alignment", "edge":"end" if tail else "start",
+                    "expected_tokens":expected_tokens, "heard_tokens":edge,
+                    "sample_start":sample_start,"sample_end":sample_end,
+                    "timing_basis":"provider_segment_timing" if segment_timed else "provider_word_timing",
+                    "action":"Review the source/export boundary; do not retry unchanged bounds blindly"})
+            if not heard or (tail and not segment_timed and sample_end-heard[-1]["end"] < .08):
                 raise CompletionReviewRequired("Export ends too close to speech; adjust the approved boundary")
         actual_duration = media_duration(output)
         if abs(actual_duration - (end - start)) > .25:
@@ -325,8 +334,11 @@ def render_complete_clip(video, segment, output, renderer, aspect):
     except Exception:
         Path(output).unlink(missing_ok=True)
         raise
+    plan_path = Path(output).with_suffix('.framing.json')
+    framing = json.loads(plan_path.read_text(encoding='utf-8')) if plan_path.exists() else None
     return {**segment, "start": start, "end": end, "duration": end - start,
-            "completion_check": {"status": "verified", "version": 2,
+            "framing_plan": framing,
+            "completion_check": {"status": "verified", "version": 3,
                 "basis": "approved_transcript_and_measured_export_speech",
                 "transcript_sentence_end": True, "media_duration": True,
                 "video_stream": True, "audio_stream": True, "format_valid": True, "word_alignment": False,

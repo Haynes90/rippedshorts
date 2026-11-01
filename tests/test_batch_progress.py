@@ -59,6 +59,14 @@ def test_no_selections_has_no_success_percentage():
     assert summarize('job',{})['completion_percentage'] is None
 
 
+def test_owner_hold_keeps_selected_denominator_and_blocks_success():
+    state=batch(2,2)
+    state['copy_drafts'][0]['editorial_hold']=True
+    result=summarize('job',state)
+    assert result['selected_clips']==2 and result['completed_clips']==1
+    assert result['clips'][0]['cause']=='HELD_BY_OWNER'
+
+
 @pytest.mark.parametrize('lane,error,expected',[('short','clip-specific encoder failure',1),('highlight','clip-specific encoder failure',1),('highlight','TRANSCRIPTION_AUTHENTICATION_BLOCKED',0)])
 def test_actual_render_completion_gate_isolates_clip_failure_but_holds_shared_failure(tmp_path,lane,error,expected):
     import ast,json,os,sqlite3,threading

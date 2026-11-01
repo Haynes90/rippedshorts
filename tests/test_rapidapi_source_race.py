@@ -26,8 +26,17 @@ def test_race_dispatches_rapidapi_and_ytdlp():
     assert "_run_source_profile" in SOURCE
 
 
-def test_source_winner_is_logged_to_console_and_jsonl():
-    assert "RIPPED_SOURCE_WINNER" in SOURCE
-    assert "source_acquisition.jsonl" in SOURCE
-    assert '"provider": provider' in SOURCE
-    assert '"profile": profile.get("name")' in SOURCE
+def test_source_winner_is_logged_and_durably_recorded():
+    # Existing durable workflow ledger replaces the obsolete per-workdir JSONL filename.
+    import source_ingestion as si,workflow_reliability
+    from unittest.mock import patch
+    from tempfile import TemporaryDirectory
+    from pathlib import Path
+    with TemporaryDirectory() as folder:
+        media=Path(folder)/'retained.mp4';media.write_bytes(b'retained-test-media')
+        with patch.object(workflow_reliability,'record_source_winner') as record,patch('builtins.print') as output:
+            si._log_source_winner(video_id='source',profile={'provider':'yt-dlp','name':'cached'},path=media,workdir=Path(folder))
+        assert record.call_args.kwargs['video_id']=='source'
+        assert record.call_args.kwargs['source_bytes']==len(b'retained-test-media')
+        assert record.call_args.kwargs['provider']=='yt-dlp' and record.call_args.kwargs['profile']=='cached'
+        assert 'RIPPED_SOURCE_WINNER' in output.call_args_list[0].args[0]

@@ -78,6 +78,7 @@ RIPPED_SHORTS_RENDER_WORKERS = max(
 RENDER_EXECUTOR = ThreadPoolExecutor(max_workers=RIPPED_SHORTS_RENDER_WORKERS)
 STATUS_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 _STATUS_CARD_LAST: dict[str, float] = {}
+_INTELLIGENCE_SYNC_PENDING = threading.Event()
 RIPPED_LOG_SHEET_ID = (
     os.getenv("RIPPED_SHORTS_LOG_SHEET_ID")
     or os.getenv("PODCAST_SHEET_ID")
@@ -586,6 +587,12 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
         else:
             send(chat_id, message)
 
+    if checkpoint_state and checkpoint_state.get("copy_review_requested_at") and checkpoint_state.get("copy_drafts") and checkpoint_state.get("rendered_count"):
+        try:
+            _refresh_copy_review(chat_id, request_id)
+        except Exception:
+            logger.exception("Playable review link notification remains retryable request_id=%s",request_id)
+
     # Clip-specific failures remain retryable; only verified successes are handed off.
     if should_handoff:
         RENDER_EXECUTOR.submit(
@@ -840,6 +847,7 @@ def _send_copy_review(
 ) -> None:
     """Present copy review as one evolving Telegram message."""
     _refresh_copy_review(chat_id, request_id, index=0)
+    __import__('review_navigation').notify_safely(request_id, 'final')
 
 
 def _regenerate_copy_draft(request_id: str, index: int, chat_id: str) -> None:
@@ -912,6 +920,11 @@ def _checkpoint_copy_edit(
     user_id: str,
 ) -> None:
     """Upsert one copy edit immediately so Telegram review survives restarts."""
+    try:
+        from intelligence_workflow import observe
+        observe(request_id,state)
+    except Exception:
+        logger.exception('Local copy learning evidence pending request_id=%s',request_id)
     import main
 
     _, _, sheets = main.get_google_services()
@@ -1594,10 +1607,11 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
                     "summary": str(segment.get("summary") or ""),
                 }
             )
-        assets=[a for a in assets if a['asset_id'] not in handed_off]
+        blocked = {item.split(': ', 1)[0] for item in __import__('clip_review_state').delivery_blockers(request_id, state)}
+        assets=[a for a in assets if a['asset_id'] not in handed_off and a['asset_id'] not in blocked]
         drafts={d.get('asset_id'):d for d in state.get('copy_drafts') or []}
         if drafts:
-            assets=[a for a in assets if drafts.get(a['asset_id'],{}).get('copy_status') in {'approved','edited'}]
+            assets=[a for a in assets if drafts.get(a['asset_id'],{}).get('copy_status') in {'approved','edited'} and not drafts.get(a['asset_id'],{}).get('editorial_hold')]
         if not assets:
             send(chat_id, "No new rendered and copy-approved videos are waiting for Schedule Master.")
             return False
@@ -1726,6 +1740,11 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(latest_state), now(), request_id),
             )
+        try:
+            from intelligence_workflow import observe
+            observe(request_id,latest_state)
+        except Exception:
+            logger.exception('Scheduling acknowledged; relational learning projection pending')
         logger.info(
             "Schedule Master accepted Shorts request_id=%s assets=%s track_id=%s",
             request_id,
@@ -2048,6 +2067,11 @@ def _save(request_id: str, status: str, state: dict[str, Any]) -> None:
             "SELECT chat_id, user_id FROM telegram_requests WHERE request_id=?",
             (request_id,),
         ).fetchone()
+    try:
+        from intelligence_workflow import observe
+        observe(request_id, state)
+    except Exception:
+        logger.exception("Could not persist source review evidence request_id=%s", request_id)
     chat_id = str(row["chat_id"]) if row else ""
     user_id = str(row["user_id"]) if row else ""
     upsert_job(
@@ -2058,6 +2082,8 @@ def _save(request_id: str, status: str, state: dict[str, Any]) -> None:
         chat_id=chat_id,
         user_id=user_id,
     )
+    if str(state.get("show_id") or "").upper() in {"TCB","TDOG"}:
+        _queue_source_intelligence_sync()
     STATUS_EXECUTOR.submit(
         _update_status_card,
         request_id,
@@ -2065,6 +2091,24 @@ def _save(request_id: str, status: str, state: dict[str, Any]) -> None:
         dict(state),
         chat_id,
     )
+
+
+def _queue_source_intelligence_sync():
+    with _LOCK:
+        if _INTELLIGENCE_SYNC_PENDING.is_set():
+            return
+        _INTELLIGENCE_SYNC_PENDING.set()
+    STATUS_EXECUTOR.submit(_sync_source_intelligence)
+
+
+def _sync_source_intelligence():
+    try:
+        from intelligence_workflow import sync
+        sync()
+    except Exception:
+        logger.exception("Source intelligence Sheets projection pending; SQLite evidence preserved")
+    finally:
+        _INTELLIGENCE_SYNC_PENDING.clear()
 
 
 def _reusable_youtube_job(video_id: str) -> dict | None:
@@ -2194,7 +2238,11 @@ def validate_complete_candidates(
             candidate.update(
                 {"start": start, "end": end, "duration": round(end - start, 3)}
             )
-            valid.append(candidate)
+            if any(abs(item["start"]-start)<.001 and abs(item["end"]-end)<.001 for item in valid):
+                rejected.append({"start": start, "end": end,
+                                 "reason": "Duplicate interval after sentence-boundary expansion"})
+            else:
+                valid.append(candidate)
         else:
             rejected.append(
                 {
@@ -2642,6 +2690,11 @@ def _short_learning_prompt(video_id: str) -> str:
 
 def _safe_log_candidate(*args, **kwargs) -> None:
     try:
+        from intelligence_workflow import observe
+        observe(args[1], args[0])
+    except Exception:
+        logger.exception("Could not persist local candidate evidence")
+    try:
         _log_candidate_decision(*args, **kwargs)
     except Exception as exc:
         logger.exception("Ripped Shorts decision log failed: %s", exc)
@@ -2717,6 +2770,8 @@ def _short_review_page_payload(
             f"{round(float(clip['duration']))}s • "
             f"{clip.get('category', 'social clip')}\n"
             f"Why: {str(clip.get('reason', ''))[:220]}\n"
+            + (f"Historical pattern influence (inferred): {len((clip.get('learning_influence') or {}).get('evidence_ids') or [])} review examples.\n" if clip.get("learning_influence") else "")
+            +
             f"{transcript}"
         )
         buttons.append([
@@ -2922,6 +2977,7 @@ def _send_candidates(
     # review message. Both cards are edited in place from here forward.
     _send_short_confirmation(chat_id, request_id)
     _refresh_short_review_message(chat_id, request_id, page_number=page)
+    __import__('review_navigation').notify_safely(request_id, 'shorts')
 
 
 def _transcribe(video_path: Path, progress=None) -> list[dict]:
@@ -2931,7 +2987,7 @@ def _transcribe(video_path: Path, progress=None) -> list[dict]:
 
 
 def _topic_break_suggestions(
-    transcript_segments: list[dict], *, semantic_fallback: bool = False
+    transcript_segments: list[dict], *, semantic_fallback: bool = False, intelligence_context: str = ""
 ) -> list[dict]:
     """Select semantic 16:9 highlights from the complete timestamped transcript."""
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -2945,7 +3001,7 @@ def _topic_break_suggestions(
         lines.append(f"[{start:.2f}-{end:.2f}] {text}")
 
     if semantic_fallback:
-        minimum = max(60.0, float(os.getenv("TOPIC_FALLBACK_MIN_SECONDS", "90")))
+        minimum = max(180.0, float(os.getenv("TOPIC_FALLBACK_MIN_SECONDS", "180")))
         selection_rules = (
             "The normal long-highlight pass found no usable section. Recover meaningful "
             "semantic sections instead of returning nothing. Identify complete interview "
@@ -2995,7 +3051,8 @@ def _topic_break_suggestions(
         "argument, opinion, demonstration, tangent, or other. Do not include Markdown or "
         "commentary.\n\nTRANSCRIPT:\n"
         + "\n".join(lines)
-        + _boundary_learning_prompt()
+        + (_boundary_learning_prompt() if not intelligence_context else "")
+        + intelligence_context
     )
     payload = {
         "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
@@ -3023,10 +3080,18 @@ def _topic_break_suggestions(
                 if data.startswith("```"):
                     data = "\n".join(data.splitlines()[1:-1]).strip()
                 parsed = json.loads(data)
-                return parsed.get("segments", []) if isinstance(parsed, dict) else []
-            last_error = f"HTTP {response.status_code}: {response.text[:500]}"
+                if not isinstance(parsed,dict) or not isinstance(parsed.get('segments'),list):
+                    raise RuntimeError('Highlight response omitted its candidate array')
+                return parsed['segments']
+            last_error = f"HTTP {response.status_code}"
+            if response.status_code in {400,401,403,404}:
+                raise RuntimeError("Highlight provider rejected request " + last_error)
+        except (ValueError,TypeError,KeyError):
+            raise RuntimeError("Highlight response failed schema validation") from None
         except Exception as exc:
-            last_error = str(exc)
+            last_error = type(exc).__name__
+            if isinstance(exc, RuntimeError):
+                raise
         if attempt < 2:
             import time
             time.sleep(3)
@@ -3035,7 +3100,7 @@ def _topic_break_suggestions(
         semantic_fallback,
         last_error,
     )
-    return []
+    raise RuntimeError("Highlight analysis failed: " + str(last_error))
 
 
 def _build_contiguous_topic_segments(
@@ -3049,7 +3114,7 @@ def _build_contiguous_topic_segments(
     if not ordered:
         return []
     minimum = (
-        max(60.0, float(minimum_seconds))
+        max(180.0, float(minimum_seconds))
         if minimum_seconds is not None
         else max(
             180.0,
@@ -3064,7 +3129,7 @@ def _build_contiguous_topic_segments(
     ]
 
     candidates = []
-    for suggestion in suggestions:
+    for proposal_rank, suggestion in enumerate(suggestions,1):
         try:
             proposed_start = float(suggestion.get("start"))
             proposed_end = float(suggestion.get("end"))
@@ -3098,6 +3163,8 @@ def _build_contiguous_topic_segments(
                 "transcript": " ".join(included),
                 "aspect_ratio": "16:9",
                 "_selection_score": float(suggestion.get("score", 0) or 0),
+                "score": float(suggestion["score"]) if suggestion.get("score") is not None else None,
+                "original_ai_rank": proposal_rank,
             }
         )
 
@@ -3255,6 +3322,7 @@ def _send_topic_candidates(
     """Present 16:9 review in one evolving Telegram message."""
     _send_short_confirmation(chat_id, request_id)
     _refresh_topic_review(chat_id, request_id, index=0)
+    __import__('review_navigation').notify_safely(request_id, 'highlights')
 
 
 def _process_topics(
@@ -3272,6 +3340,20 @@ def _process_topics(
         "16:9 highlights now. Gaps are allowed; every highlight must be at least "
         "three minutes and contain a complete point, discussion, or story.",
     )
+    if not state.get("source_intelligence") and str(state.get("show_id") or "").upper() in {"TCB","TDOG"}:
+        from intelligence_workflow import prepare
+        mapping=prepare(state,segments)
+        state['source_intelligence']={'map_id':mapping['map_id'],'version':'source-intelligence-v1'}
+    if state.get("source_intelligence"):
+        from intelligence_workflow import prepared_highlights
+        topic_result = prepared_highlights(state, segments, video)
+        topics = topic_result["segments"]
+        state.update(video_path=str(video), source_reused=reused, topic_result=topic_result,
+                     topic_reviews=state.get("topic_reviews") or {}, topic_stage="awaiting_review" if topics else "not_eligible")
+        _save(request_id, "awaiting_review" if topics else "processing", state)
+        if topics:
+            _send_topic_candidates(chat_id, request_id, topic_result)
+        return state
     suggestions = _topic_break_suggestions(segments)
     topics = _build_contiguous_topic_segments(segments, suggestions)
     topics = _preflight_candidates(video, topics)
@@ -3279,8 +3361,8 @@ def _process_topics(
 
     if not topics:
         fallback_minimum = max(
-            60.0,
-            float(os.getenv("TOPIC_FALLBACK_MIN_SECONDS", "90")),
+            180.0,
+            float(os.getenv("TOPIC_FALLBACK_MIN_SECONDS", "180")),
         )
         logger.warning(
             "16:9 preferred pass returned no usable highlights; "
@@ -3462,7 +3544,7 @@ def _process(request_id: str) -> None:
             parsed = state["parsed"]
             video_id = parsed["video_id"]
             retained_job_id = state.get('retained_audio_master_job_id') or (state.get('audio_master_ingest') or {}).get('job_id')
-            if retained_job_id:
+            if retained_job_id and ((work / f'{video_id}-source.mp4').is_file() or state.get('retained_audio_master_job_id')):
                 from source_ingestion import verify_youtube_source
                 retained_validation = verify_youtube_source(work / f'{video_id}-source.mp4',
                     video_id, parsed['source_value'], request_id=request_id,
@@ -3474,8 +3556,7 @@ def _process(request_id: str) -> None:
             try:
                 if retained_validation:
                     cache = {'video_path':work / f'{video_id}-source.mp4', 'sermon_boundary':None,
-                        'segments':[{**s, 'duration':float(s['end'])-float(s['start'])}
-                                    for s in _segments(Path(retained_validation['transcript_path']))]}
+                        'segments':__import__('source_ingestion')._segments_from_json(json.loads(Path(retained_validation['transcript_path']).read_text(encoding='utf-8')))}
                     state['audio_master_ingest'] = {'job_id':retained_job_id, 'status':'reused_verified',
                         'checkpoints':retained_validation['checkpoints']}
                     state['source_validation'] = retained_validation
@@ -3655,7 +3736,7 @@ def _process(request_id: str) -> None:
 
             # Ten reviewed shorts is enough history to treat this ID as already
             # discovered. Below ten, search again for additional distinct shorts.
-            if reuse_existing or (len(prior_shorts) >= 10 and not force_rerip):
+            if reuse_existing or (len(prior_shorts) >= 10 and not force_rerip and str(state.get("show_id") or "").upper() not in {"TCB","TDOG"}):
                 if approved_clips:
                     reviews = {
                         str(index): {
@@ -3799,22 +3880,20 @@ def _process(request_id: str) -> None:
             send(
                 chat_id,
                 f"🧠 Only {prior_count} previously reviewed short(s) were found for "
-                f"{video_id}. Searching again for up to {needed} additional distinct shorts.",
+                f"{video_id}. Searching again for additional distinct complete shorts.",
             )
         else:
             send(
                 chat_id,
                 "🧠 Reviewing the full eligible transcript and targeting approximately "
-                "20 distinct complete shorts.",
+                "all distinct quality-qualified complete shorts.",
             )
         import main
         enriched = [
             {**item, "video_id": state["parsed"].get("video_id", "drive-source")}
             for item in segments
         ]
-        learning_prompt = _short_learning_prompt(
-            video_id if row["source_kind"] == "youtube" else ""
-        )
+        learning_prompt = ("" if str(state.get("show_id") or "").upper() in {"TCB","TDOG"} else _short_learning_prompt(video_id if row["source_kind"] == "youtube" else ""))
         prior_summary = "\n".join(
             f"- {item['start']:.2f}-{item['end']:.2f}: {item.get('transcript', '')}"
             for item in prior_shorts
@@ -3837,6 +3916,10 @@ def _process(request_id: str) -> None:
             )
         else:
             supplemental = learning_prompt
+        if str(state.get("show_id") or "").upper() in {"TCB","TDOG"}:
+            supplemental = ("Find all distinct, quality-qualified complete thoughts across the full source. "
+                "There is no prescribed clip count. Shorts may come from any topic, independently of highlights. "
+                "Do not repeat the same previously reviewed complete thought. " + learning_prompt)
         framework_prompt = _configured_short_framework_prompt()
         prompt_layers = [
             text
@@ -3847,10 +3930,13 @@ def _process(request_id: str) -> None:
             )
             if str(text or "").strip()
         ]
-        result = main.call_openai_for_clips(
-            enriched,
-            "\n\n".join(prompt_layers),
-        )
+        if str(state.get("show_id") or "").upper() in {"TCB", "TDOG"}:
+            from intelligence_workflow import start
+            short_future, mapping = start(state, enriched, video, "\n\n".join(prompt_layers))
+            _save(request_id, "selecting", {**state, "stage":"parallel_format_analysis"})
+            result = short_future.result()
+        else:
+            result = main.call_openai_for_clips(enriched, "\n\n".join(prompt_layers))
         result = validate_complete_candidates(result, enriched)
         excluded_history = (
             [item for item in prior_shorts if item.get("decision") == "rejected"]
@@ -3869,7 +3955,7 @@ def _process(request_id: str) -> None:
             not in prior_texts
         ]
         new_segments = select_non_overlapping(
-            new_segments, limit=needed, allow_overlap=True
+            new_segments, limit=len(new_segments) if state.get("source_intelligence") else needed, allow_overlap=True
         )
         next_number = max(
             [int(item.get("candidate_number") or 0) for item in prior_shorts] or [0]
@@ -3920,6 +4006,8 @@ def _process(request_id: str) -> None:
                 (request_id,),
             ).fetchone()
         latest_state = json.loads(latest_row["state_json"]) if latest_row else state
+        if getattr(exc,'analysis_id',None):
+            latest_state['source_intelligence']={'map_id':exc.analysis_id.split(':')[0],'version':'source-intelligence-v1'}
         candidates_exist = bool(
             (latest_state.get("result") or {}).get("segments")
         )
@@ -3950,6 +4038,9 @@ def _process(request_id: str) -> None:
             )
         try:
             send(chat_id, failure_text)
+            if latest_state.get('source_intelligence') and row['mode']=='both' and latest_state.get('topic_source_segments'):
+                send(chat_id,'The format analysis failure is preserved. You may retry it explicitly or continue to the independently saved 16:9 review; no clips are selected automatically.')
+                _send_short_confirmation(chat_id,request_id)
         except Exception:
             logger.exception(
                 "Could not deliver Ripped Shorts processing failure notice request_id=%s",
@@ -3985,6 +4076,11 @@ def _log_quick_edit(
     user_id: str,
 ) -> None:
     """Append an applied Telegram edit to Podcast / Decision Log."""
+    try:
+        from production_intelligence import record_edits
+        record_edits(row['request_id'],result['state'],result,instruction,user_id)
+    except Exception:
+        logger.exception('Could not persist local manual edit evidence')
     try:
         import main
 
@@ -5090,6 +5186,10 @@ def _accept_update(
                 "request_id": request_id,
                 "next_action": "resend_original_youtube_url",
             }
+        retry_state=json.loads(retry_row['state_json'])
+        if retry_state.get('source_intelligence'):
+            from production_intelligence import retry_failed
+            retry_failed(retry_state['source_intelligence']['map_id'])
         background_tasks.add_task(_process, request_id)
         return {"status": "retry_accepted", "request_id": request_id}
     if is_quick_command(text):
@@ -5240,13 +5340,15 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
         _refresh_topic_review(chat_id, request_id, index=index)
         _send_short_confirmation(chat_id, request_id)
         segment = state["topic_result"]["segments"][index]
+        from clip_review_state import prepare_segment, preserve_selection
+        prepared, review_revisions = prepare_segment(request_id, f'{request_id}:highlight:{index+1}', segment)
         video = _ensure_render_source(request_id, state)
         video_id = state["parsed"].get("video_id", request_id)
         vid_title = _state_vid_title(state)
         import main
 
         rendered = main.attach_topic_segment_asset(
-            dict(segment),
+            prepared,
             video_id,
             video,
             index + 1,
@@ -5258,11 +5360,12 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
             ).fetchone()
             latest_state = json.loads(latest["state_json"])
             reviews = dict(latest_state.get("topic_reviews") or {})
-            latest_state["topic_result"]["segments"][index] = rendered
+            latest_state["topic_result"]["segments"][index] = preserve_selection(segment, rendered) if review_revisions else rendered
             reviews[str(index)] = {
                 **reviews.get(str(index), {}),
                 "status": "rendered",
                 "segment_url": rendered.get("segment_url"),
+                "rendered_review_revisions": review_revisions,
                 "folder_id": rendered.get("folder_id"),
                 "rendered_at": now(),
             }
@@ -5274,6 +5377,7 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
             )
         _refresh_topic_review(chat_id, request_id, index=index)
         _send_short_confirmation(chat_id, request_id)
+        __import__('review_navigation').notify_safely(request_id, 'final', str(rendered.get('segment_url') or index))
         _notify_render_queue_complete(request_id, chat_id)
     except Exception as exc:
         logger.exception(
@@ -5290,6 +5394,7 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
                     **reviews.get(str(index), {}),
                     "status": "render_failed",
                     "render_error": str(exc),
+                    "render_diagnostics": getattr(exc, "diagnostics", {}),
                     "rendered_at": now(),
                 }
                 latest_state["topic_reviews"] = reviews
@@ -5353,7 +5458,9 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         vid_title = _state_vid_title(state)
         import main
 
-        payload_candidate = dict(candidate)
+        from clip_review_state import prepare_segment, preserve_selection, verify_render_choice
+        identity = f'{request_id}:short:{int(candidate.get("candidate_number") or index+1)}'
+        payload_candidate, review_revisions = prepare_segment(request_id, identity, candidate)
         payload_candidate["candidate_number"] = int(
             candidate.get("candidate_number") or index + 1
         )
@@ -5366,6 +5473,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             vid_title=vid_title,
         )
         clip = rendered["segments"][0]
+        verify_render_choice(payload_candidate, clip)
         rendered_at = now()
         with _LOCK, _telegram_db() as db:
             latest = db.execute(
@@ -5373,11 +5481,12 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             ).fetchone()
             latest_state = json.loads(latest["state_json"])
             reviews = dict(latest_state.get("candidate_reviews") or {})
-            latest_state["result"]["segments"][index] = clip
+            latest_state["result"]["segments"][index] = preserve_selection(candidate, clip) if review_revisions else clip
             reviews[str(index)] = {
                 **reviews.get(str(index), {}),
                 "status": "rendered",
                 "clip_url": clip.get("clip_url"),
+                "rendered_review_revisions": review_revisions,
                 "folder_id": clip.get("folder_id"),
                 "rendered_at": rendered_at,
             }
@@ -5397,8 +5506,16 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             clip_url=clip.get("clip_url", ""),
             rendered_at=rendered_at,
         )
+        try:
+            if hasattr(main, 'prepare_framing_review'):
+                main.prepare_framing_review(request_id, identity, video, candidate, clip)
+        except Exception:
+            # A preview failure must not erase the successful export. The
+            # framing gate still prevents it from entering scheduling.
+            logger.exception('Framing preview unavailable request_id=%s asset=%s', request_id, identity)
         _refresh_short_review_message(chat_id, request_id)
         _send_short_confirmation(chat_id, request_id)
+        __import__('review_navigation').notify_safely(request_id, 'final', str(clip.get('clip_url') or identity))
         _notify_render_queue_complete(request_id, chat_id)
     except Exception as exc:
         logger.exception(
@@ -5415,6 +5532,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
                     **reviews.get(str(index), {}),
                     "status": "render_failed",
                     "render_error": str(exc),
+                    "render_diagnostics": getattr(exc, "diagnostics", {}),
                     "rendered_at": now(),
                 }
                 latest_state["candidate_reviews"] = reviews
@@ -6298,6 +6416,7 @@ def _ripped_webhook_watchdog() -> None:
             _ensure_ripped_telegram_webhook()
             _purge_expired_local_artifacts()
             _resume_stale_jobs()
+            _queue_source_intelligence_sync()
         except Exception:
             logger.exception(
                 "Ripped Shorts Telegram webhook watchdog could not verify or repair ownership"

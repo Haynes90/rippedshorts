@@ -12,6 +12,7 @@ FUNCTIONS = {
     and node.name in {
         "parse_request",
         "validate_complete_candidates",
+        "_sentence_complete_candidate",
         "_build_contiguous_topic_segments",
     }
 }
@@ -24,6 +25,7 @@ namespace = {
 exec("YOUTUBE_RE = re.compile(r'https?://(?:(?:www\\.|m\\.)?youtube\\.com/(?:watch\\?[^\\s]*v=|shorts/|live/|embed/)|youtu\\.be/)([A-Za-z0-9_-]{6,20})', re.I)\nDRIVE_RE = re.compile(r'https?://drive\\.google\\.com/(?:file/d/|open\\?id=|uc\\?(?:[^\\s]*&)?id=)([A-Za-z0-9_-]+)', re.I)", namespace)
 exec(compile(ast.Module(body=[FUNCTIONS["parse_request"]], type_ignores=[]), "telegram-functions", "exec"), namespace)
 parse_request = namespace["parse_request"]
+exec(compile(ast.Module(body=[FUNCTIONS["_sentence_complete_candidate"]], type_ignores=[]), "sentence-functions", "exec"), namespace)
 exec(compile(ast.Module(body=[FUNCTIONS["validate_complete_candidates"]], type_ignores=[]), "candidate-functions", "exec"), namespace)
 validate_complete_candidates = namespace["validate_complete_candidates"]
 exec(
@@ -129,11 +131,19 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn('"retry_source_missing"', SOURCE)
 
     def test_webhook_monitor_distinguishes_stale_errors_and_group_privacy(self):
-        self.assertIn('"last_error_date"', SOURCE)
-        self.assertIn('"last_error_age_seconds=%s"', SOURCE)
-        self.assertIn('"can_read_all_group_messages"', SOURCE)
-        self.assertIn('"getChatMember"', SOURCE)
-        self.assertIn("cannot receive plain group messages", SOURCE)
+        import telegram_intake as tg,time
+        from unittest.mock import patch,Mock
+        now=int(time.time()); info={'url':'https://fixture.test/webhook','last_error_message':'old failure','last_error_date':now-3600}
+        def api(token,method,*args):
+            return {'result':{'username':'rippedshortsbot','id':1,'can_read_all_group_messages':False}} if method=='getMe' else {'result':info}
+        with patch.object(tg,'_ripped_bot_token',return_value='fixture-only'),patch.object(tg,'_ripped_webhook_url',return_value=info['url']),patch.object(tg,'_telegram_api',side_effect=api),patch.object(tg,'logger') as log,patch.dict('os.environ',{'TELEGRAM_CHAT_ID':'','TELEGRAM_GROUP_CHAT_ID':'','Telegram_Group_Chat_ID':''}):
+            tg._ensure_ripped_telegram_webhook()
+            self.assertTrue(any('historical' in call.args[0] for call in log.info.call_args_list))
+            self.assertTrue(any('cannot receive plain group messages' in call.args[0] for call in log.warning.call_args_list))
+            self.assertFalse(any('recent delivery error' in call.args[0] for call in log.warning.call_args_list))
+            info['last_error_date']=now
+            log.reset_mock();tg._ensure_ripped_telegram_webhook()
+            self.assertTrue(any('recent delivery error' in call.args[0] for call in log.warning.call_args_list))
 
     def test_reliability_features_are_integrated(self):
         reliability = (
@@ -210,20 +220,15 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertNotEqual(result[0]["end"], 540)
 
     def test_16_9_waits_for_explicit_shorts_confirmation(self):
-        process_source = ast.get_source_segment(
-            SOURCE,
-            next(
-                node
-                for node in TREE.body
-                if isinstance(node, ast.FunctionDef) and node.name == "_process"
-            ),
-        )
-        self.assertIn('row["mode"] == "topics"', process_source)
-        self.assertNotIn('row["mode"] in {"topics", "both"}', process_source)
-        self.assertIn("rs:shorts_confirm:", SOURCE)
-        self.assertIn("shorts_confirmed_at", SOURCE)
-        self.assertIn("These Shorts Been Ripped — Continue", SOURCE)
-        self.assertIn("selection_complete_skip", SOURCE)
+        import telegram_intake as tg
+        state={'candidate_reviews':{},'topic_reviews':{}}
+        _,markup=tg._short_control_payload('existing',{'mode':'both'},state)
+        buttons=[b for row in markup['inline_keyboard'] for b in row]
+        self.assertTrue(any(b.get('callback_data')=='rs:shorts_confirm:existing' for b in buttons))
+        self.assertNotIn('shorts_confirmed_at',state)
+        state['shorts_confirmed_at']='human-confirmed'
+        _,after=tg._short_control_payload('existing',{'mode':'both'},state)
+        self.assertFalse(any(b.get('callback_data')=='rs:shorts_confirm:existing' for row in after['inline_keyboard'] for b in row))
 
     def test_completed_short_selection_hands_off_to_schedule_master(self):
         self.assertIn("def _handoff_shorts_to_schedule_master", SOURCE)
@@ -244,9 +249,13 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("Rendering continues in the background", SOURCE)
 
     def test_edited_caption_stays_visible_as_final_reviewed_copy(self):
-        self.assertIn("EDITED FINAL COPY", SOURCE)
-        self.assertIn("next_index = index", SOURCE)
-        self.assertIn("shows exactly what will be sent to Schedule Master", SOURCE)
+        from acceptance_fixtures import copy_review_fixture
+        with copy_review_fixture() as f:
+            f.reply();state=f.read()
+            text,_=f.tg._copy_review_payload('first',state['copy_drafts'],state['copy_review_index'])
+            self.assertIn('EDITED FINAL COPY',text)
+            self.assertIn('My exact edited wording\n\nSecond paragraph.',text)
+            self.assertEqual(state['copy_review_index'],0)
 
     def test_copy_reply_uses_durable_prompt_session_before_group_filter(self):
         self.assertIn("CREATE TABLE IF NOT EXISTS telegram_copy_inputs", SOURCE)
@@ -272,9 +281,12 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("You are still on this same caption", SOURCE)
 
     def test_schedule_handoff_prefers_durable_caption_checkpoint(self):
-        self.assertIn("def _caption_learning_checkpoint_map(", SOURCE)
-        self.assertIn('"copy_source": "CAPTION_LEARNING_CHECKPOINT"', SOURCE)
-        self.assertIn("checkpoint_copy = _caption_learning_checkpoint_map(request_id)", SOURCE)
+        import telegram_intake as tg
+        from unittest.mock import patch
+        rows=[{'request_id':'r','asset_id':'a','decision':'EDITED','recorded_at':'2026-10-31','final_caption':'Exact owner wording','ai_caption':'AI draft'}, {'request_id':'other','asset_id':'a','decision':'EDITED','final_caption':'Wrong request'}]
+        with patch.object(tg,'get_rows',return_value=rows):
+            resolved=tg._caption_learning_checkpoint_map('r')
+        self.assertEqual(resolved['a']['social_caption'],'Exact owner wording')
 
     def test_copy_reply_always_confirms_saved_edit(self):
         self.assertIn("confirmation_done = False", SOURCE)
@@ -283,16 +295,23 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("last_copy_edit_saved_at", SOURCE)
 
     def test_copy_reply_is_bound_to_exact_prompt_and_preserves_route(self):
-        self.assertIn('"prompt_message_id": prompt_message_id', SOURCE)
-        self.assertIn("reply_to_message_id", SOURCE)
-        self.assertIn("prompt_id == reply_to_message_id", SOURCE)
-        self.assertIn("The edit transaction is committed before refreshing", SOURCE)
-        self.assertIn("_next_pending_copy_index(drafts, index)", SOURCE)
-        self.assertIn('"next_asset_index": next_index', SOURCE)
+        from acceptance_fixtures import copy_review_fixture
+        with copy_review_fixture() as f:
+            result=f.reply('100')
+            self.assertEqual(result['status'],'copy_updated')
+            self.assertEqual(f.read()['copy_drafts'][0]['social_caption'],'My exact edited wording\n\nSecond paragraph.')
+            self.assertEqual(f.read('second')['copy_drafts'][0]['social_caption'],'Original second')
+            self.assertEqual(f.read()['route_source'],'owner')
+            self.assertEqual(f.checkpoints[0][1]['copy_drafts'][0]['copy_status'],'edited')
 
     def test_copy_reply_updates_existing_prompt_instead_of_sending_status_spam(self):
-        self.assertIn("Could not update copy edit prompt", SOURCE)
-        self.assertIn("Moved to copy", SOURCE)
+        from acceptance_fixtures import copy_review_fixture
+        with copy_review_fixture() as f:
+            f.reply()
+            methods=[call.args[0] for call in f.telegram.call_args_list]
+            self.assertNotIn('sendMessage',methods)
+            self.assertGreaterEqual(methods.count('editMessageText'),2)
+            self.assertTrue(any(call.args[1].get('message_id')=='100' for call in f.telegram.call_args_list))
 
     def test_copy_review_uses_one_reusable_message(self):
         self.assertIn("def _refresh_copy_review", SOURCE)
@@ -302,7 +321,7 @@ class TelegramParsingTests(unittest.TestCase):
 
     def test_16_9_runs_semantic_fallback_when_long_pass_is_empty(self):
         self.assertIn("semantic_fallback: bool = False", SOURCE)
-        self.assertIn('TOPIC_FALLBACK_MIN_SECONDS", "90"', SOURCE)
+        self.assertIn('TOPIC_FALLBACK_MIN_SECONDS", "180"', SOURCE)
         self.assertIn("questions with their full answers", SOURCE)
         self.assertIn("follow-up exchanges that stay on one subject", SOURCE)
         self.assertIn("topic discussions", SOURCE)
@@ -332,12 +351,11 @@ class TelegramParsingTests(unittest.TestCase):
             suggestions,
             minimum_seconds=90,
         )
-        self.assertEqual(len(recovered), 1)
-        self.assertEqual(recovered[0]["duration"], 100)
+        self.assertEqual(recovered, [])  # A 100-second fallback is below the established minimum.
 
-    def test_16_9_builder_accepts_lower_minimum_only_for_fallback(self):
+    def test_16_9_builder_keeps_three_minute_floor_in_fallback(self):
         self.assertIn("minimum_seconds: float | None = None", SOURCE)
-        self.assertIn("max(60.0, float(minimum_seconds))", SOURCE)
+        self.assertIn("max(180.0, float(minimum_seconds))", SOURCE)
         self.assertIn('TOPIC_SEGMENT_MIN_SECONDS", "180"', SOURCE)
 
     def test_topic_review_uses_one_reusable_message(self):
@@ -390,12 +408,15 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("BRAND RULE", SOURCE)
 
     def test_short_caption_keeps_hashtags_separate_and_clean(self):
-        self.assertIn("def _normalize_hashtags(", SOURCE)
-        self.assertIn("Return hashtags only in the ", SOURCE)
-        self.assertIn("do not put hashtags inside social_caption", SOURCE)
-        self.assertIn("Do not label sections with Hook:", SOURCE)
-        self.assertIn("_normalize_hashtags(copy.get(\"hashtags\"))", SOURCE)
-        self.assertIn('\"hashtags\": _normalize_hashtags(asset.get(\"hashtags\"))', SOURCE)
+        from acceptance_fixtures import copy_review_fixture
+        with copy_review_fixture() as f:
+            f.reply();draft=f.read()['copy_drafts'][0]
+            self.assertEqual(draft['hashtags'],'#Plants')
+            self.assertNotIn('#Plants',draft['social_caption'])
+            self.assertEqual(f.tg._normalize_hashtags('["#Plants", "#Seeds"]'),'#Plants #Seeds')
+            text,_=f.tg._copy_review_payload('first',[draft],0)
+            self.assertIn(draft['social_caption'],text)
+            self.assertNotIn('Hook:',text)
 
     def test_schedule_now_requires_copy_review(self):
         self.assertIn('"copy_review_requested_at"', SOURCE)
