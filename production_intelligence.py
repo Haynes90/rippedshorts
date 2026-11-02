@@ -151,7 +151,7 @@ def cached_analysis(key, analyze, wait_seconds=1250):
         exc.analysis_id=key
         with database() as db:
             # Type only: provider error bodies may contain credentials or source text.
-            diagnostic = encoded({'validation_failure': exc.diagnostics}) if isinstance(exc, TopicValidationError) else None
+            diagnostic = encoded({'validation_failure': exc.diagnostics}) if isinstance(exc, TopicValidationError) or getattr(exc, 'validation_held', False) else None
             db.execute('UPDATE source_analyses SET status=?,error=?,result=?,lease_until=NULL WHERE analysis_id=? AND owner=?', ('FAILED', type(exc).__name__, diagnostic, key, owner))
             db.execute('INSERT OR IGNORE INTO analysis_failures VALUES(?,?,?,?)',(key,owner,type(exc).__name__,datetime.now(timezone.utc).isoformat()))
         raise
@@ -229,7 +229,7 @@ def normalize_transcript(segments):
     return result
 
 
-def construct_topic_ranges(response, count):
+def construct_topic_ranges(response, count, first_segment=0, last_segment=None):
     """Derive inclusive ends from verified semantic starts, never repair references.
 
     Topics arrive in depth-first semantic order. Siblings partition the rest of
@@ -237,6 +237,7 @@ def construct_topic_ranges(response, count):
     ranges remain provider references and still pass the existing local checks.
     """
     provenance = response.get('provenance') or {}
+    last_segment = count-1 if last_segment is None else last_segment
     items = response.get('topics')
     def invalid(reason, position=None, value=None):
         raise TopicValidationError(reason, provenance, topic_position=position,
@@ -250,7 +251,7 @@ def construct_topic_ranges(response, count):
         if not isinstance(item, dict):
             invalid('Semantic boundary must be an object', position, item)
         first, key, parent = item.get('first_segment'), item.get('key'), item.get('parent_key')
-        if type(first) is not int or not 0 <= first < count:
+        if type(first) is not int or not first_segment <= first <= last_segment:
             invalid('Semantic boundary is outside verified transcript', position, first)
         if 'last_segment' in item:
             invalid('Provider end indices are not permitted in boundary contract', position, item['last_segment'])
@@ -270,15 +271,15 @@ def construct_topic_ranges(response, count):
         siblings.append(copied)
         seen[key] = copied
         stack.append(key)
-    if groups[None][0]['first_segment'] != 0:
-        invalid('Semantic chapters must begin at transcript index zero', 0, groups[None][0]['first_segment'])
+    if groups[None][0]['first_segment'] != first_segment:
+        invalid('Semantic chapters must begin at verified parent start', 0, groups[None][0]['first_segment'])
     # Iterative parent-first construction also supports deeply nested topics.
     for item in topics:
         siblings = groups[item.get('parent_key')]
         index = siblings.index(item)
         end = (siblings[index+1]['first_segment']-1 if index+1 < len(siblings)
-               else (seen[item['parent_key']]['last_segment'] if item.get('parent_key') else count-1))
-        parent_end = seen[item['parent_key']]['last_segment'] if item.get('parent_key') else count-1
+               else (seen[item['parent_key']]['last_segment'] if item.get('parent_key') else last_segment))
+        parent_end = seen[item['parent_key']]['last_segment'] if item.get('parent_key') else last_segment
         if not item['first_segment'] <= end <= parent_end:
             invalid('Semantic child boundary is outside parent', topics.index(item), item['first_segment'])
         item['last_segment'] = end
@@ -302,7 +303,7 @@ def topic_map(source, segments, analyze):
                 analysis_id = map_id
     def build():
         response = analyze(timeline)
-        if recipe or response.get('range_contract') is not None:
+        if recipe == TOPIC_RECIPE or response.get('range_contract') is not None:
             response = construct_topic_ranges(response, len(timeline))
         topics = []
         covered = set()
@@ -354,13 +355,18 @@ def topic_map(source, segments, analyze):
                     if type(a) is not int or type(b) is not int or not topic['first_segment']<=a<=b<=topic['last_segment']:
                         raise NestedReferenceError(topic_position, field, item_position, a, b, topic,
                             len(timeline), provenance)
-        return {'map_id': map_id, 'source': source, 'transcript_revision': revision,
-                'analysis_version': VERSION, 'provenance': response.get('provenance', {}), 'topics': topics}
+        result = {'map_id': map_id, 'source': source, 'transcript_revision': revision,
+                'analysis_version': response.get('provenance', {}).get('analysis_version', VERSION),
+                'provenance': response.get('provenance', {}), 'topics': topics}
+        for field in ('episode', 'episode_moments', 'stage_evidence'):
+            if field in response:
+                result[field] = response[field]
+        return result
     result = cached_analysis(analysis_id, build)
     result = {**result, 'analysis_id': analysis_id}
     record('source', map_id, {k: v for k, v in result.items() if k != 'topics'})
     for topic in result['topics']:
-        record('topic', topic['topic_id'], {**topic, 'map_id': map_id, **source, 'analysis_version': VERSION})
+        record('topic', topic['topic_id'], {**topic, 'map_id': map_id, **source, 'analysis_version': result['analysis_version']})
     return result
 
 
@@ -449,6 +455,9 @@ def candidate_records(mapping, lane, result, context):
             'topic_map_revision':identity(mapping['topics']),
             'transcript_revision':mapping['transcript_revision'], 'brand_id':mapping['source']['brand_id'],
             'show_id':mapping['source'].get('show_id'), 'learning_evidence_ids':[e['evidence_id'] for e in context.get('examples') or []],
+            'hierarchy_stage_ids':[e['analysis_id'] for e in mapping.get('stage_evidence',[])],
+            'learning_scope':{'brand_id':mapping['source']['brand_id'],'show_id':mapping['source'].get('show_id'),'format':lane},
+            'learning_input_revision':identity(context),
             'learning_confidence':context.get('confidence'), 'topic_ids':associated}
         record('candidate', candidate_id, {'candidate_id': candidate_id, 'map_id': mapping['map_id'],
             **mapping['source'], 'format': lane, 'ai_rank': candidate.get('original_ai_rank',rank), 'ai_score': candidate.get('score') if candidate.get('ai_score_available',True) else None,
@@ -517,7 +526,7 @@ def record_edits(request_id,state,result,instruction,reviewer):
 
 def learning_context(source, lane, topics=()):
     with database() as db:
-        rows = db.execute("SELECT record_id,payload FROM intelligence_records WHERE kind='feedback' ORDER BY updated_at DESC,rowid DESC LIMIT 1000").fetchall()
+        rows = db.execute("SELECT record_id,payload,digest,synced_digest FROM intelligence_records WHERE kind='feedback' ORDER BY updated_at DESC,rowid DESC LIMIT 1000").fetchall()
         topic_rows = db.execute("SELECT record_id,payload FROM intelligence_records WHERE kind='topic'").fetchall()
     topic_tags={r['record_id']:set(str(v).casefold() for v in json.loads(r['payload']).get('tags') or []) for r in topic_rows}
     wanted=set(str(v).casefold() for t in topics for v in t.get('tags') or [])
@@ -546,6 +555,7 @@ def learning_context(source, lane, topics=()):
         similarity=len(tags&wanted)/len(tags|wanted) if tags and wanted else 0
         weight+=2*similarity
         examples.append({'evidence_id': row['record_id'], 'candidate_id': item['candidate_id'], 'decision': decision,
+                         'sheets_projection_verified':row['digest']==row['synced_digest'],
                          'weight': weight, 'sign': sign, 'category': item.get('category'),
                          'feedback': item.get('feedback') or draft.get('selection_feedback'), 'bounds': item.get('bounds'),
                          'boundary_changes':{'before':item.get('before'),'after':item.get('after')} if item.get('decision')=='edited' else None,
