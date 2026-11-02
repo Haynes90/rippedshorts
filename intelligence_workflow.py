@@ -19,7 +19,8 @@ def prepare(state, segments):
         prior=json.loads(row['state_json'])
         if prior.get('show_id')==source['brand_id']:
             intelligence.feedback_snapshot(row['request_id'],prior)
-    mapping = intelligence.topic_map(source, segments, intelligence.model_topic_map)
+    from hierarchical_intelligence import mapping as hierarchical_mapping
+    mapping = hierarchical_mapping(source, segments)
     return mapping
 
 
@@ -44,7 +45,7 @@ def analyze_highlights(mapping, segments, video):
         return intelligence.candidate_records(mapping, '16:9', result, context)
     # Freeze the completed lane for this unchanged source/specification. New
     # feedback applies to future sources, not a silent rerun of this batch.
-    return intelligence.cached_analysis(mapping['map_id']+':16:9:'+intelligence.identity(os.getenv('OPENAI_MODEL'), specification, brand_context, 'minimum-180-v2'), analyze)
+    return intelligence.cached_analysis(mapping['map_id']+':16:9:'+intelligence.identity(os.getenv('OPENAI_MODEL'), specification, brand_context, mapping.get('analysis_version'), 'minimum-180-v2'), analyze)
 
 
 def start(state, segments, video, short_prompt):
@@ -70,7 +71,8 @@ def start(state, segments, video, short_prompt):
             return intelligence.candidate_records(mapping, '9:16', result, context)
         return intelligence.cached_analysis(mapping['map_id']+':9:16:'+intelligence.identity(main.OPENAI_MODEL,prompt), analyze)
     futures = intelligence.parallel_analyses(short, lambda: analyze_highlights(mapping, segments, video))
-    state['source_intelligence'] = {'map_id': mapping['map_id'], 'version': intelligence.VERSION}
+    state['source_intelligence'] = {'map_id': mapping['map_id'], 'analysis_id': mapping['analysis_id'],
+                                  'version': intelligence.VERSION}
     # The independent highlight result is in SQLite, never merged over live review state.
     return futures['9:16'], mapping
 

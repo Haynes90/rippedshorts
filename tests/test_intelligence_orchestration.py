@@ -16,7 +16,14 @@ def integrated(tmp_path,monkeypatch):
     import telegram_intake as tg
     import audio_master_handoff as storage
     monkeypatch.setattr(storage,'DB_PATH',tmp_path/'workflow.db')
-    monkeypatch.setattr(pi,'model_topic_map',lambda _: {'topics':[{'key':'one','title':'Complete discussion','first_segment':0,'last_segment':1,'tags':['gardening']}]})
+    import hierarchical_intelligence as hierarchy
+    def generate(stage,transcript,context,bounds,count):
+        if stage=='episode':
+            return {**{k:'Complete gardening episode' for k in ('title','summary','beginning','middle','ending','discussion_flow')},'themes':['gardening']}
+        if stage=='moments':return {'moments':[]}
+        return {'range_contract':pi.TOPIC_RECIPE,'topics':[{'key':'one','title':'Complete discussion',
+                'first_segment':bounds[0],'parent_key':None,'tags':['gardening']}]}
+    monkeypatch.setattr(hierarchy,'provider',generate)
     monkeypatch.setattr(tg,'validate_complete_candidates',lambda result,_:result)
     monkeypatch.setattr(tg,'_preflight_candidates',lambda _,clips:clips)
     monkeypatch.setattr(tg,'_build_contiguous_topic_segments',lambda _,clips,**kw:clips)
@@ -28,13 +35,25 @@ def integrated(tmp_path,monkeypatch):
 
 def test_actual_selector_orchestration_is_parallel_but_does_not_select_for_owner(integrated,monkeypatch):
     main,tg,state,timeline=integrated
+    import selection_specs
+    monkeypatch.setattr(selection_specs,'highlight_framework',lambda:'APPROVED HIGHLIGHT CONTRACT: minimum three minutes')
+    for lane in ('9:16','16:9'):
+        pi.record('feedback','sheet-owner-'+lane,{'candidate_id':'prior-'+lane,'brand_id':'TCB','show_id':'TCB',
+                  'format':lane,'decision':'approved','category':'education','feedback':'Practical owner preference'})
+    with pi.database() as db:
+        db.execute("UPDATE intelligence_records SET synced_digest=digest WHERE kind='feedback'")
     short_started,long_started=Event(),Event()
     def short(*args):
         short_started.set();assert long_started.wait(2)
+        assert 'existing rubric' in args[1] and 'hierarchical-source-v1' in args[1]
+        assert 'Practical owner preference' in args[1] and 'sheets_projection_verified":true' in args[1]
         return {'segments':[{'start':0.,'end':30.,'score':80,'category':'education','transcript':'A whole thought.'}]}
     def long(*args,**kwargs):
         long_started.set();assert short_started.wait(2)
         assert 'SHARED FULL-SOURCE TOPIC MAP' in kwargs['intelligence_context']
+        assert 'APPROVED HIGHLIGHT CONTRACT' in kwargs['intelligence_context']
+        assert 'hierarchical-source-v1' in kwargs['intelligence_context']
+        assert 'Practical owner preference' in kwargs['intelligence_context']
         return [{'start':0.,'end':240.,'score':85,'highlight_type':'discussion'}]
     short_mock=Mock(side_effect=short);long_mock=Mock(side_effect=long)
     monkeypatch.setattr(main,'call_openai_for_clips',short_mock)
@@ -44,6 +63,7 @@ def test_actual_selector_orchestration_is_parallel_but_does_not_select_for_owner
     prepared=workflow.prepared_highlights(state,timeline,'retained.mp4')
     assert len(short_result['segments'])==len(prepared['segments'])==1
     assert short_result['segments'][0]['map_id']==prepared['segments'][0]['map_id']==mapping['map_id']
+    assert short_result['segments'][0]['selection_provenance']['hierarchy_stage_ids']
     assert 'candidate_reviews' not in state and 'topic_reviews' not in state
     # New owner feedback after Shorts review must not repeat the completed long pass.
     pi.feedback_snapshot('prior',{'show_id':'TCB','parsed':{'video_id':'source'},'result':short_result,'candidate_reviews':{'0':{'status':'approved'}}})
@@ -71,7 +91,7 @@ def test_failure_retry_is_explicit_bounded_and_keeps_completed_sibling(integrate
         with pytest.raises(ValueError):pi.cached_analysis(key,lambda:(_ for _ in ()).throw(ValueError('bad response')))
         if attempt<2:pi.retry_failed(mapping['map_id'])
     with pytest.raises(ValueError,match='budget'):pi.retry_failed(mapping['map_id'])
-    assert pi.cached_analysis(mapping['map_id'],Mock(side_effect=AssertionError('topic map must not repeat')))
+    assert pi.cached_analysis(mapping['analysis_id'],Mock(side_effect=AssertionError('topic map must not repeat')))
 
 
 def test_status_read_does_not_modify_database(integrated):
