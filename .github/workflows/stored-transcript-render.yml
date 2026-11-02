@@ -9,6 +9,7 @@ on:
       - 'intelligence_workflow.py'
       - 'hierarchical_intelligence.py'
       - 'tests/test_hierarchical_intelligence.py'
+      - 'tests/test_conversation_relationships.py'
       - 'tests/test_intelligence_orchestration.py'
       - 'tests/test_semantic_boundary_recovery.py'
       - 'tests/test_topic_map_reference_contract.py'
@@ -38,5 +39,5 @@ jobs:
         env:
           DATA_DIR: ${{ runner.temp }}/topic-contract-data
           PYTHONPATH: .
-        run: python -m pytest tests/test_topic_map_reference_contract.py tests/test_semantic_boundary_recovery.py tests/test_production_intelligence.py tests/test_retry_loop_prevention.py tests/test_hierarchical_intelligence.py -q
+        run: python -m pytest tests/test_topic_map_reference_contract.py tests/test_semantic_boundary_recovery.py tests/test_production_intelligence.py tests/test_retry_loop_prevention.py tests/test_hierarchical_intelligence.py tests/test_conversation_relationships.py -q
 
