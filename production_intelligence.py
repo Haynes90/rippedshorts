@@ -18,6 +18,7 @@ import time
 import uuid
 
 VERSION = 'source-intelligence-v1'
+TOPIC_RECIPE = 'semantic-boundaries-v4'
 _SYNC_LOCK = threading.Lock()
 _SCHEMA_LOCK = threading.Lock()
 
@@ -34,7 +35,17 @@ def _reference_diagnostic(value):
     return {'type': type(value).__name__, 'value': None, 'redacted': True}
 
 
-class TopicReferenceError(ValueError):
+class TopicValidationError(ValueError):
+    """Deterministic source-map failure; only explicit review may reopen it."""
+
+    def __init__(self, reason, provenance=None, **details):
+        super().__init__(reason)
+        self.diagnostics = {'category': 'TOPIC_MAP_INVALID', 'reason': reason,
+                            'prompt_version': (provenance or {}).get('prompt_version'),
+                            'prompt_sha256': (provenance or {}).get('prompt_sha256'), **details}
+
+
+class TopicReferenceError(TopicValidationError):
     """Preserve reference shapes without retaining provider/source text in errors."""
 
     def __init__(self, position, first, last, count, provenance):
@@ -115,8 +126,12 @@ def cached_analysis(key, analyze, wait_seconds=1250):
             if row and row['status'] == 'PASSED':
                 return json.loads(row['result'])
             if row and row['status'] == 'FAILED':
+                saved = json.loads(row['result']) if row['result'] else {}
                 failure=ValueError('Saved analysis failed: ' + row['error'])
                 failure.analysis_id=key
+                failure.validation_held = bool(saved.get('validation_failure'))
+                if failure.validation_held:
+                    failure.diagnostics = saved['validation_failure']
                 raise failure
             if not row or (row['lease_until'] or 0) < time.time():
                 db.execute('INSERT INTO source_analyses VALUES(?,?,?,?,?,?) ON CONFLICT(analysis_id) DO UPDATE SET status=excluded.status,owner=excluded.owner,lease_until=excluded.lease_until,error=NULL',
@@ -136,10 +151,42 @@ def cached_analysis(key, analyze, wait_seconds=1250):
         exc.analysis_id=key
         with database() as db:
             # Type only: provider error bodies may contain credentials or source text.
-            diagnostic = encoded({'validation_failure': exc.diagnostics}) if isinstance(exc, TopicReferenceError) else None
+            diagnostic = encoded({'validation_failure': exc.diagnostics}) if isinstance(exc, TopicValidationError) else None
             db.execute('UPDATE source_analyses SET status=?,error=?,result=?,lease_until=NULL WHERE analysis_id=? AND owner=?', ('FAILED', type(exc).__name__, diagnostic, key, owner))
             db.execute('INSERT OR IGNORE INTO analysis_failures VALUES(?,?,?,?)',(key,owner,type(exc).__name__,datetime.now(timezone.utc).isoformat()))
         raise
+
+
+def analysis_recovery_blocked(state):
+    """Read-only watchdog guard, including legacy failed map records.
+
+    An explicit recovery must clear the request hold AND reopen the specific
+    failed analysis (or select a reviewed new recipe). A watchdog never does so.
+    Historical failed siblings do not block a different explicitly selected key.
+    """
+    if state.get('analysis_validation_hold') or (state.get('analysis_recovery') or {}).get('mode') == 'owner_bounded':
+        return True
+    source = state.get('source_intelligence') or {}
+    map_id = source.get('map_id')
+    if not map_id:
+        return False
+    key = source.get('analysis_id') or map_id
+    rows = analysis_status(map_id)
+    return any(r['analysis_id'] == key and r['status'] == 'FAILED' and
+               r['error'] in {'TopicValidationError', 'TopicReferenceError', 'NestedReferenceError', 'ValueError'}
+               for r in rows)
+
+
+def hold_analysis_failure(state, exc):
+    """Retain sanitized evidence and stop deterministic failures, not HTTP errors."""
+    if not isinstance(exc, TopicValidationError) and not getattr(exc, 'validation_held', False):
+        return False
+    state.update(stage='awaiting_topic_map_review', retryable=False,
+                 rebuild_in_progress=False, error_type=type(exc).__name__,
+                 error='Source-map validation requires explicit review',
+                 analysis_validation_hold={'analysis_id': getattr(exc, 'analysis_id', None),
+                                           'diagnostics': exc.diagnostics})
+    return True
 
 
 def retry_failed(map_id):
@@ -182,14 +229,81 @@ def normalize_transcript(segments):
     return result
 
 
+def construct_topic_ranges(response, count):
+    """Derive inclusive ends from verified semantic starts, never repair references.
+
+    Topics arrive in depth-first semantic order. Siblings partition the rest of
+    their parent's interval; roots partition the entire source. Nested moment
+    ranges remain provider references and still pass the existing local checks.
+    """
+    provenance = response.get('provenance') or {}
+    items = response.get('topics')
+    def invalid(reason, position=None, value=None):
+        raise TopicValidationError(reason, provenance, topic_position=position,
+                                   reference=_reference_diagnostic(value), segment_count=count,
+                                   allowed_min=0, allowed_max=count-1)
+    if response.get('range_contract') != TOPIC_RECIPE or not isinstance(items, list) or not items:
+        invalid('Invalid semantic boundary contract')
+    groups, seen, stack = {}, {}, []
+    topics = []
+    for position, item in enumerate(items):
+        if not isinstance(item, dict):
+            invalid('Semantic boundary must be an object', position, item)
+        first, key, parent = item.get('first_segment'), item.get('key'), item.get('parent_key')
+        if type(first) is not int or not 0 <= first < count:
+            invalid('Semantic boundary is outside verified transcript', position, first)
+        if 'last_segment' in item:
+            invalid('Provider end indices are not permitted in boundary contract', position, item['last_segment'])
+        if not isinstance(key, str) or not key or key in seen or not isinstance(item.get('title'), str) or not item['title'].strip():
+            invalid('Semantic boundary needs unique key and title', position)
+        if parent is not None and (not isinstance(parent, str) or parent not in seen or parent not in stack):
+            invalid('Semantic hierarchy must follow depth-first parent order', position)
+        while stack and stack[-1] != parent:
+            stack.pop()
+        siblings = groups.setdefault(parent, [])
+        if siblings and first <= siblings[-1]['first_segment']:
+            invalid('Semantic sibling boundaries must be strictly increasing', position, first)
+        if parent is not None and first < seen[parent]['first_segment']:
+            invalid('Semantic child starts before parent', position, first)
+        copied = dict(item)
+        topics.append(copied)
+        siblings.append(copied)
+        seen[key] = copied
+        stack.append(key)
+    if groups[None][0]['first_segment'] != 0:
+        invalid('Semantic chapters must begin at transcript index zero', 0, groups[None][0]['first_segment'])
+    # Iterative parent-first construction also supports deeply nested topics.
+    for item in topics:
+        siblings = groups[item.get('parent_key')]
+        index = siblings.index(item)
+        end = (siblings[index+1]['first_segment']-1 if index+1 < len(siblings)
+               else (seen[item['parent_key']]['last_segment'] if item.get('parent_key') else count-1))
+        parent_end = seen[item['parent_key']]['last_segment'] if item.get('parent_key') else count-1
+        if not item['first_segment'] <= end <= parent_end:
+            invalid('Semantic child boundary is outside parent', topics.index(item), item['first_segment'])
+        item['last_segment'] = end
+    return {**response, 'topics': topics}
+
+
 def topic_map(source, segments, analyze):
     if source.get('brand_id') not in {'TCB', 'TDOG'} or not source.get('source_video_id'):
         raise ValueError('Source intelligence is limited to configured TCB/TDOG sources')
     timeline = normalize_transcript(segments)
     revision = identity(timeline)
     map_id = identity(VERSION, source['brand_id'], source['source_video_id'], revision)
+    # Keep successful legacy maps/identities. A reviewed new recipe has a separate
+    # failure budget, without deleting or reopening any prior failure evidence.
+    recipe = getattr(analyze, '__dict__', {}).get('analysis_recipe')
+    analysis_id = map_id + ':' + recipe if recipe else map_id
+    if recipe:
+        with database() as db:
+            legacy = db.execute('SELECT status FROM source_analyses WHERE analysis_id=?', (map_id,)).fetchone()
+            if legacy and legacy['status'] == 'PASSED':
+                analysis_id = map_id
     def build():
         response = analyze(timeline)
+        if recipe or response.get('range_contract') is not None:
+            response = construct_topic_ranges(response, len(timeline))
         topics = []
         covered = set()
         labels = set()
@@ -199,28 +313,31 @@ def topic_map(source, segments, analyze):
                 raise TopicReferenceError(position, first, last, len(timeline), response.get('provenance') or {})
             label = str(item.get('key') or '')
             if not label or label in labels or not str(item.get('title') or '').strip():
-                raise ValueError('Topic needs a unique key and semantic title')
+                raise TopicValidationError('Topic needs a unique key and semantic title', response.get('provenance'))
             labels.add(label)
             covered.update(range(first, last+1))
             topics.append({**item, 'topic_id': identity(map_id, first, last, label),
                            'start': timeline[first]['start'], 'end': timeline[last]['end'],
                            'transcript_ref': {'revision': revision, 'first_segment': first, 'last_segment': last}})
         if covered != set(range(len(timeline))):
-            raise ValueError('Topic map omitted part of the full source transcript')
+            raise TopicValidationError('Topic map omitted part of the full source transcript', response.get('provenance'))
         keys = {t['key']: t['topic_id'] for t in topics}
         for topic_position, topic in enumerate(topics):
             parent = topic.get('parent_key')
             if parent and (parent not in keys or parent == topic['key']):
-                raise ValueError('Invalid parent topic association')
+                raise TopicValidationError('Invalid parent topic association', response.get('provenance'))
             topic['parent_topic_id'] = keys.get(parent)
+            related = topic.get('related_keys', [])
+            if not isinstance(related, list) or any(not isinstance(k, str) or k not in keys or k == topic['key'] for k in related):
+                raise TopicValidationError('Invalid related topic association', response.get('provenance'))
             topic['related_topic_ids'] = [keys[k] for k in topic.get('related_keys', []) if k in keys and k != topic['key']]
             parent_item = next((t for t in topics if t['key']==parent),None)
             if parent_item and not parent_item['start']<=topic['start']<topic['end']<=parent_item['end']:
-                raise ValueError('Child topic is outside its parent')
+                raise TopicValidationError('Child topic is outside its parent', response.get('provenance'))
             chain={topic['key']}
             while parent:
                 if parent in chain:
-                    raise ValueError('Cyclic topic hierarchy')
+                    raise TopicValidationError('Cyclic topic hierarchy', response.get('provenance'))
                 chain.add(parent)
                 parent=next(t for t in topics if t['key']==parent).get('parent_key')
             for field in ('subtopics','questions_responses','memorable_moments'):
@@ -239,7 +356,8 @@ def topic_map(source, segments, analyze):
                             len(timeline), provenance)
         return {'map_id': map_id, 'source': source, 'transcript_revision': revision,
                 'analysis_version': VERSION, 'provenance': response.get('provenance', {}), 'topics': topics}
-    result = cached_analysis(map_id, build)
+    result = cached_analysis(analysis_id, build)
+    result = {**result, 'analysis_id': analysis_id}
     record('source', map_id, {k: v for k, v in result.items() if k != 'topics'})
     for topic in result['topics']:
         record('topic', topic['topic_id'], {**topic, 'map_id': map_id, **source, 'analysis_version': VERSION})
@@ -260,11 +378,12 @@ def topic_map_schema(segment_count):
                              'not offsets relative to the topic: topic.first_segment <= first_segment <= last_segment <= topic.last_segment.')
     moments = {'type': 'array', 'items': moment}
     topic = obj({'key': text, 'title': text, 'summary': text, 'tags': strings,
-                 'classification': text, 'first_segment': reference, 'last_segment': reference,
+                 'classification': text, 'first_segment': reference,
                  'parent_key': {'type': ['string', 'null']}, 'related_keys': strings,
                  'subtopics': moments, 'questions_responses': moments, 'memorable_moments': moments,
                  'short_potential': {'type': 'boolean'}, 'highlight_potential': {'type': 'boolean'}})
-    return obj({'topics': {'type': 'array', 'minItems': 1, 'items': topic}})
+    return obj({'range_contract': {'type':'string', 'enum':[TOPIC_RECIPE]},
+                'topics': {'type': 'array', 'minItems': 1, 'items': topic}})
 
 
 def model_topic_map(timeline):
@@ -272,13 +391,18 @@ def model_topic_map(timeline):
     prompt = ('Map the ENTIRE verified program into semantic chapters and conversational arcs, not time slices. '
               'Include minor transitions and unselected material so every transcript segment is covered. '
               'Do not invent speakers; use a supplied verified speaker only. Return JSON topics: '
-              '[{key,title,summary,tags,classification,first_segment,last_segment,parent_key,related_keys,'
+              '[{key,title,summary,tags,classification,first_segment,parent_key,related_keys,'
               'subtopics,questions_responses,memorable_moments,short_potential,highlight_potential}]. '
               'Moments and subtopics must reference segment indices. Distinguish complete explanations, '
               'stories, lessons, humor, surprises, subject changes and context. No fixed topic or clip count. '
               f'Use only integer index values from 0 through {len(timeline)-1}, inclusive, copied from each segment index field. '
-              'first_segment and last_segment are inclusive transcript indices, never seconds, strings or one-based positions. '
-              'Use first_segment <= last_segment. Cover all indices, including the beginning and ending. '
+              'References are global transcript indices, never seconds, strings or one-based positions. '
+              f'Return range_contract={TOPIC_RECIPE}. Choose actual semantic transitions throughout the ENTIRE source. '
+              'Return chapters and their children in depth-first order: parent before children, followed by the next sibling. '
+              'Sibling first_segment values must strictly increase. The first root chapter MUST start at index 0. '
+              'Do NOT return last_segment for topics. The application derives each inclusive end as the next sibling start minus one, '
+              'or its parent end (the final root ends at the final transcript segment). Children must start inside this derived parent. '
+              'Do not return to a parent after moving to its next sibling. Preserve meaningful hierarchy, not arbitrary slices. '
               'For EVERY subtopic, questions_responses item and memorable_moments item, check '
               'topic.first_segment <= item.first_segment <= item.last_segment <= topic.last_segment. '
               'Nested indices are GLOBAL transcript indices, never topic-relative offsets. '
@@ -294,10 +418,19 @@ def model_topic_map(timeline):
               'response_format': {'type': 'json_schema', 'json_schema': {'name': 'verified_source_topics',
                                   'strict': True, 'schema': topic_map_schema(len(timeline))}}}, timeout=(15, 600))
     response.raise_for_status()
-    result = json.loads(response.json()['choices'][0]['message']['content'])
-    result['provenance'] = {'provider': 'openai', 'model': model, 'evidence': 'full_verified_timed_transcript',
-        'prompt_version':'semantic-source-map-v3-nested-contract','prompt_sha256':hashlib.sha256(prompt.encode()).hexdigest()}
+    provenance = {'provider': 'openai', 'model': model, 'evidence': 'full_verified_timed_transcript',
+        'prompt_version':TOPIC_RECIPE,'prompt_sha256':hashlib.sha256(prompt.encode()).hexdigest()}
+    try:
+        result = json.loads(response.json()['choices'][0]['message']['content'])
+        if not isinstance(result, dict):
+            raise ValueError('Not a map object')
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise TopicValidationError('Invalid provider source-map response shape', provenance) from None
+    result['provenance'] = provenance
     return result
+
+
+model_topic_map.analysis_recipe = TOPIC_RECIPE
 
 
 def prompt_evidence(model, prompt, lane):
@@ -384,7 +517,7 @@ def record_edits(request_id,state,result,instruction,reviewer):
 
 def learning_context(source, lane, topics=()):
     with database() as db:
-        rows = db.execute("SELECT record_id,payload FROM intelligence_records WHERE kind='feedback' ORDER BY updated_at DESC LIMIT 1000").fetchall()
+        rows = db.execute("SELECT record_id,payload FROM intelligence_records WHERE kind='feedback' ORDER BY updated_at DESC,rowid DESC LIMIT 1000").fetchall()
         topic_rows = db.execute("SELECT record_id,payload FROM intelligence_records WHERE kind='topic'").fetchall()
     topic_tags={r['record_id']:set(str(v).casefold() for v in json.loads(r['payload']).get('tags') or []) for r in topic_rows}
     wanted=set(str(v).casefold() for t in topics for v in t.get('tags') or [])

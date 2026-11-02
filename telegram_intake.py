@@ -4012,11 +4012,21 @@ def _process(request_id: str) -> None:
             ).fetchone()
         latest_state = json.loads(latest_row["state_json"]) if latest_row else state
         if getattr(exc,'analysis_id',None):
-            latest_state['source_intelligence']={'map_id':exc.analysis_id.split(':')[0],'version':'source-intelligence-v1'}
+            latest_state['source_intelligence']={'map_id':exc.analysis_id.split(':')[0],
+                'analysis_id':exc.analysis_id,'version':'source-intelligence-v1'}
+        from production_intelligence import hold_analysis_failure
+        validation_held = hold_analysis_failure(latest_state, exc)
         candidates_exist = bool(
             (latest_state.get("result") or {}).get("segments")
         )
-        if candidates_exist:
+        if validation_held:
+            _save(request_id, 'awaiting_topic_map_review', latest_state)
+            failure_text = (
+                f'⏸ Source-map validation held\nJob ID: {request_id}\n'
+                'Sanitized diagnostics are saved. Explicit review and recovery authorization '
+                'are required; automatic retries are disabled. Existing work is preserved.'
+            )
+        elif candidates_exist:
             latest_state["notification_error"] = str(exc)
             latest_state["notification_retryable"] = True
             latest_state["stage"] = "awaiting_review"
@@ -4043,7 +4053,7 @@ def _process(request_id: str) -> None:
             )
         try:
             send(chat_id, failure_text)
-            if latest_state.get('source_intelligence') and row['mode']=='both' and latest_state.get('topic_source_segments'):
+            if not validation_held and latest_state.get('source_intelligence') and row['mode']=='both' and latest_state.get('topic_source_segments'):
                 send(chat_id,'The format analysis failure is preserved. You may retry it explicitly or continue to the independently saved 16:9 review; no clips are selected automatically.')
                 _send_short_confirmation(chat_id,request_id)
         except Exception:
@@ -6326,6 +6336,13 @@ def _resume_stale_jobs() -> int:
                     status,
                     stage,
                 )
+                continue
+
+            from production_intelligence import analysis_recovery_blocked
+            if analysis_recovery_blocked(state):
+                if video_id:
+                    seen_video_ids.add(video_id)
+                logger.info('RIPPED_JOB_WATCHDOG_SKIP_VALIDATION_HOLD request_id=%s', row['request_id'])
                 continue
 
             if video_id:

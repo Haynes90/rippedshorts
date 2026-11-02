@@ -70,7 +70,8 @@ def start(state, segments, video, short_prompt):
             return intelligence.candidate_records(mapping, '9:16', result, context)
         return intelligence.cached_analysis(mapping['map_id']+':9:16:'+intelligence.identity(main.OPENAI_MODEL,prompt), analyze)
     futures = intelligence.parallel_analyses(short, lambda: analyze_highlights(mapping, segments, video))
-    state['source_intelligence'] = {'map_id': mapping['map_id'], 'version': intelligence.VERSION}
+    state['source_intelligence'] = {'map_id': mapping['map_id'], 'analysis_id': mapping['analysis_id'],
+                                  'version': intelligence.VERSION}
     # The independent highlight result is in SQLite, never merged over live review state.
     return futures['9:16'], mapping
 

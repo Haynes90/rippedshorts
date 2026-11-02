@@ -51,7 +51,9 @@ def test_provider_contract_uses_actual_zero_based_inclusive_range(monkeypatch):
     assert payload['model'] == 'gpt-5-mini'
     assert 'GLOBAL inclusive transcript indices' in topic['properties']['subtopics']['items']['description']
     assert 'topic.first_segment <= item.first_segment <= item.last_segment <= topic.last_segment' in payload['messages'][1]['content']
-    assert result['provenance']['prompt_version'] == 'semantic-source-map-v3-nested-contract'
+    assert 'last_segment' not in topic['properties']  # ends are derived, not generated
+    assert 'strictly increase' in payload['messages'][1]['content']
+    assert result['provenance']['prompt_version'] == pi.TOPIC_RECIPE
 
 
 def test_strict_schema_does_not_replace_full_source_coverage_check(tmp_path, monkeypatch):
