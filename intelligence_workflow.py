@@ -31,7 +31,7 @@ def analyze_highlights(mapping, segments, video):
     specification=highlight_framework()
     brand_context = ('TDOG: practical gardening explanations, host/guest discussions, stories and memorable exchanges.' if mapping['source'].get('show_id')=='TDOG' else 'TCB: insightful, useful, funny or memorable source-show discussions with attribution context.')
     prompt = specification+'\nCURRENT OWNER WORKFLOW: Analyze both formats concurrently; only presentation and approval wait for Shorts confirmation. Retain all editorial and timing requirements from the specification.\nSHARED FULL-SOURCE TOPIC MAP:\n'+intelligence.encoded(mapping)+intelligence.learning_prompt(context)
-    prompt += '\nSHOW CONTEXT: '+brand_context+'\nDiscover valuable tangents and unusual moments throughout the source, including outside major topics. Never force a quota.'
+    prompt += '\nSHOW CONTEXT: '+brand_context+'\nDiscover valuable tangents and unusual moments throughout the source, including outside major topics. Never force a quota. Select focused topic arcs (for example a substantive seed-saving technique), not entire chapters by default. Preserve complete conversational context and the established minimum 180 seconds; no arbitrary maximum.'
     def analyze():
         suggestions = tg._topic_break_suggestions(segments, intelligence_context=prompt)
         topics = tg._preflight_candidates(video, tg._build_contiguous_topic_segments(segments, suggestions))
@@ -54,6 +54,7 @@ def start(state, segments, video, short_prompt):
     mapping = prepare(state, segments)
     context = intelligence.learning_context(mapping['source'], '9:16', mapping['topics'])
     prompt = short_prompt+'\nSHARED FULL-SOURCE TOPIC MAP:\n'+intelligence.encoded(mapping)+intelligence.learning_prompt(context)
+    prompt += '\nSENTENCE-LEVEL CLIP FARMING: Examine the full transcript for strong individual explanations, funny exchanges, useful statements and complete question-answer moments. Expand verified boundaries for complete thoughts, setup, context and payoff. Sentence punctuation alone is not acoustic evidence. Do not constrain clips to chapter/topic boundaries or force quotas; returning topics and cross-topic exchanges are eligible. Preserve the approved rubric and speech-boundary validation.'
     def short():
         def analyze():
             # Existing semantic and exact transcript-boundary validation is retained.

@@ -9,9 +9,10 @@ import os
 
 import production_intelligence as pi
 
-VERSION = 'hierarchical-source-v2'
+VERSION = 'hierarchical-source-v3'
 LEGACY_VERSION = 'hierarchical-source-v1'
-STAGE_VERSIONS = {'conversations':'conversation-boundaries-v2',
+STAGE_VERSIONS = {'topics':'chronological-topics-v2',
+                  'conversations':'conversation-boundaries-v2',
                   'relationships':'conversation-relationships-v1'}
 
 
@@ -78,6 +79,45 @@ def obj(properties):
     return {'type':'object', 'properties':properties, 'required':list(properties), 'additionalProperties':False}
 
 
+def chronological_topics(value, count, bounds):
+    """Validate temporal spans first, thematic edges second; never repair a key.
+
+    A topic belongs to its verified conversation, not another temporal topic.
+    Returning subjects and complete Q&A exchanges get their own chronological
+    spans. Supplementary related_keys may point backward or forward.
+    """
+    items=value.get('topics')
+    provenance=value.get('provenance') or {}
+    def reject(kind, position, reference, keys):
+        node=items[position]
+        raise pi.TopicValidationError('Invalid chronological topic reference',provenance,
+            failure_kind=kind,topic_position=position,
+            topic_key=safe_reference(node.get('key')),
+            rejected_reference=safe_reference(reference),reference_type=type(reference).__name__,
+            valid_reference_count=len(keys),valid_reference_digest=pi.identity(sorted(keys)),
+            topic_schema={'version':stage_version('topics'),'parent':'verified_conversation',
+                          'thematic_links':'related_keys','forward_links':True})
+    if isinstance(items,list):
+        for position,node in enumerate(items):
+            if isinstance(node,dict) and node.get('parent_key') is not None:
+                reject('TEMPORAL_PARENT_NOT_ALLOWED',position,node['parent_key'],set())
+    # Null parents make the existing strict start/end constructor a chronological
+    # partition. The unchanged legacy constructor still validates old checkpoints.
+    result=pi.construct_topic_ranges(value,count,*bounds)
+    keys={node['key'] for node in result['topics']}
+    for position,node in enumerate(result['topics']):
+        links=node.get('related_keys',[])
+        if not isinstance(links,list):reject('LINK_COLLECTION_TYPE',position,links,keys)
+        seen=set()
+        for target in links:
+            if type(target) is not str:reject('REFERENCE_TYPE',position,target,keys)
+            if target not in keys:reject('UNKNOWN_TARGET',position,target,keys)
+            if target==node['key']:reject('SELF_REFERENCE',position,target,keys)
+            if target in seen:reject('DUPLICATE_LINK',position,target,keys)
+            seen.add(target)
+    return result
+
+
 TEXT = {'type':'string'}
 STRINGS = {'type':'array', 'items':TEXT}
 
@@ -104,6 +144,8 @@ def schema(stage, count, bounds, context=None):
     if stage=='conversations':
         del topic['properties']['related_keys']
         topic['required'].remove('related_keys')
+    if stage=='topics':
+        topic['properties']['parent_key']={'type':'null'}
     return obj({'range_contract':{'type':'string','enum':[pi.TOPIC_RECIPE]},
                 'topics':{'type':'array','minItems':1,'items':topic}})
 
@@ -133,7 +175,11 @@ def instructions(stage, bounds):
            'All parent_key values must be null. Associate themes via tags.' if stage=='conversations' else
            'Examine ONLY this verified parent conversation to identify topics and meaningful subtopics, '
            'questions/answers, explanations, advice, stories, disagreements and supporting context. '
-           'Preserve depth-first hierarchy; parent before child, never return to a closed parent.')
+           'Discover topics and meaningful exchanges CHRONOLOGICALLY first. A complete question and answer '
+           'can be its own focused topic. Returning subjects are separate chronological occurrences. '
+           'All parent_key values MUST be null: the verified conversation is their temporal parent. '
+           'After identifying ALL topic keys, group them thematically via related_keys; forward and backward '
+           'links are allowed, but no unknown keys, self-links or duplicate links. Do not impose a depth-first tree.')
     return common + aim + (f' Return range_contract={pi.TOPIC_RECIPE}. Choose strictly increasing semantic '
         f'sibling START indices within {bounds[0]}..{bounds[1]}. First root starts at {bounds[0]}. '
         'No last_segment field. The application derives ends from next sibling start minus one, or parent end. '
@@ -175,6 +221,14 @@ def analyze(timeline, source, generate=None):
         inputs = {'source':source,'bounds':bounds,'context':context,'transcript_revision':pi.identity(transcript)}
         recipe=stage_version(stage)
         key = root+':'+recipe+':'+stage+':'+pi.identity(inputs,os.getenv('OPENAI_MODEL','gpt-4o-mini'))
+        if stage=='topics':
+            # Only PASSED exact-input legacy results are reusable. Never reopen a
+            # held legacy failure or relabel it as a success under the new recipe.
+            legacy_key=root+':'+LEGACY_VERSION+':'+stage+':'+pi.identity(inputs,os.getenv('OPENAI_MODEL','gpt-4o-mini'))
+            with pi.database() as db:
+                legacy=db.execute('SELECT status FROM source_analyses WHERE analysis_id=?',(legacy_key,)).fetchone()
+            if legacy and legacy['status']=='PASSED':
+                key,recipe=legacy_key,LEGACY_VERSION
         def run():
             provenance = {}
             try:
@@ -199,7 +253,8 @@ def analyze(timeline, source, generate=None):
                         if any(not isinstance(moment.get(f),str) or not moment[f].strip() for f in ('title','summary','category')):
                             raise pi.TopicValidationError('Incomplete interesting moment evidence',provenance,item_position=position)
                 else:
-                    value=pi.construct_topic_ranges(value,count,*bounds)
+                    value=(chronological_topics(value,count,bounds) if stage=='topics'
+                           else pi.construct_topic_ranges(value,count,*bounds))
                     keys={t['key'] for t in value['topics']}
                     for position,topic in enumerate(value['topics']):
                         if stage=='conversations' and topic.get('parent_key') is not None:
