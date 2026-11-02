@@ -23,11 +23,14 @@ def topic(key,start,parent=None):
 
 
 def generate(stage,transcript,context,bounds,count):
-    provenance={'prompt_version':hi.VERSION+':'+stage,'prompt_sha256':'tested-prompt-hash'}
+    provenance={'prompt_version':hi.stage_version(stage)+':'+stage,'prompt_sha256':'tested-prompt-hash'}
     if stage=='episode':
         return {**{k:'Seed saving, advice and audience questions' for k in
                 ('title','summary','beginning','middle','ending','discussion_flow')},'themes':['seed saving'],'provenance':provenance}
-    if stage=='conversations':topics=[topic('seed discussion',0),topic('audience questions',8)]
+    if stage=='relationships':return {'relationships':[],'provenance':provenance}
+    if stage=='conversations':
+        topics=[topic('seed discussion',0),topic('audience questions',8)]
+        for item in topics:item.pop('related_keys')
     elif stage=='topics':topics=[topic('introduction',bounds[0]),topic('practical advice',bounds[0]+2),topic('supporting context',bounds[0]+2,'practical advice')]
     else:return {'moments':[{'title':'Humorous transition','summary':'Complete exchange across chapters',
                     'category':'humor','first_segment':7,'last_segment':9}],'provenance':provenance}
@@ -37,7 +40,7 @@ def generate(stage,transcript,context,bounds,count):
 def test_full_top_down_understanding_hierarchy_and_transition_moments(isolated):
     calls=Mock(side_effect=generate)
     result=hi.analyze(TIMELINE,SOURCE,calls)
-    assert [c.args[0] for c in calls.call_args_list]==['episode','conversations','topics','topics','moments']
+    assert [c.args[0] for c in calls.call_args_list]==['episode','conversations','relationships','topics','topics','moments']
     assert len(calls.call_args_list[0].args[1])==len(calls.call_args_list[1].args[1])==len(calls.call_args_list[-1].args[1])==12
     children=[c for c in calls.call_args_list if c.args[0]=='topics']
     assert [s['index'] for s in children[1].args[1]]==[8,9,10,11]  # GLOBAL indices retained
@@ -47,7 +50,7 @@ def test_full_top_down_understanding_hierarchy_and_transition_moments(isolated):
     assert moment['first_segment']==7 and moment['last_segment']==9
     assert 'conversation:seed discussion' in moment['topic_keys'] and 'conversation:audience questions' in moment['topic_keys']
     assert result['episode']['themes']==['seed saving']
-    assert len(result['stage_evidence'])==5
+    assert len(result['stage_evidence'])==6
     assert hi.analyze(TIMELINE,SOURCE,Mock(side_effect=AssertionError('duplicate provider call')))==result
 
 
@@ -94,7 +97,7 @@ def test_successful_children_survive_one_explicit_failed_child_reopen(isolated):
     calls=Mock(side_effect=generate)
     result=hi.analyze(TIMELINE,SOURCE,calls)
     assert [c.args[0] for c in calls.call_args_list]==['topics','moments']
-    assert result['topics'] and len(result['stage_evidence'])==5
+    assert result['topics'] and len(result['stage_evidence'])==6
 
 
 def test_outer_map_retains_child_failure_classification_and_watchdog_hold(isolated,monkeypatch):
@@ -122,7 +125,7 @@ def test_compiled_map_and_moments_reach_existing_candidate_provenance(isolated,m
         context={'examples':[{'evidence_id':'scoped-owner-feedback'}],'confidence':0.5}
         pi.candidate_records(result,lane,clips,context)
         evidence=clips['segments'][0]['selection_provenance']
-        assert len(evidence['hierarchy_stage_ids'])==5
+        assert len(evidence['hierarchy_stage_ids'])==6
         assert evidence['learning_scope']=={'brand_id':'TDOG','show_id':'TDOG','format':lane}
         assert evidence['learning_evidence_ids']==['scoped-owner-feedback']
 

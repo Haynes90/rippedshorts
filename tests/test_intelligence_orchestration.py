@@ -21,6 +21,7 @@ def integrated(tmp_path,monkeypatch):
         if stage=='episode':
             return {**{k:'Complete gardening episode' for k in ('title','summary','beginning','middle','ending','discussion_flow')},'themes':['gardening']}
         if stage=='moments':return {'moments':[]}
+        if stage=='relationships':return {'relationships':[]}
         return {'range_contract':pi.TOPIC_RECIPE,'topics':[{'key':'one','title':'Complete discussion',
                 'first_segment':bounds[0],'parent_key':None,'tags':['gardening']}]}
     monkeypatch.setattr(hierarchy,'provider',generate)
@@ -45,14 +46,14 @@ def test_actual_selector_orchestration_is_parallel_but_does_not_select_for_owner
     short_started,long_started=Event(),Event()
     def short(*args):
         short_started.set();assert long_started.wait(2)
-        assert 'existing rubric' in args[1] and 'hierarchical-source-v1' in args[1]
+        assert 'existing rubric' in args[1] and 'hierarchical-source-v2' in args[1]
         assert 'Practical owner preference' in args[1] and 'sheets_projection_verified":true' in args[1]
         return {'segments':[{'start':0.,'end':30.,'score':80,'category':'education','transcript':'A whole thought.'}]}
     def long(*args,**kwargs):
         long_started.set();assert short_started.wait(2)
         assert 'SHARED FULL-SOURCE TOPIC MAP' in kwargs['intelligence_context']
         assert 'APPROVED HIGHLIGHT CONTRACT' in kwargs['intelligence_context']
-        assert 'hierarchical-source-v1' in kwargs['intelligence_context']
+        assert 'hierarchical-source-v2' in kwargs['intelligence_context']
         assert 'Practical owner preference' in kwargs['intelligence_context']
         return [{'start':0.,'end':240.,'score':85,'highlight_type':'discussion'}]
     short_mock=Mock(side_effect=short);long_mock=Mock(side_effect=long)
