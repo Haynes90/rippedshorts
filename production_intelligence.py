@@ -132,6 +132,7 @@ def cached_analysis(key, analyze, wait_seconds=1250):
                 failure.validation_held = bool(saved.get('validation_failure'))
                 if failure.validation_held:
                     failure.diagnostics = saved['validation_failure']
+                failure.operational_failure=saved.get('operational_failure')
                 raise failure
             if not row or (row['lease_until'] or 0) < time.time():
                 db.execute('INSERT INTO source_analyses VALUES(?,?,?,?,?,?) ON CONFLICT(analysis_id) DO UPDATE SET status=excluded.status,owner=excluded.owner,lease_until=excluded.lease_until,error=NULL',
@@ -152,6 +153,12 @@ def cached_analysis(key, analyze, wait_seconds=1250):
         with database() as db:
             # Type only: provider error bodies may contain credentials or source text.
             diagnostic = encoded({'validation_failure': exc.diagnostics}) if isinstance(exc, TopicValidationError) or getattr(exc, 'validation_held', False) else None
+            import requests
+            if isinstance(exc,requests.RequestException):
+                status=getattr(getattr(exc,'response',None),'status_code',None)
+                exc.operational_failure={'category':'AUTHENTICATION_FAILED' if status in (401,403) else 'PROVIDER_UNAVAILABLE',
+                                         'http_status':status,'error_type':type(exc).__name__}
+                diagnostic=encoded({'operational_failure':exc.operational_failure})
             db.execute('UPDATE source_analyses SET status=?,error=?,result=?,lease_until=NULL WHERE analysis_id=? AND owner=?', ('FAILED', type(exc).__name__, diagnostic, key, owner))
             db.execute('INSERT OR IGNORE INTO analysis_failures VALUES(?,?,?,?)',(key,owner,type(exc).__name__,datetime.now(timezone.utc).isoformat()))
         raise
@@ -320,7 +327,7 @@ def topic_map(source, segments, analyze):
             topics.append({**item, 'topic_id': identity(map_id, first, last, label),
                            'start': timeline[first]['start'], 'end': timeline[last]['end'],
                            'transcript_ref': {'revision': revision, 'first_segment': first, 'last_segment': last}})
-        if covered != set(range(len(timeline))):
+        if covered != set(range(len(timeline))) and not (response.get('analysis_path')=='transcript-direct' and not topics):
             raise TopicValidationError('Topic map omitted part of the full source transcript', response.get('provenance'))
         keys = {t['key']: t['topic_id'] for t in topics}
         for topic_position, topic in enumerate(topics):
@@ -358,7 +365,7 @@ def topic_map(source, segments, analyze):
         result = {'map_id': map_id, 'source': source, 'transcript_revision': revision,
                 'analysis_version': response.get('provenance', {}).get('analysis_version', VERSION),
                 'provenance': response.get('provenance', {}), 'topics': topics}
-        for field in ('episode', 'episode_moments', 'stage_evidence'):
+        for field in ('episode', 'episode_moments', 'stage_evidence', 'analysis_path', 'metadata_failures', 'discovery_windows'):
             if field in response:
                 result[field] = response[field]
         return result
@@ -450,6 +457,8 @@ def candidate_records(mapping, lane, result, context):
         associated = [t['topic_id'] for t in mapping['topics'] if candidate['start'] < t['end'] and candidate['end'] > t['start']]
         candidate.update(candidate_id=candidate_id, topic_ids=associated, map_id=mapping['map_id'])
         candidate['topic_titles'] = [t.get('title') for t in mapping['topics'] if t['topic_id'] in associated and t.get('title')]
+        candidate['subject_description']=(candidate.get('title') or candidate.get('topic') or
+            next(iter(candidate['topic_titles']),None) or candidate.get('reason') or candidate.get('transcript'))
         candidate['selection_provenance'] = {**(result.get('selection_provenance') or {}), **(candidate.get('selection_provenance') or {}),
             'map_id':mapping['map_id'], 'map_analysis_version':mapping.get('analysis_version'),
             'topic_map_revision':identity(mapping['topics']),
@@ -459,9 +468,13 @@ def candidate_records(mapping, lane, result, context):
             'learning_scope':{'brand_id':mapping['source']['brand_id'],'show_id':mapping['source'].get('show_id'),'format':lane},
             'learning_input_revision':identity(context),
             'learning_confidence':context.get('confidence'), 'topic_ids':associated}
+        candidate['selection_provenance']['analysis_path']=mapping.get('analysis_path','full-hierarchy')
+        candidate['selection_provenance']['metadata_failure_ids']=[f['analysis_id'] for f in mapping.get('metadata_failures',[])]
+        candidate['selection_provenance']['discovery_windows_revision']=identity(mapping.get('discovery_windows',[]))
         record('candidate', candidate_id, {'candidate_id': candidate_id, 'map_id': mapping['map_id'],
             **mapping['source'], 'format': lane, 'ai_rank': candidate.get('original_ai_rank',rank), 'ai_score': candidate.get('score') if candidate.get('ai_score_available',True) else None,
             'start': candidate['start'], 'end': candidate['end'], 'category': candidate.get('category') or candidate.get('highlight_type'),
+            'subject_description':candidate['subject_description'], 'transcript_excerpt':candidate.get('transcript'),
             'topic_ids': associated, 'reason': candidate.get('reason'), 'learning_evidence': context,
             'selection_provenance':candidate['selection_provenance'],
             'transcript_ref': {'revision': mapping['transcript_revision'], 'start': candidate['start'], 'end': candidate['end']}})

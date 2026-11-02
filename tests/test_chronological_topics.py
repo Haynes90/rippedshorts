@@ -93,9 +93,9 @@ def test_recovery_reuses_exact_legacy_passes_without_reopening_legacy_failure(is
     result=hi.analyze(TIMELINE,SOURCE,calls)
     assert [c.args[0] for c in calls.call_args_list]==['topics','moments']
     assert calls.call_args_list[0].args[3]==(8,11)
-    assert len(result['stage_evidence'])==6
+    assert len(result['stage_evidence'])==7  # legacy accepted topics need no new link checkpoint
     assert ':hierarchical-source-v1:topics:' in result['stage_evidence'][3]['analysis_id']
-    assert ':chronological-topics-v2:topics:' in result['stage_evidence'][4]['analysis_id']
+    assert ':chronological-spans-v3:topics:' in result['stage_evidence'][4]['analysis_id']
     with pi.database() as db:
         after={r['analysis_id']:dict(r) for r in db.execute('select * from source_analyses')}
     assert all(after[key]==row for key,row in before.items())
@@ -168,15 +168,15 @@ def test_complete_conversational_path_reaches_both_real_selectors_and_learning(i
     assert highlights['segments'][0]['duration']>=180
     assert not shorts['validation_rejections']
     assert mapping['episode_moments'][0]['first_segment']==5
-    assert len(mapping['stage_evidence'])==6
+    assert len(mapping['stage_evidence'])==8
     for lane,result in [('9:16',shorts),('16:9',highlights)]:
-        assert 'hierarchical-source-v3' in captured[lane]
+        assert 'hierarchical-source-v4' in captured[lane]
         assert 'returning-storage' in captured[lane] and 'Seed dinner joke' in captured[lane]
         assert 'Keep the complete useful answer and payoff.' in captured[lane]
         candidate=result['segments'][0]
         assert candidate['learning_influence']['score_adjustment']>0
         assert candidate['selection_provenance']['learning_evidence_ids']==['past-review-'+lane]
-        assert len(candidate['selection_provenance']['hierarchy_stage_ids'])==6
+        assert len(candidate['selection_provenance']['hierarchy_stage_ids'])==8
         assert candidate['candidate_id'] and candidate['topic_ids']
     assert 'SENTENCE-LEVEL CLIP FARMING' in captured['9:16']
     assert 'focused topic arcs' in captured['16:9']

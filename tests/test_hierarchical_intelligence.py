@@ -50,7 +50,7 @@ def test_full_top_down_understanding_hierarchy_and_transition_moments(isolated):
     assert moment['first_segment']==7 and moment['last_segment']==9
     assert 'conversation:seed discussion' in moment['topic_keys'] and 'conversation:audience questions' in moment['topic_keys']
     assert result['episode']['themes']==['seed saving']
-    assert len(result['stage_evidence'])==6
+    assert len(result['stage_evidence'])==8
     assert hi.analyze(TIMELINE,SOURCE,Mock(side_effect=AssertionError('duplicate provider call')))==result
 
 
@@ -74,7 +74,7 @@ def test_failure_is_durable_sanitized_and_completed_stages_never_repeat(isolated
         diagnostic=json.loads(failed[0]['result'])['validation_failure']
         assert diagnostic['stage']==bad_stage and diagnostic['stage_analysis_id']
         assert 'private invalid reference' not in failed[0]['result'] and 'Private transcript' not in failed[0]['result']
-        assert len([r for r in rows if r['status']=='PASSED'])==count-1
+        assert len([r for r in rows if r['status']=='PASSED'])==count-1+(2 if bad_stage=='moments' else 0)
 
 
 def test_child_outside_parent_and_missing_conversation_beginning_fail(isolated):
@@ -97,22 +97,24 @@ def test_successful_children_survive_one_explicit_failed_child_reopen(isolated):
     calls=Mock(side_effect=generate)
     result=hi.analyze(TIMELINE,SOURCE,calls)
     assert [c.args[0] for c in calls.call_args_list]==['topics','moments']
-    assert result['topics'] and len(result['stage_evidence'])==6
+    assert result['topics'] and len(result['stage_evidence'])==8
 
 
-def test_outer_map_retains_child_failure_classification_and_watchdog_hold(isolated,monkeypatch):
+def test_outer_map_retains_optional_failure_but_can_continue_without_moments(isolated,monkeypatch):
     def bad(stage,*args):
         value=generate(stage,*args)
         if stage=='moments':value['moments'][0]['last_segment']=99
         return value
     monkeypatch.setattr(hi,'provider',bad)
     segments=[{k:v for k,v in s.items() if k!='index'} for s in TIMELINE]
-    for _ in range(2):
-        with pytest.raises(ValueError) as failure:hi.mapping(SOURCE,segments)
-        state={}
-        assert pi.hold_analysis_failure(state,failure.value)
-        assert state['analysis_validation_hold']['diagnostics']['stage']=='moments'
-        assert pi.analysis_recovery_blocked(state)
+    first=hi.mapping(SOURCE,segments)
+    assert first['analysis_path']=='topics-only' and first['episode_moments']==[]
+    assert first['metadata_failures'][0]['diagnostics']['stage']=='moments'
+    assert hi.mapping(SOURCE,segments)==first
+    with pi.database() as db:
+        saved=json.loads(db.execute("select result from source_analyses where status='FAILED'").fetchone()[0])
+    assert saved['validation_failure']['stage']=='moments'
+    assert pi.analysis_recovery_blocked({'analysis_validation_hold':saved['validation_failure']})
 
 
 def test_compiled_map_and_moments_reach_existing_candidate_provenance(isolated,monkeypatch):
@@ -125,7 +127,7 @@ def test_compiled_map_and_moments_reach_existing_candidate_provenance(isolated,m
         context={'examples':[{'evidence_id':'scoped-owner-feedback'}],'confidence':0.5}
         pi.candidate_records(result,lane,clips,context)
         evidence=clips['segments'][0]['selection_provenance']
-        assert len(evidence['hierarchy_stage_ids'])==6
+        assert len(evidence['hierarchy_stage_ids'])==8
         assert evidence['learning_scope']=={'brand_id':'TDOG','show_id':'TDOG','format':lane}
         assert evidence['learning_evidence_ids']==['scoped-owner-feedback']
 
