@@ -46,14 +46,16 @@ def test_actual_selector_orchestration_is_parallel_but_does_not_select_for_owner
     short_started,long_started=Event(),Event()
     def short(*args):
         short_started.set();assert long_started.wait(2)
-        assert 'existing rubric' in args[1] and 'hierarchical-source-v2' in args[1]
+        assert 'existing rubric' in args[1] and 'hierarchical-source-v3' in args[1]
+        assert 'SENTENCE-LEVEL CLIP FARMING' in args[1] and 'setup, context and payoff' in args[1]
         assert 'Practical owner preference' in args[1] and 'sheets_projection_verified":true' in args[1]
         return {'segments':[{'start':0.,'end':30.,'score':80,'category':'education','transcript':'A whole thought.'}]}
     def long(*args,**kwargs):
         long_started.set();assert short_started.wait(2)
         assert 'SHARED FULL-SOURCE TOPIC MAP' in kwargs['intelligence_context']
         assert 'APPROVED HIGHLIGHT CONTRACT' in kwargs['intelligence_context']
-        assert 'hierarchical-source-v2' in kwargs['intelligence_context']
+        assert 'hierarchical-source-v3' in kwargs['intelligence_context']
+        assert 'focused topic arcs' in kwargs['intelligence_context'] and 'minimum 180 seconds' in kwargs['intelligence_context']
         assert 'Practical owner preference' in kwargs['intelligence_context']
         return [{'start':0.,'end':240.,'score':85,'highlight_type':'discussion'}]
     short_mock=Mock(side_effect=short);long_mock=Mock(side_effect=long)

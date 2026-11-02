@@ -31,7 +31,7 @@ def generate(stage,transcript,context,bounds,count):
     if stage=='conversations':
         topics=[topic('seed discussion',0),topic('audience questions',8)]
         for item in topics:item.pop('related_keys')
-    elif stage=='topics':topics=[topic('introduction',bounds[0]),topic('practical advice',bounds[0]+2),topic('supporting context',bounds[0]+2,'practical advice')]
+    elif stage=='topics':topics=[topic('introduction',bounds[0]),topic('practical advice',bounds[0]+2),topic('supporting context',bounds[0]+3)]
     else:return {'moments':[{'title':'Humorous transition','summary':'Complete exchange across chapters',
                     'category':'humor','first_segment':7,'last_segment':9}],'provenance':provenance}
     return {'range_contract':pi.TOPIC_RECIPE,'topics':topics,'provenance':provenance}
