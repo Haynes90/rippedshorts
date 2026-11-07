@@ -60,7 +60,13 @@ def start(state, segments, video, short_prompt):
             # Existing semantic and exact transcript-boundary validation is retained.
             from selection_specs import selector_result
             from source_ingestion import select_non_overlapping
-            result = tg.validate_complete_candidates(selector_result(main.call_openai_for_clips(segments, prompt)), segments)
+            try:
+                response=main.call_openai_for_clips(segments, prompt)
+            except RuntimeError as exc:
+                if str(exc).startswith('OpenAI response was not valid JSON:'):
+                    raise ValueError('Shorts response failed JSON validation') from None
+                raise  # authentication/provider failures must not be disguised as editorial rejection
+            result = tg.validate_complete_candidates(selector_result(response), segments, maximum=None)
             result['selection_provenance'] = intelligence.prompt_evidence(main.OPENAI_MODEL, main.openai_clip_prompt(segments,prompt), '9:16')
             result['selection_provenance']['specification_sha256'] = __import__('hashlib').sha256(short_prompt.encode()).hexdigest()
             live = getattr(tg,'_SHORT_FRAMEWORK_LIVE_CACHE','')
@@ -76,6 +82,25 @@ def start(state, segments, video, short_prompt):
                                   'version': intelligence.VERSION}
     # The independent highlight result is in SQLite, never merged over live review state.
     return futures['9:16'], mapping
+
+
+def shorts_for_review(state, future, segments, video):
+    """Expose a valid sibling without retrying or approving a rejected format."""
+    try:
+        return future.result()
+    except ValueError as exc:
+        if (getattr(exc,'operational_failure',None) or {}).get('category')=='AUTHENTICATION_FAILED':
+            raise
+        if ':9:16:' not in str(getattr(exc,'analysis_id','')):
+            raise
+        highlights=prepared_highlights(state,segments,video)
+        if not highlights.get('segments'):
+            raise exc
+        state['topic_result']=highlights
+        state['format_failures']={**state.get('format_failures',{}),'9:16':{
+            'analysis_id':exc.analysis_id,'category':'FORMAT_VALIDATION_FAILED',
+            'status':'held','retry_requires_owner':True}}
+        return {'segments':[], 'format_failure':state['format_failures']['9:16']}
 
 
 def prepared_highlights(state, segments, video):

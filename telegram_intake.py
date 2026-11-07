@@ -2178,7 +2178,7 @@ def _sentence_complete_candidate(
 
 
 def validate_complete_candidates(
-    payload: dict, transcript_segments: list[dict], tolerance: float = 0.75
+    payload: dict, transcript_segments: list[dict], tolerance: float = 0.75, maximum: int | None = 20
 ) -> dict:
     """Reject invented text and enforce complete sentence/thought boundaries."""
     boundaries = []
@@ -2253,7 +2253,7 @@ def validate_complete_candidates(
             )
     return {
         **payload,
-        "segments": valid[:20],
+        "segments": valid if maximum is None else valid[:maximum],
         "validation_rejections": rejected,
     }
 
@@ -2962,6 +2962,11 @@ def _send_candidates(
 ) -> None:
     """Create one persistent control card and one reusable 9:16 review page."""
     clips = result.get("segments", [])
+    if not clips and result.get('format_failure'):
+        send(chat_id, 'Shorts analysis is held. Independently prepared highlights remain available; no clips were approved.')
+        _send_short_confirmation(chat_id, request_id)
+        __import__('review_navigation').notify_safely(request_id, 'highlights')
+        return
     if not clips:
         send(
             chat_id,
@@ -3936,13 +3941,13 @@ def _process(request_id: str) -> None:
             if str(text or "").strip()
         ]
         if str(state.get("show_id") or "").upper() in {"TCB", "TDOG"}:
-            from intelligence_workflow import start
+            from intelligence_workflow import start, shorts_for_review
             short_future, mapping = start(state, enriched, video, "\n\n".join(prompt_layers))
             _save(request_id, "selecting", {**state, "stage":"parallel_format_analysis"})
-            result = short_future.result()
+            result = shorts_for_review(state, short_future, enriched, video)
         else:
             result = main.call_openai_for_clips(enriched, "\n\n".join(prompt_layers))
-        result = validate_complete_candidates(result, enriched)
+        result = validate_complete_candidates(result, enriched, maximum=None if state.get('source_intelligence') else 20)
         excluded_history = (
             [item for item in prior_shorts if item.get("decision") == "rejected"]
             if force_rerip

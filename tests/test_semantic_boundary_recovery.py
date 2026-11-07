@@ -247,7 +247,10 @@ def test_provider_timeout_is_operational_not_semantic_validation(db,monkeypatch)
                'analysis_id':failure.value.analysis_id}})
     with pi.database() as conn:
         row=conn.execute('select * from source_analyses').fetchone()
-        assert row['result'] is None and row['error']=='Timeout'
+    assert row['error']=='Timeout'
+    saved=json.loads(row['result'])
+    assert saved['operational_failure']['category']=='PROVIDER_UNAVAILABLE'
+    assert 'validation_failure' not in saved  # timeout is operational, never semantic evidence
 
 
 def test_provider_cannot_omit_contract_and_fall_back_to_independent_ranges(db,monkeypatch):

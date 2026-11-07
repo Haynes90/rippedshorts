@@ -9,9 +9,9 @@ import os
 
 import production_intelligence as pi
 
-VERSION = 'hierarchical-source-v3'
+VERSION = 'hierarchical-source-v4'
 LEGACY_VERSION = 'hierarchical-source-v1'
-STAGE_VERSIONS = {'topics':'chronological-topics-v2',
+STAGE_VERSIONS = {'topics':'chronological-spans-v3', 'topic_links':'topic-links-v1',
                   'conversations':'conversation-boundaries-v2',
                   'relationships':'conversation-relationships-v1'}
 
@@ -79,7 +79,7 @@ def obj(properties):
     return {'type':'object', 'properties':properties, 'required':list(properties), 'additionalProperties':False}
 
 
-def chronological_topics(value, count, bounds):
+def chronological_topics(value, count, bounds, validate_links=True):
     """Validate temporal spans first, thematic edges second; never repair a key.
 
     A topic belongs to its verified conversation, not another temporal topic.
@@ -104,6 +104,24 @@ def chronological_topics(value, count, bounds):
     # Null parents make the existing strict start/end constructor a chronological
     # partition. The unchanged legacy constructor still validates old checkpoints.
     result=pi.construct_topic_ranges(value,count,*bounds)
+    if not validate_links:
+        # Keep the proposed links privately in the same durable result, but
+        # explicitly OUTSIDE the accepted temporal topics. Never label them valid.
+        accepted=[]; issues=[]
+        for position,t in enumerate(result['topics']):
+            node={k:v for k,v in t.items() if k!='related_keys'}
+            for field in ('tags','classification','short_potential','highlight_potential'):
+                if field not in node:continue
+                v=node[field]
+                valid=(isinstance(v,list) and all(type(x) is str for x in v) if field=='tags'
+                       else type(v) is str if field=='classification' else type(v) is bool)
+                if not valid:
+                    issues.append({'topic_position':position,'field':field,'reference':safe_reference(v),
+                                   'failure_kind':'OPTIONAL_CLASSIFICATION_TYPE'})
+                    node.pop(field)  # explicitly rejected optional field, not a repaired value
+            accepted.append(node)
+        return {**result,'topics':accepted,'optional_metadata_failures':issues,
+                'unverified_relationships':[{'key':t['key'],'related_keys':t.get('related_keys',[])} for t in result['topics']]}
     keys={node['key'] for node in result['topics']}
     for position,node in enumerate(result['topics']):
         links=node.get('related_keys',[])
@@ -116,6 +134,31 @@ def chronological_topics(value, count, bounds):
             if target in seen:reject('DUPLICATE_LINK',position,target,keys)
             seen.add(target)
     return result
+
+
+def topic_relationships(value):
+    """Local, independently cached validation; zero additional model calls."""
+    topics=value['topics']; proposed=value.get('unverified_relationships',[])
+    by_key={t['key']:t for t in topics}
+    joined={**value,'topics':[{**t,'related_keys':next((r['related_keys'] for r in proposed if r['key']==t['key']),[])} for t in topics]}
+    # Reuse the precise type/unknown/self/duplicate diagnostic contract without
+    # reconstructing or editing accepted boundaries.
+    keys=set(by_key)
+    for position,t in enumerate(joined['topics']):
+        links=t['related_keys']; seen=set()
+        def reject(kind,target):
+            raise pi.TopicValidationError('Invalid supplementary topic relationship',value.get('provenance'),
+                failure_kind=kind,topic_position=position,topic_key=safe_reference(t['key']),
+                rejected_reference=safe_reference(target),reference_type=type(target).__name__,
+                valid_reference_count=len(keys),valid_reference_digest=pi.identity(sorted(keys)))
+        if not isinstance(links,list):reject('LINK_COLLECTION_TYPE',links)
+        for target in links:
+            if type(target) is not str:reject('REFERENCE_TYPE',target)
+            if target not in keys:reject('UNKNOWN_TARGET',target)
+            if target==t['key']:reject('SELF_REFERENCE',target)
+            if target in seen:reject('DUPLICATE_LINK',target)
+            seen.add(target)
+    return {'relationships':proposed,'provenance':value.get('provenance',{})}
 
 
 TEXT = {'type':'string'}
@@ -210,7 +253,7 @@ def provider(stage, timeline, context, bounds, total_count):
     return {**value,'provenance':provenance}
 
 
-def analyze(timeline, source, generate=None):
+def analyze(timeline, source, generate=None, allow_fallback=False):
     """Return the existing topic-map contract plus independently cached evidence."""
     generate = generate or provider
     root = pi.identity(pi.VERSION,source['brand_id'],source['source_video_id'],pi.identity(timeline))
@@ -224,15 +267,18 @@ def analyze(timeline, source, generate=None):
         if stage=='topics':
             # Only PASSED exact-input legacy results are reusable. Never reopen a
             # held legacy failure or relabel it as a success under the new recipe.
-            legacy_key=root+':'+LEGACY_VERSION+':'+stage+':'+pi.identity(inputs,os.getenv('OPENAI_MODEL','gpt-4o-mini'))
-            with pi.database() as db:
-                legacy=db.execute('SELECT status FROM source_analyses WHERE analysis_id=?',(legacy_key,)).fetchone()
-            if legacy and legacy['status']=='PASSED':
-                key,recipe=legacy_key,LEGACY_VERSION
+            for prior_recipe in (LEGACY_VERSION,'chronological-topics-v2'):
+                legacy_key=root+':'+prior_recipe+':'+stage+':'+pi.identity(inputs,os.getenv('OPENAI_MODEL','gpt-4o-mini'))
+                with pi.database() as db:
+                    legacy=db.execute('SELECT status FROM source_analyses WHERE analysis_id=?',(legacy_key,)).fetchone()
+                if legacy and legacy['status']=='PASSED':
+                    key,recipe=legacy_key,prior_recipe
+                    break
         def run():
             provenance = {}
             try:
-                value = generate(stage,transcript,context,bounds,count)
+                value = (topic_relationships(context['accepted_topics']) if stage=='topic_links'
+                         else generate(stage,transcript,context,bounds,count))
                 provenance = value.get('provenance') or {}
                 if stage == 'episode':
                     for field in ('title','summary','beginning','middle','ending','discussion_flow'):
@@ -240,6 +286,8 @@ def analyze(timeline, source, generate=None):
                             raise pi.TopicValidationError('Incomplete episode understanding',provenance,field=field)
                     if not isinstance(value.get('themes'),list) or not value['themes'] or any(not isinstance(t,str) or not t.strip() for t in value['themes']):
                         raise pi.TopicValidationError('Invalid episode themes',provenance)
+                elif stage == 'topic_links':
+                    pass  # local validator above; no provider call or boundary mutation
                 elif stage == 'relationships':
                     value=validate_relationships(value,context['verified_conversations'])
                 elif stage == 'moments':
@@ -253,7 +301,7 @@ def analyze(timeline, source, generate=None):
                         if any(not isinstance(moment.get(f),str) or not moment[f].strip() for f in ('title','summary','category')):
                             raise pi.TopicValidationError('Incomplete interesting moment evidence',provenance,item_position=position)
                 else:
-                    value=(chronological_topics(value,count,bounds) if stage=='topics'
+                    value=(chronological_topics(value,count,bounds,validate_links=recipe in (LEGACY_VERSION,'chronological-topics-v2')) if stage=='topics'
                            else pi.construct_topic_ranges(value,count,*bounds))
                     keys={t['key'] for t in value['topics']}
                     for position,topic in enumerate(value['topics']):
@@ -275,15 +323,37 @@ def analyze(timeline, source, generate=None):
         evidence.append({'stage':stage,'analysis_id':key,'input_revision':pi.identity(inputs),
                          'bounds':list(bounds),'provenance':value.get('provenance',{})})
         return value
-    episode=checkpoint('episode',timeline,{'source':source},(0,count-1))
-    conversations=checkpoint('conversations',timeline,{'source':source,'episode':episode},(0,count-1))
+    failures=[]
+    def optional(stage, transcript, context, bounds):
+        try:
+            return checkpoint(stage,transcript,context,bounds)
+        except Exception as exc:
+            # Only known content-validation failures are optional. Authentication,
+            # storage, source integrity and unexpected software faults still stop.
+            operational=getattr(exc,'operational_failure',None) or {}
+            if not allow_fallback or not (isinstance(exc,pi.TopicValidationError) or getattr(exc,'validation_held',False)
+                                         or operational.get('category')=='PROVIDER_UNAVAILABLE'):
+                raise
+            failure={'stage':stage,'analysis_id':getattr(exc,'analysis_id',None),
+                     'bounds':list(bounds),'diagnostics':getattr(exc,'diagnostics',None) or operational}
+            failures.append(failure)
+            return None
+    episode=optional('episode',timeline,{'source':source},(0,count-1))
+    conversations=optional('conversations',timeline,{'source':source,'episode':episode},(0,count-1)) if episode else None
+    if not conversations:
+        return {'topics':[],'episode':episode,'episode_moments':[], 'stage_evidence':evidence,
+                'analysis_path':'transcript-direct','metadata_failures':failures,
+                'discovery_windows':discovery_windows(timeline),
+                'provenance':{'analysis_version':VERSION,'prompt_version':VERSION}}
     verified=[{**topic,'position':position,'conversation_id':conversation_id(root,position,topic)}
               for position,topic in enumerate(conversations['topics'])]
-    relationships=checkpoint('relationships',[],{'source':source,'episode':episode,
+    relationships=optional('relationships',[],{'source':source,'episode':episode,
                              'verified_conversations':verified},(0,count-1))
     by_id={item['conversation_id']:item['key'] for item in verified}
-    links={item['conversation_id']:item['related_ids'] for item in relationships['relationships']}
+    links={item['conversation_id']:item['related_ids'] for item in relationships['relationships']} if relationships else {}
     topics=[]
+    detailed_complete=True
+    links_complete=relationships is not None
     for node in verified:
         conversation={k:v for k,v in node.items() if k not in {'position','conversation_id'}}
         conversation['related_keys']=[by_id[target] for target in links.get(node['conversation_id'],[])]
@@ -292,20 +362,60 @@ def analyze(timeline, source, generate=None):
         topics.append({**conversation,'key':parent_key,'classification':'conversation',
                        'related_keys':['conversation:'+k for k in conversation.get('related_keys',[])]})
         a,b=conversation['first_segment'],conversation['last_segment']
-        child=checkpoint('topics',timeline[a:b+1],{'source':source,'episode':episode,'conversation':conversation},(a,b))
+        child=optional('topics',timeline[a:b+1],{'source':source,'episode':episode,'conversation':conversation},(a,b))
+        if child is None:
+            detailed_complete=False
+            continue
+        for issue in child.get('optional_metadata_failures',[]):
+            failures.append({'stage':'classification','analysis_id':evidence[-1]['analysis_id'],
+                             'bounds':[a,b],'diagnostics':issue})
+            links_complete=False
+        if 'unverified_relationships' in child:
+            accepted=optional('topic_links',[],{'source':source,'accepted_topics':child},(a,b))
+            links_complete=links_complete and accepted is not None
+            accepted_links={r['key']:r['related_keys'] for r in accepted['relationships']} if accepted else {}
+            # Explicit topics-only view. Rejected links remain in their failed
+            # record and are never represented as verified associations.
+            child={**child,'topics':[{**t,'related_keys':accepted_links.get(t['key'],[])} for t in child['topics']]}
         for item in child['topics']:
             topics.append({**item,'key':parent_key+':'+item['key'],
                 'parent_key':parent_key+':'+item['parent_key'] if item.get('parent_key') else parent_key,
                 'related_keys':[parent_key+':'+k for k in item.get('related_keys',[])]})
-    moments=checkpoint('moments',timeline,{'source':source,'episode':episode,'topics':topics},(0,count-1))
+    moments=optional('moments',timeline,{'source':source,'episode':episode,'topics':topics},(0,count-1))
+    moments_complete=moments is not None
+    moments=moments or {'moments':[]}
     for moment in moments['moments']:
         moment['topic_keys']=[t['key'] for t in topics if moment['first_segment']<=t['last_segment'] and moment['last_segment']>=t['first_segment']]
+    path=('conversations-only' if not detailed_complete else
+          'topics-only' if not links_complete or not moments_complete else 'full-hierarchy')
     return {'topics':topics,'episode':episode,'episode_moments':moments['moments'],'stage_evidence':evidence,
+            'analysis_path':path,'metadata_failures':failures,'discovery_windows':discovery_windows(timeline,conversations['topics']),
             'provenance':{'analysis_version':VERSION,'prompt_version':VERSION,'stage_ids':[e['analysis_id'] for e in evidence]}}
 
 
 def mapping(source, segments):
     def staged(timeline):
-        return analyze(timeline,source)
+        return analyze(timeline,source,allow_fallback=True)
     staged.analysis_recipe=VERSION
     return pi.topic_map(source,segments,staged)
+
+
+def discovery_windows(timeline, conversations=()):
+    """Original-index context hints, never proposed clip or acoustic boundaries.
+
+    Keep the entire episode as the coverage window. Verified conversations and
+    actual question/response cues add overlapping context; selectors still see
+    the full transcript and must choose/validate complete semantic clips.
+    """
+    windows=[{'first_segment':0,'last_segment':len(timeline)-1,'kind':'entire-episode'}]
+    windows.extend({'first_segment':max(0,t['first_segment']-2),
+                    'last_segment':min(len(timeline)-1,t['last_segment']+2),
+                    'kind':'verified-conversation-context'} for t in conversations)
+    for i,segment in enumerate(timeline):
+        if segment['text'].rstrip().endswith('?'):
+            end=i+1
+            while end<len(timeline)-1 and not timeline[end]['text'].rstrip().endswith(('.', '!', '?')):
+                end+=1
+            windows.append({'first_segment':max(0,i-2),'last_segment':min(len(timeline)-1,end+2),
+                            'kind':'question-response-context'})
+    return windows

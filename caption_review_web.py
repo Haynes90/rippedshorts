@@ -200,6 +200,9 @@ def _payload_for_session(token: str) -> dict[str, Any]:
         for number,clip in enumerate((state.get(key) or {}).get('segments') or [],1):
             review=(state.get(review_key) or {}).get(str(number-1)) or {}
             candidate_evidence.append({'format':lane,'number':number,'candidate_id':clip.get('candidate_id'),
+                'title':clip.get('subject_description') or clip.get('title') or next(iter(clip.get('topic_titles') or []),None),
+                'transcript':clip.get('transcript'),'reason':clip.get('reason') or clip.get('why_it_will_work'),
+                'selection_provenance':clip.get('selection_provenance') or {},
                 'review_status':review.get('status','pending'),'error':review.get('render_error'),
                 'diagnostics':review.get('render_diagnostics'), 'learning_influence':clip.get('learning_influence'),
                 'framing_plan':clip.get('framing_plan')})
