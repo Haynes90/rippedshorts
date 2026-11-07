@@ -53,7 +53,7 @@ validation-only external-network blocker:
 
 ```text
 python -m pytest -p validation_network tests -q -ra --tb=short
-601 passed, 0 failed, 2 skipped, 2 subtests passed (28.30 seconds)
+602 passed, 0 failed, 2 skipped, 2 subtests passed (28.46 seconds)
 ```
 
 The two local skips require FFmpeg/FFprobe on PATH. The GitHub stored-render job
@@ -64,6 +64,9 @@ Final stabilization also rejects an earlier queued approval as legacy restoratio
 evidence for the completed/held batch. Each restored entry requires its original
 rendered/failed attempt and owner receipt. An existing output URL with incomplete
 success proof is held for verification rather than rerendered.
+Selector caches precede display numbering. Restoration uses only the original
+asset number explicitly bound to the verified owner receipt after matching exact
+candidate identity and bounds; it rejects a contradictory cached number.
 
 Legacy text assertions requiring Sheets-based replacement and request redirection
 were replaced by executable exact-request/six-selection preservation checks. Bounded

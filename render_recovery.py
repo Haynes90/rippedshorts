@@ -310,6 +310,16 @@ def legacy_selection_receipt(request_id, ordered_evidence):
                 raise RenderReviewRequired('Approval format is invalid')
             key, reviews = LANES[lane]
             clip = deepcopy(matches[0]); index = len(rebuilt[key]['segments'])
+            if lane == 'short':
+                # Display numbers are assigned after selector caching. Recover only
+                # the number explicitly bound to this verified owner asset receipt.
+                prefix = request_id + ':short:'
+                number = identity.removeprefix(prefix)
+                if not identity.startswith(prefix) or not number.isdecimal() or int(number) < 1 or str(int(number)) != number:
+                    raise RenderReviewRequired('Approved asset identity is invalid')
+                if clip.get('candidate_number') not in (None, int(number)):
+                    raise RenderReviewRequired('Candidate number contradicts the original asset receipt')
+                clip['candidate_number'] = int(number)
             if asset_id(request_id, lane, clip, index) != identity:
                 raise RenderReviewRequired('Manifest order changes original asset identities')
             if review.get('status') == 'rendered':

@@ -325,6 +325,24 @@ def test_legacy_restoration_cannot_substitute_an_earlier_queued_approval_for_a_h
     assert batch['read']()==before
 
 
+def test_cache_before_display_numbering_uses_exact_owner_asset_receipt_not_list_position(batch):
+    entries=legacy_manifest(batch)
+    with recovery.evidence.database() as db:
+        cached=json.loads(db.execute("SELECT result FROM source_analyses WHERE analysis_id='cached-short'").fetchone()[0])
+        for c in cached['segments']:c.pop('candidate_number')
+        db.execute("UPDATE source_analyses SET result=? WHERE analysis_id='cached-short'",(json.dumps(cached),))
+    receipt=recovery.legacy_selection_receipt('current',entries)
+    with recovery.evidence.database() as db:
+        saved=recovery._get(db,receipt,'selected_batch')
+    assert [c['candidate_number'] for c in saved['collections']['result']['segments']]==[12,13,14,15]
+    assert batch['read']()['candidate_reviews']['1']['receipt']=='existing-success'
+    with recovery.evidence.database() as db:
+        cached['segments'][0]['candidate_number']=9
+        db.execute("UPDATE source_analyses SET result=? WHERE analysis_id='cached-short'",(json.dumps(cached),))
+    with pytest.raises(recovery.RenderReviewRequired,match='contradicts'):
+        recovery.legacy_selection_receipt('current',entries)
+
+
 @pytest.mark.parametrize('missing',['proof','status'])
 def test_existing_output_without_complete_success_proof_is_held_not_rerendered(batch,missing):
     state=batch['read']()
