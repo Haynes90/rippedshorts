@@ -436,7 +436,7 @@ class TelegramParsingTests(unittest.TestCase):
 
     def test_rapid_approvals_use_bounded_concurrent_render_pool(self):
         self.assertIn("RIPPED_SHORTS_RENDER_WORKERS", SOURCE)
-        self.assertIn("RENDER_EXECUTOR.submit(_render_approved", SOURCE)
+        self.assertIn("RENDER_EXECUTOR.submit(renderer, request_id, index, chat_id, render_ticket=ticket)", SOURCE)
         self.assertIn('"status": "queued"', SOURCE)
 
     def test_candidate_decisions_are_logged_without_user_scores(self):

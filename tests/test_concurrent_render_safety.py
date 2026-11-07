@@ -29,8 +29,8 @@ def test_selector_uses_quality_without_quota_and_collects_learning_metadata():
 def test_approvals_use_bounded_pool_and_are_idempotent():
     source = (ROOT / "telegram_intake.py").read_text()
     assert "RIPPED_SHORTS_RENDER_WORKERS" in source
-    assert "RENDER_EXECUTOR.submit(_render_approved" in source
-    assert 'existing_status in {"queued", "rendering", "rendered"}' in source
+    assert "RENDER_EXECUTOR.submit(renderer, request_id, index, chat_id, render_ticket=ticket)" in source
+    assert 'existing_status in {"queued", "rendering", "rendered", "render_failed"}' in source
     assert '"status": "rendering"' in source
 
 

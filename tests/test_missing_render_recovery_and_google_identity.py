@@ -1,20 +1,21 @@
 from pathlib import Path
+from test_request_scoped_render_recovery import batch
 
 INTAKE=(Path(__file__).resolve().parents[1]/"telegram_intake.py").read_text(encoding="utf-8")
 MAIN=(Path(__file__).resolve().parents[1]/"main.py").read_text(encoding="utf-8")
 
 
-def test_missing_approved_renders_can_be_requeued_from_sheet():
+def test_missing_render_action_uses_saved_request_selection():
     assert "def _queue_missing_approved_renders(" in INTAKE
-    assert "_approved_clip_history_from_sheet(video_id)" in INTAKE
     assert '"♻️ Retry Missing Renders"' in INTAKE
     assert 'r"/render-missing' in INTAKE
 
 
-def test_missing_render_recovery_uses_exact_approved_sheet_segments():
-    assert '"segments": missing' in INTAKE
-    assert '"recovered_from_sheet": True' in INTAKE
-    assert "RENDER_EXECUTOR.submit(_render_approved" in INTAKE
+def test_missing_render_recovery_retains_exact_approved_request_segments(batch):
+    before=batch['read']()
+    batch['tg']._queue_missing_approved_renders('current','chat')
+    assert batch['read']()==before
+    batch['tg']._approved_clip_history_from_sheet.assert_not_called()
 
 
 def test_google_service_account_identity_is_logged():
@@ -24,17 +25,21 @@ def test_google_service_account_identity_is_logged():
     assert "because GOOGLE_CREDENTIALS takes precedence" in MAIN
 
 
-def test_missing_render_recovery_redirects_old_cards_to_active_job():
-    assert "def _active_request_for_video(" in INTAKE
-    assert "RENDER_RECOVERY_REDIRECT" in INTAKE
-    assert "That review card belongs to an older job" in INTAKE
+def test_old_cards_cannot_redirect_retry_to_another_request(batch):
+    other=batch['read']('older')
+    result=batch['tg']._queue_missing_approved_renders('current','chat')
+    assert result['request_id']=='current' and batch['read']('older')==other
+    batch['tg']._active_request_for_video.assert_not_called()
 
 
-def test_render_recovery_checkpoints_durable_state():
-    assert '"stage": "render_recovery"' in INTAKE
-    assert '_save(request_id, "render_recovery", state)' in INTAKE
-    assert '_save(request_id, "awaiting_render_completion", state)' in INTAKE
-    assert "awaiting_render_retry" in INTAKE
+def test_render_recovery_checkpoints_selection_without_replacing_request(batch):
+    import render_recovery as recovery
+    before=batch['read']()
+    batch['tg']._queue_missing_approved_renders('current','chat')
+    with recovery.evidence.database() as db:
+        kinds={row['kind'] for row in db.execute('SELECT kind FROM intelligence_records')}
+    assert {'selected_batch','render_success','render_hold'} <= kinds
+    assert batch['read']()==before
 
 
 def test_watchdog_recovers_stuck_failed_approved_renders_once():

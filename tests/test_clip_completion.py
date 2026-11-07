@@ -173,3 +173,23 @@ def test_upload_is_blocked_on_verification_failure(name,aspect,tmp_path):
         if aspect=='16:9': env[name](segment,'test',tmp_path/'source',1,vid_title='test')
         else: env[name]({'segments':[segment]},'test',None,video_path_override=tmp_path/'source',vid_title='test')
     assert calls==[]
+
+
+@pytest.mark.parametrize('failure',['word_mismatch','speech_proximity'])
+def test_boundary_holds_preserve_specific_evidence_without_asserting_asr_is_acoustic_proof(monkeypatch,tmp_path,failure):
+    output=tmp_path/'held.mp4'
+    monkeypatch.setattr(c,'media_duration',lambda path:5 if path==output else 200)
+    monkeypatch.setattr(c,'review_thought',lambda *a:dict(complete_start=True,complete_end=True,complete_thought=True))
+    def heard(*args):
+        result=words('Different complete sentence.' if failure=='word_mismatch' else 'A complete sentence.',start=0,step=.6)
+        if failure=='speech_proximity':result[-1]['end']=5
+        return result
+    monkeypatch.setattr(c,'transcribe_window',heard)
+    with pytest.raises(c.CompletionReviewRequired) as raised:
+        c.render_complete_clip(Path('source'),{'start':10,'end':15,'transcript':'A complete sentence.'},
+                               output,lambda *a:output.write_bytes(b'isolated-export'),'9:16')
+    diag=raised.value.diagnostics
+    assert diag['stage']==('export_boundary_alignment' if failure=='word_mismatch' else 'export_speech_proximity')
+    assert diag['boundary_safety']==('UNCONFIRMED_ASR_ALIGNMENT' if failure=='word_mismatch' else 'REVIEW_REQUIRED')
+    assert diag['timing_basis']=='provider_word_timing'
+    assert not output.exists()  # failed exports remain unavailable for final approval/upload
