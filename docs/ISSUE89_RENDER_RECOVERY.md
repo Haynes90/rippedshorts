@@ -53,12 +53,17 @@ validation-only external-network blocker:
 
 ```text
 python -m pytest -p validation_network tests -q -ra --tb=short
-598 passed, 0 failed, 2 skipped, 2 subtests passed (27.61 seconds)
+601 passed, 0 failed, 2 skipped, 2 subtests passed (28.30 seconds)
 ```
 
 The two local skips require FFmpeg/FFprobe on PATH. The GitHub stored-render job
 installs these tools; its results must be checked at the PR head. Deprecation warnings
 are existing FastAPI/Starlette notices. This is not a claim of production recovery.
+
+Final stabilization also rejects an earlier queued approval as legacy restoration
+evidence for the completed/held batch. Each restored entry requires its original
+rendered/failed attempt and owner receipt. An existing output URL with incomplete
+success proof is held for verification rather than rerendered.
 
 Legacy text assertions requiring Sheets-based replacement and request redirection
 were replaced by executable exact-request/six-selection preservation checks. Bounded

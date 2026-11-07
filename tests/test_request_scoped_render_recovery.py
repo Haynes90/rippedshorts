@@ -312,6 +312,30 @@ def test_legacy_manifest_rejects_other_request_missing_approval_and_changed_boun
         recovery.legacy_selection_receipt('current',entries)
 
 
+def test_legacy_restoration_cannot_substitute_an_earlier_queued_approval_for_a_held_attempt(batch):
+    entries=legacy_manifest(batch)
+    with recovery.evidence.database() as db:
+        payload=recovery._get(db,entries[0]['feedback_id'],'feedback')
+        payload['review']={**payload['review'],'status':'queued'}
+        recovery._put(db,'feedback','earlier-approval',payload)
+    entries[0]['feedback_id']='earlier-approval'
+    before=batch['read']()
+    with pytest.raises(recovery.RenderReviewRequired,match='incomplete'):
+        recovery.legacy_selection_receipt('current',entries)
+    assert batch['read']()==before
+
+
+@pytest.mark.parametrize('missing',['proof','status'])
+def test_existing_output_without_complete_success_proof_is_held_not_rerendered(batch,missing):
+    state=batch['read']()
+    if missing=='proof':state['result']['segments'][1]['completion_check']={}
+    else:state['candidate_reviews']['1']['status']='render_failed'
+    batch['write'](state)
+    assert recovery.prepare_queue('current','short',1)[1]=='existing_media_requires_verification'
+    body=Mock();recovery.guarded_render('short')(body)('current',1,'chat')
+    body.assert_not_called();assert batch['read']()==state
+
+
 def test_restored_six_asset_review_http_playback_and_approval_controls(batch,monkeypatch):
     from fastapi import FastAPI,Response
     from fastapi.testclient import TestClient

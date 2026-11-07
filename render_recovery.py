@@ -159,6 +159,8 @@ def prepare_queue(request_id, lane, index):
             return None, 'already_rendered'
         if _get(db, result['action'] + ':success', 'render_success'):
             return None, 'successful_receipt_requires_reconciliation'
+        if review.get('status') == 'rendered' or review.get('clip_url') or review.get('segment_url'):
+            return None, 'existing_media_requires_verification'
         if _get(db, result['action'] + ':hold', 'render_hold'):
             return None, 'held_requires_review'
         if (review.get('status') == 'render_failed' and failure_kind(review) != 'FAILED_TRANSIENT_SOURCE_ACCESS'
@@ -294,7 +296,7 @@ def legacy_selection_receipt(request_id, ordered_evidence):
             if feedback.get('source_video_id') != (state.get('parsed') or {}).get('video_id'):
                 raise RenderReviewRequired('Approval source differs')
             review = feedback.get('review') or {}
-            if review.get('status') not in SELECTED or not review.get('user_id') or not review.get('reviewed_at'):
+            if review.get('status') not in {'rendered', 'render_failed'} or not review.get('user_id') or not review.get('reviewed_at'):
                 raise RenderReviewRequired('Original owner selection receipt is incomplete')
             row = db.execute('SELECT status,result FROM source_analyses WHERE analysis_id=?', (entry['analysis_id'],)).fetchone()
             if not row or row['status'] != 'PASSED':
