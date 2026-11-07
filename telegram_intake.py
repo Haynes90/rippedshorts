@@ -6169,6 +6169,7 @@ def _active_local_source_dirs() -> set[Path]:
                 protected.add(Path(video_path).resolve().parent)
     except Exception:
         logger.exception("RIPPED_STORAGE_ACTIVE_DIR_DISCOVERY_FAILED")
+        raise
     try:
         with _LOCK, connect() as db:
             source_rows = db.execute(
@@ -6179,6 +6180,7 @@ def _active_local_source_dirs() -> set[Path]:
                 protected.add((SOURCE_DIR / str(row["source_job_id"])).resolve())
     except Exception:
         logger.exception("RIPPED_STORAGE_SOURCE_JOB_DISCOVERY_FAILED")
+        raise
     return protected
 
 
@@ -6215,13 +6217,16 @@ def _purge_expired_local_artifacts(
         return 0
 
     protected_files = {DB_PATH.resolve()}
-    protected_dirs = _active_local_source_dirs() if emergency else set()
+    protected_dirs = _active_local_source_dirs()
+    protected_dirs.add((data_dir / "release-backups").resolve())
     candidates: list[Path] = []
     for path in data_dir.rglob("*"):
         try:
             if not path.is_file() or path.resolve() in protected_files:
                 continue
             if path.name in {DB_PATH.name + "-wal", DB_PATH.name + "-shm"}:
+                continue
+            if _path_is_under(path, protected_dirs):
                 continue
             old_enough = path.stat().st_mtime < cutoff
             emergency_reclaimable = emergency and not _path_is_under(path, protected_dirs)
@@ -6248,6 +6253,8 @@ def _purge_expired_local_artifacts(
 
     for path in sorted((p for p in data_dir.rglob("*") if p.is_dir()), reverse=True):
         try:
+            if _path_is_under(path, protected_dirs):
+                continue
             if path != data_dir and not any(path.iterdir()):
                 path.rmdir()
         except OSError:

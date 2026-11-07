@@ -4,6 +4,7 @@ on:
     paths:
       - 'clip_completion.py'
       - 'telegram_intake.py'
+      - 'tests/test_held_source_retention.py'
       - 'main.py'
       - 'production_intelligence.py'
       - 'intelligence_workflow.py'
@@ -41,5 +42,5 @@ jobs:
         env:
           DATA_DIR: ${{ runner.temp }}/topic-contract-data
           PYTHONPATH: .
-        run: python -m pytest tests/test_topic_map_reference_contract.py tests/test_semantic_boundary_recovery.py tests/test_production_intelligence.py tests/test_retry_loop_prevention.py tests/test_hierarchical_intelligence.py tests/test_conversation_relationships.py tests/test_chronological_topics.py tests/test_optional_intelligence_fallback.py -q
+        run: python -m pytest tests/test_topic_map_reference_contract.py tests/test_semantic_boundary_recovery.py tests/test_production_intelligence.py tests/test_retry_loop_prevention.py tests/test_hierarchical_intelligence.py tests/test_conversation_relationships.py tests/test_chronological_topics.py tests/test_optional_intelligence_fallback.py tests/test_held_source_retention.py -q
 
