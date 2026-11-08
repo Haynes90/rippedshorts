@@ -5232,6 +5232,14 @@ def _accept_update(
     return {"status": "accepted", "request_id": request_id}
 
 
+def _prepare_selected_boundary(request_id, identity, candidate, source, state, aspect, revisions):
+    """Existing explicit render only; source evidence precedes expensive exports."""
+    if str(state.get('show_id') or '').upper() not in {'TCB', 'TDOG'}:
+        return candidate
+    from boundary_specification import prepare_for_render
+    return prepare_for_render(request_id, identity, candidate, source, state, aspect, revisions)
+
+
 @guarded_render("highlight")
 def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
     phase = "source_access"
@@ -5267,6 +5275,9 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
         vid_title = _state_vid_title(state)
         import main
 
+        phase = "boundary_preflight"
+        prepared = _prepare_selected_boundary(request_id, current_asset_id(f'{request_id}:highlight:{index+1}'),
+                                              prepared, video, state, "16:9", review_revisions)
         phase = "render_export"
         rendered = main.attach_topic_segment_asset(
             prepared,
@@ -5404,6 +5415,9 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         payload_candidate["candidate_number"] = int(
             candidate.get("candidate_number") or index + 1
         )
+        phase = "boundary_preflight"
+        payload_candidate = _prepare_selected_boundary(request_id, identity, payload_candidate, video,
+                                                       state, "9:16", review_revisions)
         payload = {"segments": [payload_candidate]}
         phase = "render_export"
         rendered = main.attach_clip_assets(
