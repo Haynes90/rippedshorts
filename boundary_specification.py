@@ -258,7 +258,9 @@ def verify_export(source, output, start, end):
         expected, actual = pcm(source, start+position, length), pcm(output, position, length)
         count = min(len(expected), len(actual))
         if count < 400 or abs(len(expected)-len(actual)) > 16:
-            raise BoundaryReviewRequired("EXPORTED_AUDIO_INTERVAL_MISMATCH", edge=edge)
+            raise BoundaryReviewRequired("EXPORTED_AUDIO_INTERVAL_MISMATCH", edge=edge,
+                expected_samples=len(expected), actual_samples=len(actual), position=position,
+                sample_rate=8000)
         x,y = expected[:count],actual[:count]
         mx,my = sum(x)/count,sum(y)/count
         xx,yy = sum((v-mx)**2 for v in x),sum((v-my)**2 for v in y)

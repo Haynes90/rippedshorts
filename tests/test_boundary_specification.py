@@ -314,6 +314,9 @@ def test_persisted_contract_through_actual_ffmpeg_export_in_both_formats(passage
     width,height=(1080,1920) if aspect=="9:16" else (640,360)
     def renderer(video,start,duration,destination):
         subprocess.run([ffmpeg,"-v","error","-y","-ss",str(start),"-i",str(video),"-t",str(duration),"-vf",f"scale={width}:{height}","-r","25" if aspect=="9:16" else "5","-c:v","libx264","-preset","ultrafast","-c:a","aac","-b:a","192k",str(destination)],check=True)
-    result=speech.render_complete_clip(source,prepared,output,renderer,aspect)
+    try:
+        result=speech.render_complete_clip(source,prepared,output,renderer,aspect)
+    except boundary.BoundaryReviewRequired as exc:
+        pytest.fail(str(exc)+" "+json.dumps(exc.diagnostics))
     assert result["boundary_export_evidence"]["full_decode"] and result["completion_check"]["export_edges"]
     assert result["boundary_specification_id"]==prepared["boundary_specification_id"] and p["reviewer"].call_count==1
