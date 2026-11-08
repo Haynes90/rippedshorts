@@ -36,6 +36,7 @@ from clipmaster_review import (
     router as clipmaster_review_router,
 )
 from durable_jobs import durable_job
+from render_recovery import guarded_render, current_index, current_asset_id
 from workflow_reliability import (
     classify_error,
     latest_incomplete,
@@ -223,146 +224,40 @@ def _active_request_for_video(video_id: str, preferred_request_id: str = "") -> 
     return preferred_request_id, preferred
 
 
-def _queue_missing_approved_renders(request_id: str, chat_id: str) -> dict[str, Any]:
-    """Rebuild exact approved-but-unrendered Shorts from the Podcast sheet."""
-    with _LOCK, _telegram_db() as db:
-        row = db.execute(
-            "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
-        ).fetchone()
-    if not row:
-        return {"status": "not_found", "request_id": request_id}
-
-    original_request_id = request_id
-    state = json.loads(row["state_json"])
-    parsed = state.get("parsed") or {}
-    video_id = str(parsed.get("video_id") or "").strip()
-    if not video_id:
-        return {"status": "not_youtube", "request_id": request_id}
-
-    request_id, active_row = _active_request_for_video(video_id, request_id)
-    if active_row is not None:
-        row = active_row
-        state = json.loads(row["state_json"])
-        if request_id != original_request_id:
-            logger.info(
-                "RENDER_RECOVERY_REDIRECT old_request_id=%s active_request_id=%s video_id=%s",
-                original_request_id,
-                request_id,
-                video_id,
-            )
-            send(
-                chat_id,
-                "♻️ That review card belongs to an older job. "
-                "I found the current active job for this video and will recover "
-                "the missing approved renders there instead.",
-            )
-
-    approval_history = _approved_clip_history_from_sheet(video_id)
-    missing = list(approval_history.get("unfinished") or [])
-    if not missing:
-        send(
-            chat_id,
-            f"✅ No approved missing Shorts remain for YouTube ID {video_id}.",
-        )
-        return {
-            "status": "nothing_missing",
-            "request_id": request_id,
-            "video_id": video_id,
-        }
-
-    # Checkpoint recovery before any network/source work so Workflow Jobs no longer
-    # incorrectly reports this as waiting for human review.
-    state.update(
-        {
-            "stage": "render_recovery",
-            "rebuild_in_progress": False,
-            "render_recovery_in_progress": True,
-            "render_recovery_requested_at": now(),
-            "render_recovery_count": int(state.get("render_recovery_count") or 0) + 1,
-        }
-    )
-    state.pop("error", None)
-    state.pop("notification_error", None)
-    _save(request_id, "render_recovery", state)
-
+def _submit_render(lane: str, request_id: str, index: int, chat_id: str, *, render_ticket=None):
+    """Bind queued work to the current approved asset/revision before execution."""
+    from render_recovery import prepare_queue, RenderReviewRequired
     try:
-        source = _ensure_render_source(request_id, state)
-    except Exception as exc:
-        state.update(
-            {
-                "stage": "awaiting_render_retry",
-                "render_recovery_in_progress": False,
-                "render_recovery_error": str(exc),
-                "error": str(exc),
-            }
-        )
-        _save(request_id, "awaiting_render_retry", state)
-        logger.exception(
-            "RENDER_RECOVERY_SOURCE_FAILED request_id=%s video_id=%s",
-            request_id,
-            video_id,
-        )
-        send(
-            chat_id,
-            "⚠️ I recovered your approved clip decisions, but the full source "
-            "video still could not be restored. Nothing was discarded. "
-            "Use Retry Missing Renders after the source is available again.\n"
-            f"Job ID: {request_id}\n{str(exc)[:1200]}",
-        )
-        return {
-            "status": "source_recovery_failed",
-            "request_id": request_id,
-            "video_id": video_id,
-            "count": len(missing),
-        }
+        ticket, reason = prepare_queue(request_id, lane, index)
+    except RenderReviewRequired as exc:
+        return {"status": "held_requires_review", "reason": str(exc)}
+    if ticket is None:
+        return {"status": reason}
+    if render_ticket and any(ticket[k] != render_ticket[k] for k in ('asset_id','candidate_id','revision')):
+        return {"status": "held_revision_changed"}
+    renderer = _render_approved if lane == 'short' else _render_topic_approved
+    RENDER_EXECUTOR.submit(renderer, request_id, index, chat_id, render_ticket=ticket)
+    return {"status": "queued", "asset_id": ticket['asset_id'], "revision": ticket['revision']}
 
-    reviews = {
-        str(index): {
-            "status": "queued",
-            "reviewed_at": clip.get("_reviewed_at") or now(),
-            "user_id": clip.get("_reviewer_user_id", ""),
-            "recovered_from_sheet": True,
-            "retry_missing_render": True,
-        }
-        for index, clip in enumerate(missing)
-    }
-    recovered_result = {
-        "analysis": {
-            "content_type": "",
-            "main_theme": "",
-            "key_ideas": [],
-            "keywords": [],
-        },
-        "segments": missing,
-    }
-    state.update(
-        {
-            "stage": "awaiting_render_completion",
-            "rebuild_in_progress": False,
-            "render_recovery_in_progress": False,
-            "video_path": str(source),
-            "result": recovered_result,
-            "candidate_reviews": reviews,
-            "recovered_approvals_from_sheet": True,
-            "retry_missing_renders_at": now(),
-        }
-    )
-    state.pop("error", None)
-    state.pop("render_recovery_error", None)
-    _save(request_id, "awaiting_render_completion", state)
-    send(
-        chat_id,
-        f"♻️ Recovered {len(missing)} approved Short(s) that never finished rendering "
-        f"for YouTube ID {video_id}. Re-rendering those exact originals now.",
-    )
-    for index in range(len(missing)):
-        RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
-    return {
-        "status": "missing_renders_queued",
-        "request_id": request_id,
-        "video_id": video_id,
-        "count": len(missing),
-    }
+
+def _queue_missing_approved_renders(request_id: str, chat_id: str, *, asset_id=None, approved_revision=None) -> dict[str, Any]:
+    """Retry only this request's selected unfinished assets, never video history."""
+    from render_recovery import retry_plan, RenderReviewRequired
+    if bool(asset_id) != bool(approved_revision):
+        return {"status": "held_requires_review", "reason": "Asset and approved revision are required together"}
+    try:
+        planned, held = retry_plan(request_id, chat_id)
+    except RenderReviewRequired as exc:
+        send(chat_id, "⏸ Render retry held: " + str(exc) + ". Existing selections and media were preserved.")
+        return {"status": "held_requires_review", "request_id": request_id, "reason": str(exc)}
+    if asset_id:
+        planned = [item for item in planned if item['asset_id'] == asset_id and item['revision'] == approved_revision]
+    queued = [_submit_render(item['lane'], request_id, item['index'], chat_id, render_ticket=item) for item in planned]
+    count = sum(item['status'] == 'queued' for item in queued)
+    send(chat_id, f"♻️ Queued {count} eligible selected asset(s). Completed clips and validation holds were preserved.")
+    return {"status": "missing_renders_queued" if count else "nothing_eligible", "request_id": request_id,
+            "count": count, "assets": queued, "protected": held}
+
 
 
 
@@ -3783,7 +3678,7 @@ def _process(request_id: str) -> None:
                         f"for YouTube ID {video_id}. Rendering only those shorts now.",
                     )
                     for index in range(len(approved_clips)):
-                        RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
+                        _submit_render("short", request_id, index, chat_id)
                     _send_short_confirmation(chat_id, request_id)
                     return
                 if rendered_clips or reuse_existing:
@@ -4002,7 +3897,7 @@ def _process(request_id: str) -> None:
                 "short(s) while presenting additional shorts for review.",
             )
             for index in range(len(approved_clips)):
-                RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
+                _submit_render("short", request_id, index, chat_id)
         _send_candidates(
             chat_id, request_id, result, start_index=len(approved_clips)
         )
@@ -4985,7 +4880,7 @@ def _accept_update(
                 return {"status": "topic_not_found"}
             reviews = dict(state.get("topic_reviews") or {})
             existing = (reviews.get(str(index)) or {}).get("status")
-            if verb == "approve" and existing in {"queued", "rendering", "rendered"}:
+            if verb == "approve" and existing in {"queued", "rendering", "rendered", "render_failed"}:
                 return {
                     "status": f"already_{existing}",
                     "request_id": request_id,
@@ -5002,7 +4897,7 @@ def _accept_update(
                 (json.dumps(state), now(), request_id),
             )
         if verb == "approve":
-            RENDER_EXECUTOR.submit(_render_topic_approved, request_id, index, chat_id)
+            _submit_render("highlight", request_id, index, chat_id)
             _refresh_topic_review(chat_id, request_id, index=index)
             _send_short_confirmation(chat_id, request_id)
         else:
@@ -5029,7 +4924,7 @@ def _accept_update(
             state = json.loads(current["state_json"])
             reviews = dict(state.get("candidate_reviews") or {})
             existing_status = (reviews.get(str(index)) or {}).get("status")
-            if verb == "approve" and existing_status in {"queued", "rendering", "rendered"}:
+            if verb == "approve" and existing_status in {"queued", "rendering", "rendered", "render_failed"}:
                 return {
                     "status": f"already_{existing_status}",
                     "request_id": request_id,
@@ -5061,7 +4956,7 @@ def _accept_update(
                 user_id,
                 render_status="queued",
             )
-            RENDER_EXECUTOR.submit(_render_approved, request_id, index, chat_id)
+            _submit_render("short", request_id, index, chat_id)
             _refresh_short_review_message(chat_id, request_id)
             _send_short_confirmation(chat_id, request_id)
         else:
@@ -5229,6 +5124,8 @@ def _accept_update(
                 if lane == "short":
                     reviews = dict(result["state"].get("candidate_reviews") or {})
                     for index in range(len(result.get("after") or [])):
+                        if (reviews.get(str(index)) or {}).get("status") in {"queued", "rendering", "rendered", "render_failed"}:
+                            continue
                         reviews[str(index)] = {
                             "status": "queued",
                             "reviewed_at": now(),
@@ -5238,6 +5135,8 @@ def _accept_update(
                 elif lane == "topic":
                     reviews = dict(result["state"].get("topic_reviews") or {})
                     for index in range(len(result.get("after") or [])):
+                        if (reviews.get(str(index)) or {}).get("status") in {"queued", "rendering", "rendered", "render_failed"}:
+                            continue
                         reviews[str(index)] = {
                             "status": "queued",
                             "reviewed_at": now(),
@@ -5249,14 +5148,10 @@ def _accept_update(
             if result.get("action") == "approve_all":
                 if result.get("lane") == "short":
                     for index in range(len(result.get("after") or [])):
-                        RENDER_EXECUTOR.submit(
-                            _render_approved, row["request_id"], index, chat_id
-                        )
+                        _submit_render("short", row["request_id"], index, chat_id)
                 elif result.get("lane") == "topic":
                     for index in range(len(result.get("after") or [])):
-                        RENDER_EXECUTOR.submit(
-                            _render_topic_approved, row["request_id"], index, chat_id
-                        )
+                        _submit_render("highlight", row["request_id"], index, chat_id)
         send(chat_id, result["message"])
         return {
             "status": "quick_edit_applied" if result.get("changed") else "quick_edit_help",
@@ -5337,7 +5232,9 @@ def _accept_update(
     return {"status": "accepted", "request_id": request_id}
 
 
+@guarded_render("highlight")
 def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
+    phase = "source_access"
     try:
         with _LOCK, _telegram_db() as db:
             row = db.execute(
@@ -5346,6 +5243,9 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
             if not row:
                 raise RuntimeError(f"Ripped Shorts request not found: {request_id}")
             state = json.loads(row["state_json"])
+            index = current_index(state, "highlight", index)
+            if __import__('render_recovery')._successful(state['topic_result']['segments'][index], (state.get('topic_reviews') or {}).get(str(index), {})):
+                return
             reviews = dict(state.get("topic_reviews") or {})
             reviews[str(index)] = {
                 **reviews.get(str(index), {}),
@@ -5361,12 +5261,13 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
         _send_short_confirmation(chat_id, request_id)
         segment = state["topic_result"]["segments"][index]
         from clip_review_state import prepare_segment, preserve_selection
-        prepared, review_revisions = prepare_segment(request_id, f'{request_id}:highlight:{index+1}', segment)
+        prepared, review_revisions = prepare_segment(request_id, current_asset_id(f'{request_id}:highlight:{index+1}'), segment)
         video = _ensure_render_source(request_id, state)
         video_id = state["parsed"].get("video_id", request_id)
         vid_title = _state_vid_title(state)
         import main
 
+        phase = "render_export"
         rendered = main.attach_topic_segment_asset(
             prepared,
             video_id,
@@ -5379,6 +5280,7 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
                 "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
             ).fetchone()
             latest_state = json.loads(latest["state_json"])
+            index = current_index(latest_state, "highlight", index)
             reviews = dict(latest_state.get("topic_reviews") or {})
             latest_state["topic_result"]["segments"][index] = preserve_selection(segment, rendered) if review_revisions else rendered
             reviews[str(index)] = {
@@ -5409,11 +5311,16 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
                     "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
                 ).fetchone()
                 latest_state = json.loads(latest["state_json"])
+                index = current_index(latest_state, "highlight", index)
+                if __import__('render_recovery')._successful(latest_state['topic_result']['segments'][index], (latest_state.get('topic_reviews') or {}).get(str(index), {})):
+                    return  # A notification failure cannot invalidate a committed successful export.
                 reviews = dict(latest_state.get("topic_reviews") or {})
                 reviews[str(index)] = {
                     **reviews.get(str(index), {}),
                     "status": "render_failed",
                     "render_error": str(exc),
+                    "render_error_type": type(exc).__name__,
+                    "render_failure_phase": phase,
                     "render_diagnostics": getattr(exc, "diagnostics", {}),
                     "rendered_at": now(),
                 }
@@ -5431,8 +5338,11 @@ def _render_topic_approved(request_id: str, index: int, chat_id: str) -> None:
         _notify_render_queue_complete(request_id, chat_id)
 
 
+
+@guarded_render("short")
 def _render_approved(request_id: str, index: int, chat_id: str) -> None:
     user_id = ""
+    phase = "source_access"
     try:
         with _LOCK, _telegram_db() as db:
             row = db.execute(
@@ -5441,6 +5351,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         if not row:
             raise RuntimeError(f"Ripped Shorts request not found: {request_id}")
         state = json.loads(row["state_json"])
+        index = current_index(state, "short", index)
         result = state.get("result") or {}
         segments = result.get("segments") or []
         if state.get("rebuild_in_progress") or index >= len(segments):
@@ -5465,6 +5376,15 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         }
         state["candidate_reviews"] = reviews
         with _LOCK, _telegram_db() as db:
+            latest = db.execute('SELECT state_json FROM telegram_requests WHERE request_id=?', (request_id,)).fetchone()
+            state = json.loads(latest['state_json'])
+            index = current_index(state, "short", index)
+            candidate = state['result']['segments'][index]
+            reviews = dict(state.get('candidate_reviews') or {})
+            if __import__('render_recovery')._successful(candidate, reviews.get(str(index), {})):
+                return
+            reviews[str(index)] = {**reviews.get(str(index), {}), 'status':'rendering', 'render_started_at':now()}
+            state['candidate_reviews'] = reviews
             db.execute(
                 "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                 (json.dumps(state), now(), request_id),
@@ -5479,12 +5399,13 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
         import main
 
         from clip_review_state import prepare_segment, preserve_selection, verify_render_choice
-        identity = f'{request_id}:short:{int(candidate.get("candidate_number") or index+1)}'
+        identity = current_asset_id(f'{request_id}:short:{int(candidate.get("candidate_number") or index+1)}')
         payload_candidate, review_revisions = prepare_segment(request_id, identity, candidate)
         payload_candidate["candidate_number"] = int(
             candidate.get("candidate_number") or index + 1
         )
         payload = {"segments": [payload_candidate]}
+        phase = "render_export"
         rendered = main.attach_clip_assets(
             payload,
             state["parsed"].get("video_id", request_id),
@@ -5500,6 +5421,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
                 "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
             ).fetchone()
             latest_state = json.loads(latest["state_json"])
+            index = current_index(latest_state, "short", index)
             reviews = dict(latest_state.get("candidate_reviews") or {})
             latest_state["result"]["segments"][index] = preserve_selection(candidate, clip) if review_revisions else clip
             reviews[str(index)] = {
@@ -5547,11 +5469,16 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
                     "SELECT * FROM telegram_requests WHERE request_id=?", (request_id,)
                 ).fetchone()
                 latest_state = json.loads(latest["state_json"])
+                index = current_index(latest_state, "short", index)
+                if __import__('render_recovery')._successful(latest_state['result']['segments'][index], (latest_state.get('candidate_reviews') or {}).get(str(index), {})):
+                    return  # Preserve completed media when a later notification/projection fails.
                 reviews = dict(latest_state.get("candidate_reviews") or {})
                 reviews[str(index)] = {
                     **reviews.get(str(index), {}),
                     "status": "render_failed",
                     "render_error": str(exc),
+                    "render_error_type": type(exc).__name__,
+                    "render_failure_phase": phase,
                     "render_diagnostics": getattr(exc, "diagnostics", {}),
                     "rendered_at": now(),
                 }
@@ -5589,6 +5516,7 @@ def _render_approved(request_id: str, index: int, chat_id: str) -> None:
             f"{_render_progress_text(request_id)}",
         )
         _notify_render_queue_complete(request_id, chat_id)
+
 
 
 
@@ -6385,6 +6313,13 @@ def _resume_stale_jobs() -> int:
                 stale_minutes = 5 if (stage == "awaiting_review" and has_failed_approved_render) else 30
                 if now_value - updated.astimezone(timezone.utc) < timedelta(minutes=stale_minutes):
                     continue
+                from render_recovery import retry_plan, RenderReviewRequired
+                try:
+                    eligible, _ = retry_plan(row['request_id'], str(row['chat_id'] or ''))
+                except RenderReviewRequired:
+                    continue
+                if not eligible:
+                    continue  # Held/successful assets must not consume watchdog retry budgets.
                 attempts = int(state.get("watchdog_resume_count") or 0)
                 if attempts >= 3:
                     continue

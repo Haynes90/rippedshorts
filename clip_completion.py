@@ -315,9 +315,16 @@ def render_complete_clip(video, segment, output, renderer, aspect):
                     "expected_tokens":expected_tokens, "heard_tokens":edge,
                     "sample_start":sample_start,"sample_end":sample_end,
                     "timing_basis":"provider_segment_timing" if segment_timed else "provider_word_timing",
+                    "boundary_safety":"UNCONFIRMED_ASR_ALIGNMENT",
                     "action":"Review the source/export boundary; do not retry unchanged bounds blindly"})
             if not heard or (tail and not segment_timed and sample_end-heard[-1]["end"] < .08):
-                raise CompletionReviewRequired("Export ends too close to speech; adjust the approved boundary")
+                raise CompletionReviewRequired("Export ends too close to speech; adjust the approved boundary", diagnostics={
+                    "stage":"export_speech_proximity", "edge":"end" if tail else "start",
+                    "sample_start":sample_start, "sample_end":sample_end,
+                    "last_speech_end":heard[-1].get('end') if heard else None,
+                    "required_gap_seconds":.08, "boundary_safety":"REVIEW_REQUIRED",
+                    "timing_basis":"provider_segment_timing" if segment_timed else "provider_word_timing",
+                    "action":"Compare actual source/export audio and timing before changing approved bounds"})
         actual_duration = media_duration(output)
         if abs(actual_duration - (end - start)) > .25:
             raise CompletionReviewRequired("Export duration differs from selected bounds")
