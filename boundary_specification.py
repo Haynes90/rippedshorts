@@ -246,7 +246,11 @@ def verify_export(source, output, start, end):
     def pcm(path, position, duration):
         result = subprocess.run([os.getenv("FFMPEG_BINARY", "ffmpeg"), "-v", "error",
             "-ss", str(position), "-i", str(path), "-t", str(duration), "-vn",
-            "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"], capture_output=True, timeout=60)
+            # Respect the requested media timeline, including encoded start PTS.
+            # Raw PCM otherwise drops a leading timestamp gap on some builds.
+            # No lag search or time stretching: changed speech still fails correlation.
+            "-ac", "1", "-af", "aresample=8000:first_pts=0", "-ar", "8000",
+            "-f", "s16le", "pipe:1"], capture_output=True, timeout=60)
         if result.returncode:
             raise BoundaryReviewRequired("EXPORTED_AUDIO_UNREADABLE")
         samples = array("h"); samples.frombytes(result.stdout)
