@@ -46,6 +46,12 @@ workflow installs those tools. Tests use isolated SQLite/media and block externa
 operations; local HTTP integration tests run normally. Live media retention and
 website preview-before-selection acceptance remain unperformed.
 
+The first CI run exposed two previously observed optional-intelligence fixture
+races: background highlight futures could outlive a test's provider and database
+patches. The fixture now waits for its own futures at teardown, while retaining
+concurrent execution and every existing safety assertion. No application analysis
+code or production worker behavior was changed for this correction.
+
 ## Shortest remaining path
 
 1. Resolve PR91's real-speech acceptance and its conservative quiet-interval rule

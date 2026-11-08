@@ -16,6 +16,16 @@ def episode(isolated,monkeypatch):
     import main
     import telegram_intake as tg
     import selection_specs
+    # Preserve production concurrency, but keep workers inside the lifetime of
+    # this fixture's database and provider patches. Never leak into the next test.
+    from concurrent.futures import wait
+    original_parallel = pi.parallel_analyses
+    pending = []
+    def tracked_parallel(*args, **kwargs):
+        results = original_parallel(*args, **kwargs)
+        pending.extend(results.values())
+        return results
+    monkeypatch.setattr(pi, 'parallel_analyses', tracked_parallel)
     texts=[
         'Welcome to our seed saving discussion.', 'Which ripe tomatoes make good seed stock?',
         'Use healthy open-pollinated fruit.', 'How do you remove the gel coating?',
@@ -97,7 +107,9 @@ def episode(isolated,monkeypatch):
                   'format':lane,'decision':'approved','category':'education' if lane=='9:16' else 'explanation',
                   'feedback':'Preserve the whole answer and practical payoff.'})
     with pi.database() as db:db.execute("UPDATE intelligence_records SET synced_digest=digest WHERE kind='feedback'")
-    return state,segments,generator,transport,tg
+    yield state,segments,generator,transport,tg
+    _, unfinished = wait(pending, timeout=10)
+    assert not unfinished, 'Isolated analysis workers must finish before fixture teardown'
 
 
 @pytest.mark.parametrize('mode,path',[
