@@ -61,6 +61,7 @@ def previews(passage,monkeypatch):
 
 def test_playable_before_selection_then_reuse_after_caption_edit_and_new_connection(previews):
     p=previews
+    state=p['read']();state['result']['segments'][0].update(end=16.1,duration=6.1);p['write'](state)
     for lane in ('short','highlight'):recovery.generate_preview('request',lane,0,p['source'])
     assert not p['read']()['candidate_reviews'] and not p['read']()['topic_reviews']
     base='/api/ripped-shorts/review/'+p['token']

@@ -127,6 +127,8 @@ def prepare_for_render(request_id, identity, candidate, source, state, aspect, a
     if validation.get("source_id", source_id) != source_id:
         raise BoundaryReviewRequired("SOURCE_IDENTITY_INVALID")
     inputs = {k:candidate.get(k) for k in ("start","end","duration","framing_mode","transcript")}
+    if purpose == 'preview':
+        inputs['duration'] = float(candidate['end'])-float(candidate['start'])
     inputs.update(candidate_id=candidate.get("candidate_id") or identity, review_revisions=approved_revisions, source_sha256=source_sha)
     if digest(inputs) != selected["revision"] or selected["approval_revisions"] != approved_revisions:
         raise BoundaryReviewRequired("APPROVED_INPUT_DIFFERS")
