@@ -1,75 +1,27 @@
-# Preview-first prerequisite: retain verified revisions without duplicate uploads
-
-This dependent change closes one Drive-retention gap from the Pass B plan. It does
-not start preview jobs, expose a new review UI, migrate historical media or modify
-production records. It depends on PR91's persisted boundary specification.
+# Preview-to-website acceptance (PR92, depends on PR91)
 
 ## Implemented
 
-The existing uploader accepts verified clip evidence from both existing render
-adapters. Legacy calls retain their existing behavior. A specification-bound output
-must have exact request/asset identity, boundary fingerprint, bounds, completed
-media checks and a full-decode receipt before this retention path can run.
+New TCB/TDOG discovery can enter preview-first mode with RIPPED_PREVIEW_FIRST_ENABLED=true (default false). Existing selected/reviewed requests cannot be automatically migrated. No production setting was changed.
 
-Existing SQLite evidence records retain an immutable upload intent and success
-receipt. The upload key binds specification, source, asset and destination folder.
-Output SHA256/MD5/size are frozen; a different encoding for the same identity is
-held rather than uploaded as a duplicate. The Drive object carries a hashed
-appProperty for authoritative reconciliation. A successful receipt is read back
-against Drive size, checksum, folder, MIME type and correlation tag before reuse.
+The existing bounded render executor processes Shorts and highlights independently. Each candidate receives PR91's persisted source/transcript/revision-bound specification before rendering. A successful matching preview receipt bypasses provider, FFmpeg and upload work. A claimed but uncertain render is held; a verified export is retained before upload so a recoverable upload operation can reuse it. Existing Drive reconciliation checks checksum, size, folder and correlation tag and never blindly repeats an uncertain create.
 
-A lost API response or database-commit failure can reconcile the already-created
-object without another create. Multiple matches, changed/deleted media, absent
-checksums and uncertain empty listings hold for review. Concurrent callers cannot
-both claim creation. Read-only listing failures before creation begins are safe to
-retry; uncertainty after the creation intent cannot silently replay. No automatic
-deletion, public sharing, caption edit, owner approval, invitation or scheduling is
-performed. Individual render/upload failures retain the existing sibling isolation.
+Both existing render adapters consume exact saved timestamps. Export verification remains mandatory. Source acoustics are measured; verified word timing can support a fully captured passage without compulsory silence. The 100ms word-timing allowance is a conservative planning check, not proof of phoneme precision. Segment-only uncertain cuts remain held. No legacy endpoint edits are applied.
 
-This reuses an upload; it does not yet skip FFmpeg when a preview qualifies as final.
-Historical successful media is not migrated or reuploaded. In particular, an already
-completed protected asset continues through its existing success guard unchanged.
+The existing authenticated review website lists the entire preview pool before selection, with playable media, transcript, rationale, independent decisions and explicit playback/framing confirmation. Only explicit approval promotes that exact preview into selected media. Copy drafts remain pending and collaborator/copy/scheduling approvals remain separate. Rejecting, requesting an edit or leaving unused never deletes retained media. Caption-only changes do not change the media revision or render again. SQLite receipts survive a new process. No scheduling is triggered by preview generation or selection.
 
-## Isolated tests
+Existing cleanup now keeps a durable completion eligibility clock across requests sharing a source. Active jobs, unresolved reviews/edits/holds and unscheduled selected work protect local media. Verified completion or explicit owner closure starts the existing retention interval; reopening resets it. Emergency cleanup does not shorten this source interval. Drive media and protected database/backup files are unaffected.
 
-`tests/test_retained_preview_upload.py` uses actual SQLite and an explicitly mocked
-Drive API. It checks exact-revision requirements, one upload/one receipt, successful
-readback reuse, response loss, commit failure, concurrent creation, changed output,
-multiple remote matches, remote checksum/folder/tag changes and safe pre-create read
-retries. The existing uploader is exercised, not only the receipt helper. These are
-not claims of live Drive uploads, real preview readiness or completed scheduling.
+## Verification and limits
 
-Executed locally: `python -m pytest -p validation_network -q -ra --tb=short`:
-**662 passed, 0 failed, 4 skipped, 2 subtests passed**, 42.04s. The 22 new cases are
-included. Four skips require local FFmpeg/FFprobe tools on PATH; GitHub's focused
-workflow installs those tools. Tests use isolated SQLite/media and block external
-operations; local HTTP integration tests run normally. Live media retention and
-website preview-before-selection acceptance remain unperformed.
+Full isolated suite: python -m pytest -p validation_network -q -ra --tb=short. Most recent completed run: 675 passed, 0 failed, 6 local tool-dependent skips, 2 subtests passed. Final CI is authoritative for FFmpeg/FFprobe cases.
 
-The first CI run exposed two previously observed optional-intelligence fixture
-races: background highlight futures could outlive a test's provider and database
-patches. The fixture now waits for its own futures at teardown, while retaining
-concurrent execution and every existing safety assertion. No application analysis
-code or production worker behavior was changed for this correction.
+New tests exercise real SQLite, authenticated existing HTTP routes, candidate discovery dispatch, explicit approvals, sibling isolation, process restart, immutable media reuse, seven-day-old shared caches and normal/emergency completion expiry. Drive API operations and semantic judgments are explicitly mocked; these are not live provider or podcast listening results.
 
-## Shortest remaining path
+CI installs FFmpeg/FFprobe and renders both a 1080x1920 Short and a 1920x1080 highlight exceeding 180 seconds from generated synthetic audiovisual media, through the existing adapters and exported-media checks. Tests fetch authenticated media (including range requests), reject unauthorized access, approve the preview and verify no duplicate export/upload. Synthetic website evidence is retained as a three-day CI artifact. Synthetic tones are not evidence of natural speech or real creator playback acceptance.
 
-1. Resolve PR91's real-speech acceptance and its conservative quiet-interval rule
-   using retained source audio and contextual timing. No automatic approved-cut edits.
-2. Register verified preview receipts for unselected candidates through the current
-   bounded render executor, after their immutable specification is validated. Keep
-   preview readiness separate from candidate, finished-media, copy and collaborator
-   approvals. This change provides retention receipts; it does not claim step2 done.
-3. Extend the existing website cards/media route to these unselected verified previews.
-   Reuse the exact receipt on approval before invoking FFmpeg. Caption/creator-only
-   edits must not regenerate video. Keep Telegram request-specific navigation only.
-4. Add the completion-eligibility timestamp to existing source usage records; normal
-   and emergency cleanup must protect shared active/review/edit/held sources. Start
-   expiry only after all linked work completes or is explicitly closed. No new storage
-   service and no deletion of retained Drive originals/previews/finals.
-5. After actual owner final approvals, exercise the existing idempotent Schedule
-   Master handoff and independently read destination/date/revision records. Keep
-   cadence, audits, reconciliation, public-publishing pause and Agape isolation.
+## Controlled live acceptance still required
 
-Review branches only. Merge, deployment, production retries, hold release and scheduling
-still require separate authorization. No paid infrastructure or analysis stage added.
+Keep both PRs draft and unmerged until reviewed. Dependency order: PR91 then PR92. Production remains untouched; the six protected TDOG assets, successful Short13, five holds and provisional boundary suggestions are unchanged.
+
+After separate merge/deployment authorization: back up durable state and queue, verify one worker and persistent storage, deploy paused with publishing/Agape disabled, and enable the preview flag only for a newly authorized unprotected test request. Verify actual source speech, Drive service identity/uploads, both website previews and owner playback/framing/copy/collaborator decisions. Do not retry the protected five assets or rerender Short13. After separate scheduling authorization, use the existing idempotent handoff and read back authoritative Schedule Master asset/destination/date/receipt records. Existing scheduling and reconciliation code is not replaced by this PR. Live Drive, actual scheduling and paused-production end-to-end acceptance are NOT VERIFIED by isolated tests.

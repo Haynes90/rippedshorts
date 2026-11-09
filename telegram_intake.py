@@ -3890,6 +3890,10 @@ def _process(request_id: str) -> None:
             "candidate_reviews": reviews,
         }
         _save(request_id, "awaiting_review", final_state)
+        if (os.getenv('RIPPED_PREVIEW_FIRST_ENABLED','false').lower()=='true'
+                and str(state.get('show_id') or '').upper() in {'TCB','TDOG'} and not approved_clips):
+            __import__('render_recovery').start_preview_pipeline(request_id,video)
+            return  # Telegram navigates to the existing website; it does not select.
         if approved_clips:
             send(
                 chat_id,
@@ -6137,6 +6141,51 @@ def _path_is_under(path: Path, parents: set[Path]) -> bool:
     return False
 
 
+def _source_cache_eligibility(active_dirs=None):
+    """Durable completion clock across all requests sharing a local source."""
+    from production_intelligence import record, identity
+    from batch_progress import summarize, selected_assets
+    stamp=datetime.now(timezone.utc).timestamp()
+    with _telegram_db() as db:
+        rows=db.execute('SELECT request_id,status,state_json FROM telegram_requests').fetchall()
+    groups={}
+    for row in rows:
+        state=json.loads(row['state_json'])
+        explicit=bool(state.get('source_cache_closed_at') and state.get('source_cache_closure_actor'))
+        assets=selected_assets(row['request_id'],state)
+        complete=bool(assets and all(a.get('completed') for a in summarize(row['request_id'],state)['clips']))
+        pending=any(v.get('choice')=='request_adjustment' for v in (state.get('website_clip_reviews') or {}).values())
+        if state.get('preview_first_version')==1:
+            for lane,(key,_) in __import__('render_recovery').LANES.items():
+                for index,clip in enumerate((state.get(key) or {}).get('segments') or []):
+                    asset=__import__('render_recovery').asset_id(row['request_id'],lane,clip,index)
+                    pending |= (state.get('website_clip_reviews') or {}).get(asset,{}).get('choice') not in {'approve','reject','unused'}
+        resolved=explicit or (complete and not pending)
+        paths={(SOURCE_DIR/f"telegram-{row['request_id']}").resolve()}
+        if state.get('video_path'):
+            paths.add(Path(state['video_path']).resolve().parent)
+        for path in paths:
+            groups.setdefault(path,[]).append(resolved)
+    result={}
+    with connect() as db:
+        jobs=db.execute('SELECT source_job_id,status FROM source_jobs').fetchall()
+    for job in jobs:
+        if str(job['status']).lower() not in _TERMINAL_JOB_STAGES:
+            groups.setdefault((SOURCE_DIR/job['source_job_id']).resolve(),[]).append(False)
+    from production_intelligence import database
+    for path,owners in groups.items():
+        key='source-cache-eligibility:'+identity(str(path))
+        with database() as db:
+            old=db.execute('SELECT payload FROM intelligence_records WHERE record_id=?',(key,)).fetchone()
+        old=json.loads(old['payload']) if old else {}
+        active=active_dirs if active_dirs is not None else _active_local_source_dirs()
+        in_use=any(parent not in groups and (_path_is_under(path,{parent}) or _path_is_under(parent,{path})) for parent in active)
+        eligible=(old.get('eligible_since') or stamp) if all(owners) and not in_use else None
+        record('source_cache_eligibility',key,dict(path=str(path),eligible_since=eligible))
+        result[path]=eligible
+    return result
+
+
 def _purge_expired_local_artifacts(
     *,
     retention_hours: int | None = None,
@@ -6148,6 +6197,7 @@ def _purge_expired_local_artifacts(
         1,
         int(retention_hours if retention_hours is not None else configured),
     )
+    source_cutoff = datetime.now(timezone.utc).timestamp() - retention_hours * 3600
     if emergency:
         retention_hours = min(retention_hours, 1)
 
@@ -6160,6 +6210,9 @@ def _purge_expired_local_artifacts(
 
     protected_files = {DB_PATH.resolve()}
     protected_dirs = _active_local_source_dirs()
+    source_clocks = _source_cache_eligibility(protected_dirs)
+    protected_dirs.difference_update(path for path,eligible in source_clocks.items() if eligible is not None)
+    protected_dirs.update(path for path,eligible in source_clocks.items() if eligible is None)
     protected_dirs.add((data_dir / "release-backups").resolve())
     candidates: list[Path] = []
     for path in data_dir.rglob("*"):
@@ -6169,6 +6222,13 @@ def _purge_expired_local_artifacts(
             if path.name in {DB_PATH.name + "-wal", DB_PATH.name + "-shm"}:
                 continue
             if _path_is_under(path, protected_dirs):
+                continue
+            clocks=[eligible for parent,eligible in source_clocks.items() if _path_is_under(path,{parent})]
+            if clocks:
+                # Neither file mtime nor emergency cleanup can shorten the clock.
+                if any(value is None or value >= source_cutoff for value in clocks):
+                    continue
+                candidates.append(path)
                 continue
             old_enough = path.stat().st_mtime < cutoff
             emergency_reclaimable = emergency and not _path_is_under(path, protected_dirs)

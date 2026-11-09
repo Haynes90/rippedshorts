@@ -210,6 +210,182 @@ def current_asset_id(default):
     return (_CURRENT.get() or {}).get('asset_id', default)
 
 
+def preview_ticket(request_id, state, identity):
+    """Validated candidate authority is separate from any owner selection."""
+    if state.get('preview_first_version') != 1 or state.get('show_id') not in {'TCB','TDOG'}:
+        raise RenderReviewRequired('Preview-first processing is not enabled for this request')
+    for lane,(key,_) in LANES.items():
+        for index,clip in enumerate((state.get(key) or {}).get('segments') or []):
+            if asset_id(request_id,lane,clip,index) != identity:
+                continue
+            revisions={}
+            from clip_review_state import reviews, prepare_segment
+            if any(r['asset_id']==identity for r in reviews(request_id)):
+                clip,revisions=prepare_segment(request_id,identity,clip)
+            inputs={k:clip.get(k) for k in ('start','end','duration','framing_mode','transcript')}
+            inputs.update(candidate_id=clip.get('candidate_id') or identity,review_revisions=revisions,
+                source_sha256=(state.get('source_validation') or {}).get('source_sha256'))
+            return dict(request_id=request_id,lane=lane,index=index,asset_id=identity,
+                candidate_id=inputs['candidate_id'],revision=digest(inputs),approval_revisions=revisions)
+    raise RenderReviewRequired('Candidate no longer matches the discovery record')
+
+
+def preview_items(request_id,state):
+    """Read immutable results; never replace the candidate pool or decisions."""
+    result=[]
+    if state.get('preview_first_version') != 1:
+        return result
+    with evidence.database() as db:
+        for lane,(key,review_key) in LANES.items():
+            for index,candidate in enumerate((state.get(key) or {}).get('segments') or []):
+                identity=asset_id(request_id,lane,candidate,index)
+                try:
+                    item=preview_ticket(request_id,state,identity)
+                except (RenderReviewRequired,ValueError):
+                    result.append((identity,lane,{'status':'preview_held','render_error':'Pending revision review'},candidate))
+                    continue
+                prefix='preview:'+identity+':'+item['revision']
+                saved=_get(db,prefix+':success','preview_success')
+                held=_get(db,prefix+':hold','preview_hold')
+                clip=saved['clip'] if saved else candidate
+                review=(state.get(review_key) or {}).get(str(index)) or {}
+                if saved:
+                    review={**review,'status':'rendered','clip_url':clip.get('clip_url') or clip.get('segment_url'),
+                            'rendered_review_revisions':clip.get('rendered_review_revisions') or {}}
+                elif held:
+                    review={**review,'status':'preview_held','render_error':held['category']}
+                else:
+                    review={**review,'status':'preview_pending'}
+                result.append((identity,lane,review,clip))
+    return result
+
+
+def generate_preview(request_id,lane,index,source):
+    """One bounded existing-renderer operation; no selection or scheduling."""
+    from pathlib import Path
+    import main
+    from audio_master_handoff import DATA_DIR
+    from boundary_specification import prepare_for_render, consume
+    from clip_completion import render_complete_clip
+    with evidence.database() as db:
+        _,state=_state(db,request_id)
+    key,_=LANES[lane];candidate=deepcopy(state[key]['segments'][index])
+    identity=asset_id(request_id,lane,candidate,index);item=preview_ticket(request_id,state,identity)
+    prefix='preview:'+identity+':'+item['revision'];aspect='9:16' if lane=='short' else '16:9'
+    with evidence.database() as db:
+        done=_get(db,prefix+':success','preview_success')
+        if done:
+            return done['clip']  # no provider, FFmpeg or upload repeated after restart
+        held=_get(db,prefix+':hold','preview_hold')
+        exported=_get(db,prefix+':export','preview_export')
+        if held and not (exported and held['category'] in {'Timeout','ReadTimeout','ConnectTimeout',
+                'ConnectionError','TimeoutError','OSError','OperationalError','HttpError'}):
+            raise RenderReviewRequired('Preview is held; an explicit corrected revision is required')
+    if item['approval_revisions']:
+        candidate,_=__import__('clip_review_state').prepare_segment(request_id,identity,candidate)
+    try:
+        prepared=prepare_for_render(request_id,identity,candidate,source,state,aspect,item['approval_revisions'],purpose='preview')
+        consume(source,prepared,aspect)
+    except Exception as exc:
+        with evidence.database() as db:
+            _put(db,'preview_hold',prefix+':hold',dict(ticket=item,category=type(exc).__name__,
+                diagnostics=getattr(exc,'diagnostics',{}),retry_requires_review=True))
+        raise
+    output=Path(DATA_DIR)/'sources'/('telegram-'+request_id)/'previews'/(digest(item)+'.mp4')
+    output.parent.mkdir(parents=True,exist_ok=True)
+    with evidence.database() as db:
+        db.execute('BEGIN IMMEDIATE')
+        exported=_get(db,prefix+':export','preview_export')
+        intent=_get(db,prefix+':intent','preview_intent')
+        if not exported:
+            if intent:
+                raise RenderReviewRequired('Prior preview render is running or uncertain; reconcile before retry')
+            _put(db,'preview_intent',prefix+':intent',item)
+    try:
+        if exported:
+            if not output.is_file() or hashlib.sha256(output.read_bytes()).hexdigest()!=exported['sha256']:
+                raise RenderReviewRequired('Verified local export unavailable; reconcile retained media before rendering again')
+            rendered=exported['clip']
+        else:
+            from functools import partial
+            renderer=(partial(main.create_clip_file,framing_mode=prepared.get('framing_mode'))
+                      if lane=='short' else main.create_topic_segment_file)
+            rendered=render_complete_clip(source,prepared,output,renderer,aspect)
+            with evidence.database() as db:
+                _put(db,'preview_export',prefix+':export',dict(clip=rendered,
+                    sha256=hashlib.sha256(output.read_bytes()).hexdigest()))
+        retained=main.upload_clip_to_drive(output,digest(item)+'.mp4',
+            vid_title=state.get('vid_title'),verified_clip=rendered)
+        url=retained['clip_url']
+        rendered={**rendered,'clip_url':url,'segment_url':url,'folder_id':retained['folder_id'],
+                  'media_receipt_id':retained['media_receipt_id'], 'rendered_review_revisions':item['approval_revisions']}
+        with evidence.database() as db:
+            _,current=_state(db,request_id)
+            if preview_ticket(request_id,current,identity)!=item:
+                raise RenderReviewRequired('Candidate changed during preview; retained media requires reconciliation')
+            _put(db,'preview_success',prefix+':success',dict(ticket=item,clip=rendered))
+        return rendered
+    except Exception as exc:
+        with evidence.database() as db:
+            if not _get(db,prefix+':hold','preview_hold'):
+                _put(db,'preview_hold',prefix+':hold',dict(ticket=item,category=type(exc).__name__,
+                    diagnostics=getattr(exc,'diagnostics',{}),retry_requires_review=True))
+        raise
+
+
+def preview_lane(request_id,lane,source):
+    with evidence.database() as db:
+        _,state=_state(db,request_id)
+    key,_=LANES[lane]
+    outcomes=[]
+    for index,_ in enumerate((state.get(key) or {}).get('segments') or []):
+        try:
+            generate_preview(request_id,lane,index,source);outcomes.append('verified')
+        except Exception:
+            outcomes.append('held')  # preserve every independently successful sibling
+    __import__('review_navigation').notify_safely(request_id,'final','previews-'+lane)
+    return outcomes
+
+
+def start_preview_pipeline(request_id,source):
+    """Discovery hook for new requests only, on the existing bounded executor."""
+    import telegram_intake as tg
+    with evidence.database() as db:
+        db.execute('BEGIN IMMEDIATE')
+        _,state=_state(db,request_id)
+        if state.get('show_id') not in {'TCB','TDOG'} or any(state.get(k) for k in
+                ('candidate_reviews','topic_reviews','website_clip_reviews','schedule_master')):
+            raise RenderReviewRequired('Existing owner decisions cannot be migrated to preview-first automatically')
+        key='preview-dispatch:'+request_id
+        if _get(db,key,'preview_dispatch'):
+            return {}  # no duplicate workers after a repeated discovery notification
+        state['preview_first_version']=1
+        _put(db,'preview_dispatch',key,dict(request_id=request_id,source_sha256=state.get('source_validation',{}).get('source_sha256')))
+        db.execute('UPDATE telegram_requests SET state_json=? WHERE request_id=?',
+                   (json.dumps(state),request_id))
+    def highlights():
+        try:
+            result=__import__('intelligence_workflow').prepared_highlights(state,state['topic_source_segments'],source)
+            with evidence.database() as db:
+                db.execute('BEGIN IMMEDIATE')
+                _,latest=_state(db,request_id)
+                if latest.get('topic_result') and latest['topic_result']!=result:
+                    raise RenderReviewRequired('Persisted highlight candidates changed; review required')
+                latest['topic_result']=result
+                db.execute('UPDATE telegram_requests SET state_json=? WHERE request_id=?',(json.dumps(latest),request_id))
+            return preview_lane(request_id,'highlight',source)
+        except Exception as exc:
+            with evidence.database() as db:
+                _put(db,'preview_format_hold','preview-format:'+request_id+':highlight',
+                     dict(category=type(exc).__name__,diagnostics=getattr(exc,'diagnostics',{})))
+            __import__('review_navigation').notify_safely(request_id,'final','highlight-preview-held')
+            return ['held']
+    results={'9:16':tg.RENDER_EXECUTOR.submit(preview_lane,request_id,'short',source),
+             '16:9':tg.RENDER_EXECUTOR.submit(highlights)}
+    __import__('review_navigation').notify_safely(request_id,'final','previews-preparing')
+    return results
+
+
 def guarded_render(lane):
     def decorate(function):
         @wraps(function)

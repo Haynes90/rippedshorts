@@ -30,6 +30,12 @@ def _asset(state, request_id, asset_id):
     for identity, lane, review, clip in selected_assets(request_id, state):
         if identity == asset_id:
             return lane, clip
+    if state.get('preview_first_version')==1:
+        from render_recovery import LANES, asset_id as candidate_identity
+        for lane,(key,_) in LANES.items():
+            for index,clip in enumerate((state.get(key) or {}).get('segments') or []):
+                if candidate_identity(request_id,lane,clip,index)==asset_id:
+                    return lane,clip
     raise ValueError('Asset is not one of the existing selected clips')
 
 
@@ -185,6 +191,9 @@ def delivery_blockers(request_id, state):
     errors = []
     current = reviews(request_id)
     framing_ids = {r['asset_id'] for r in current if r['kind'] == 'framing'}
+    if state.get('preview_first_version')==1:
+        framing_ids.update(c['asset_id'] for c in __import__('finished_clip_review').clips(request_id,state)
+                           if c['approval_current'] and c['decision'].get('framing_reviewed'))
     for identity, lane, _, clip in selected_assets(request_id, state):
         if lane == 'short' and clip.get('framing_plan') and identity not in framing_ids:
             errors.append(identity + ': framing preview and owner approval required')
