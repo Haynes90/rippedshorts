@@ -52,7 +52,7 @@ def previews(passage,monkeypatch):
     def render(source,clip,output,renderer,aspect):
         assert boundary.consume(source,clip,aspect)
         calls.append((aspect,clip['start'],clip['end']));output.write_bytes(b'isolated output '+aspect.encode()*100)
-        return {**clip,'completion_check':{k:True for k in recovery.PROOF},'boundary_export_evidence':{'full_decode':True}}
+        return {**clip,'duration':float(clip['end'])-float(clip['start']),'completion_check':{k:True for k in recovery.PROOF},'boundary_export_evidence':{'full_decode':True}}
     monkeypatch.setattr(speech,'render_complete_clip',render)
     app=FastAPI();app.include_router(web.router)
     token=web.ensure_review_session('request')['token']

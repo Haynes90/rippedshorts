@@ -222,7 +222,10 @@ def preview_ticket(request_id, state, identity):
             from clip_review_state import reviews, prepare_segment
             if any(r['asset_id']==identity for r in reviews(request_id)):
                 clip,revisions=prepare_segment(request_id,identity,clip)
-            inputs={k:clip.get(k) for k in ('start','end','duration','framing_mode','transcript')}
+            inputs={k:clip.get(k) for k in ('start','end','framing_mode','transcript')}
+            # Duration is derived, never a second identity for the same bounds.
+            # Real exports recalculate it (e.g. 4.1-.9 != literal 3.2).
+            inputs['duration']=float(clip['end'])-float(clip['start'])
             inputs.update(candidate_id=clip.get('candidate_id') or identity,review_revisions=revisions,
                 source_sha256=(state.get('source_validation') or {}).get('source_sha256'))
             return dict(request_id=request_id,lane=lane,index=index,asset_id=identity,
