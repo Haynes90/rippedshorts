@@ -218,6 +218,7 @@ def _payload_for_session(token: str) -> dict[str, Any]:
     regenerated = sum(item["regeneration_count"] > 0 for item in items)
     return {
         "request_id": request_id,
+        "preview_first": state.get('preview_first_version')==1,
         "acceptance_demo": bool(state.get('acceptance_demo')),
         "batch_summary": batch,
         "candidate_evidence": candidate_evidence,
@@ -390,12 +391,12 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
     <div class="progress-text" id="progressText"></div>
   </div>
 
-  <section id="finished-clips"><h2>Review finished clips</h2>{__import__('clip_review_ui').finished_cards(payload.get('clips', []), token)}</section>
+  <section id="finished-clips"><h2>{'Watch previews, then choose clips' if payload.get('preview_first') else 'Review finished clips'}</h2>{__import__('clip_review_ui').finished_cards(payload.get('clips', []), token)}</section>
   <details id="editing-workflow" {'open' if payload.get('stage') in {'editorial','framing'} else ''}><summary>Edit boundaries or framing / compare alternatives</summary>
   {__import__('clip_review_ui').sections(payload.get('comparisons', []), token)}
   </details>
-  <section id="shorts"><h2>9:16 candidate review</h2><p>Candidate selection remains in Telegram; saved selections are preserved.</p></section>
-  <section id="highlights"><h2>16:9 candidate review</h2><p>Highlight selection follows Shorts confirmation in Telegram.</p></section>
+  <section id="shorts"><h2>9:16 candidate review</h2><p>{'Watch and choose Shorts above. Telegram provides notifications only.' if payload.get('preview_first') else 'Candidate selection remains in Telegram; saved selections are preserved.'}</p></section>
+  <section id="highlights"><h2>16:9 candidate review</h2><p>{'Review the highlight previews after Shorts above; each decision is saved independently.' if payload.get('preview_first') else 'Highlight selection follows Shorts confirmation in Telegram.'}</p></section>
   <section id="final"><h2>Final rendered video and copy approval</h2><section id="assets">{cards}</section></section>
 </main>
 
@@ -631,7 +632,16 @@ def finished_clip_media(token: str, asset_id: str):
     match = _DRIVE_ID_RE.search(item['media_url']) if item else None
     if not match:
         raise HTTPException(status_code=409, detail='Verified finished media unavailable; diagnostic comparisons are not final exports')
-    return _preview_response({'drive_file_id': match.group(1)})
+    artifact={'drive_file_id':match.group(1)}
+    if item.get('preview'):
+        from production_intelligence import database
+        from render_recovery import _get
+        with database() as db:
+            receipt=_get(db,item.get('media_receipt_id'),'retained_media')
+        if not receipt or receipt['remote']['clip_id']!=match.group(1):
+            raise HTTPException(status_code=409,detail='Exact preview retention receipt unavailable')
+        artifact.update(size=receipt['expected']['bytes'],sha256=receipt['expected']['output_sha256'])
+    return _preview_response(artifact)
 
 
 @router.post("/api/ripped-shorts/review/{token}/asset/{index}")

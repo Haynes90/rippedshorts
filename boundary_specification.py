@@ -114,10 +114,11 @@ def acoustic_edge(source, cut, edge, duration):
                 automatic_adjustment=False)
 
 
-def prepare_for_render(request_id, identity, candidate, source, state, aspect, approved_revisions):
+def prepare_for_render(request_id, identity, candidate, source, state, aspect, approved_revisions, *, purpose='selected'):
     """Existing explicit render action only; persist specification before FFmpeg."""
     source = Path(source)
-    selected = _selected_ticket(request_id, state, identity)
+    from render_recovery import preview_ticket
+    selected = preview_ticket(request_id, state, identity) if purpose == 'preview' else _selected_ticket(request_id, state, identity)
     validation = state.get("source_validation") or {}
     source_sha = validation.get("source_sha256")
     source_id = (state.get("parsed") or {}).get("video_id")
@@ -126,6 +127,8 @@ def prepare_for_render(request_id, identity, candidate, source, state, aspect, a
     if validation.get("source_id", source_id) != source_id:
         raise BoundaryReviewRequired("SOURCE_IDENTITY_INVALID")
     inputs = {k:candidate.get(k) for k in ("start","end","duration","framing_mode","transcript")}
+    if purpose == 'preview':
+        inputs['duration'] = float(candidate['end'])-float(candidate['start'])
     inputs.update(candidate_id=candidate.get("candidate_id") or identity, review_revisions=approved_revisions, source_sha256=source_sha)
     if digest(inputs) != selected["revision"] or selected["approval_revisions"] != approved_revisions:
         raise BoundaryReviewRequired("APPROVED_INPUT_DIFFERS")
@@ -149,7 +152,7 @@ def prepare_for_render(request_id, identity, candidate, source, state, aspect, a
     binding = dict(request_id=request_id, asset_id=identity, candidate_id=selected["candidate_id"],
         approved_input_revision=selected["revision"], approved_revisions=approved_revisions,
         source_video_id=source_id, source_sha256=source_sha, transcript_revision=digest(transcript),
-        aspect=aspect, start=start, end=end, transcript=candidate.get("transcript"),
+        aspect=aspect, purpose=purpose, start=start, end=end, transcript=candidate.get("transcript"),
         words_digest=digest(candidate.get("words")), configuration=configuration(candidate, aspect))
     key = "boundary-assessment:" + VERSION + ":" + digest(binding)
 
@@ -180,7 +183,17 @@ def prepare_for_render(request_id, identity, candidate, source, state, aspect, a
         if any(u["start"] < start or u["end"] > end for u in chosen):
             reasons.append("TIMED_SPEECH_EXTENDS_OUTSIDE_CUT")
         edges = {edge:acoustic_edge(source, t, edge, duration) for edge,t in [("start",start),("end",end)]}
-        if not all(v["measured_clear"] for v in edges.values()):
+        # Silence is one form of evidence, not a compulsory edit requirement.
+        # Reliable word-timed speech wholly inside the cut can support a natural
+        # transition with background sound. Segment timestamps cannot do this.
+        word_timed = all(u['timing_basis']=='provider_word_timing' for u in chosen)
+        for edge,cut in [('start',start),('end',end)]:
+            margin = chosen[0]['start']-cut if edge=='start' else cut-chosen[-1]['end']
+            crossing = any(u['start'] < cut < u['end'] for u in units)
+            edges[edge]['timed_capture_supported'] = word_timed and margin >= .1 and not crossing
+            edges[edge]['timing_allowance_seconds'] = .1 if word_timed else None
+            edges[edge]['captured_margin_seconds'] = margin
+        if not all(v["measured_clear"] or v['timed_capture_supported'] for v in edges.values()):
             reasons.append("ACOUSTIC_EDGE_UNRESOLVED")
         return dict(version=VERSION, binding=binding, status="HELD" if reasons else "VALIDATED",
             reasons=reasons, semantic=semantic, acoustic=edges,
@@ -218,7 +231,9 @@ def consume(source, candidate, aspect):
         raise BoundaryReviewRequired("REQUEST_IDENTITY_MISSING")
     import json
     state = json.loads(row["state_json"])
-    current = _selected_ticket(binding["request_id"], state, binding["asset_id"])
+    from render_recovery import preview_ticket
+    current = (preview_ticket(binding['request_id'], state, binding['asset_id'])
+               if binding.get('purpose')=='preview' else _selected_ticket(binding["request_id"], state, binding["asset_id"]))
     if (candidate.get("boundary_request_id") != binding["request_id"] or candidate.get("boundary_asset_id") != binding["asset_id"]
             or current["candidate_id"] != binding["candidate_id"] or current["revision"] != binding["approved_input_revision"]
             or current["approval_revisions"] != binding["approved_revisions"]

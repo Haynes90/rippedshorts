@@ -15,7 +15,9 @@ PROOF = ('media_duration', 'video_stream', 'audio_stream', 'format_valid', 'expo
 
 def clips(request_id, state, comparisons=()):
     result = []
-    for asset, lane, review, candidate in selected_assets(request_id, state):
+    entries = (__import__('render_recovery').preview_items(request_id,state)
+               if state.get('preview_first_version')==1 else selected_assets(request_id,state))
+    for asset, lane, review, candidate in entries:
         check = candidate.get('completion_check') or {}
         url = review.get('clip_url') or review.get('segment_url') or ''
         finished = bool(review.get('status') == 'rendered' and url and all(check.get(k) is True for k in PROOF))
@@ -36,8 +38,9 @@ def clips(request_id, state, comparisons=()):
             learning_influence=candidate.get('learning_influence'), framing=candidate.get('framing_plan'),
             render_status=review.get('status'), error=review.get('render_error'), finished=finished,
             media_url=url if finished else '', bounds=bounds, media_revision=fingerprint,
+            media_receipt_id=candidate.get('media_receipt_id'),
             decision=decision, approval_current=bool(decision.get('choice') == 'approve' and finished and decision.get('media_revision') == fingerprint),
-            frozen=copy_frozen(state, asset)))
+            frozen=copy_frozen(state, asset), preview=state.get('preview_first_version')==1))
     return result
 
 
@@ -46,7 +49,7 @@ def save(request_id, asset_id, body):
     reason = body.get('reason') or ''
     feedback = str(body.get('feedback') or '')[:2000]
     fields = body.get('changed_fields') or []
-    if choice not in {'approve', 'reject', 'request_adjustment'}:
+    if choice not in {'approve', 'reject', 'request_adjustment', 'unused'}:
         raise ValueError('Choose Approve, Reject or Request Adjustment')
     if choice == 'reject' and reason not in REASONS:
         raise ValueError('Choose the actual rejection reason')
@@ -59,6 +62,8 @@ def save(request_id, asset_id, body):
         if not row:
             raise ValueError('Request not found')
         state = json.loads(row['state_json'])
+        if choice=='unused' and state.get('preview_first_version')!=1:
+            raise ValueError('Unused applies only to preview-first candidates')
         item = next((c for c in clips(request_id, state) if c['asset_id'] == asset_id), None)
         if not item or item['frozen']:
             raise ValueError('Asset is missing or already submitted; existing approvals are frozen')
@@ -68,16 +73,45 @@ def save(request_id, asset_id, body):
         if choice == 'approve':
             if not item['finished'] or body.get('playback_verified') is not True:
                 raise ValueError('Play the verified finished clip with audio before approving')
+            if state.get('preview_first_version')==1 and body.get('framing_verified') is not True:
+                raise ValueError('Explicitly confirm the framing of this exact preview')
             if any(b.startswith(asset_id+': ') for b in delivery_blockers(request_id, state) if 'clip approval' not in b):
                 raise ValueError('The finished render does not match the editorial/framing approval')
         decision = dict(choice=choice, reason=reason, feedback=feedback, changed_fields=fields,
             media_revision=item['media_revision'], version=current.get('version', 0)+1,
             actor=str(row['user_id']), decided_at=datetime.now(timezone.utc).isoformat(),
             approval_scope='clip_editorial_only', native_invitation_authorized=False)
+        if state.get('preview_first_version')==1:
+            decision['framing_reviewed']=body.get('framing_verified') is True and choice=='approve'
         if choice != 'reject':
             decision['reason'] = ''
         decision['prior_versions'] = list(current.get('prior_versions') or []) + ([{k:v for k,v in current.items() if k != 'prior_versions'}] if current else [])
         state.setdefault('website_clip_reviews', {})[asset_id] = decision
+        copy_added=False
+        if state.get('preview_first_version')==1:
+            from render_recovery import LANES, asset_id as identity
+            for lane,(key,review_key) in LANES.items():
+                for index,candidate in enumerate(state.get(key,{}).get('segments') or []):
+                    if identity(request_id,lane,candidate,index)!=asset_id:
+                        continue
+                    review=dict((state.get(review_key) or {}).get(str(index)) or {})
+                    if choice=='approve':
+                        # Select only the explicitly chosen verified preview; reuse
+                        # its immutable media without requesting another render.
+                        pair=next(v for v in __import__('render_recovery').preview_items(request_id,state) if v[0]==asset_id)
+                        state[key]['segments'][index]={**candidate,**pair[3]}
+                        review.update(status='rendered',clip_url=item['media_url'],segment_url=item['media_url'],
+                            user_id=str(row['user_id']),reviewed_at=decision['decided_at'],
+                            rendered_review_revisions=pair[3].get('rendered_review_revisions') or {})
+                    else:
+                        review.update(status='rejected' if choice=='reject' else 'preview_unused' if choice=='unused' else 'preview_edit_requested')
+                    state.setdefault(review_key,{})[str(index)]=review
+            if choice=='approve' and not any(d.get('asset_id')==asset_id for d in state.get('copy_drafts') or []):
+                selected=next(a for a in __import__('telegram_intake')._copy_review_assets(state,request_id) if a['asset_id']==asset_id)
+                state.setdefault('copy_drafts',[]).append({**selected,'social_caption':'',
+                    'video_title':selected.get('title') or '', 'video_description':'',
+                    'hashtags':'','copy_status':'pending','user_edited':False})
+                copy_added=True  # Separate copy approval; no automatic AI or scheduling.
         state['clip_review_ui_version'] = 2
         db.execute('UPDATE telegram_requests SET state_json=?,updated_at=? WHERE request_id=?',
                    (json.dumps(state), decision['decided_at'], request_id))
@@ -89,6 +123,7 @@ def save(request_id, asset_id, body):
         import logging
         logging.getLogger(__name__).exception('Saved clip feedback projection pending request=%s', request_id)
     return dict(status='saved', decision=decision, scheduling_started=False, rendering_started=False,
+                copy_review_ready=copy_added,
                 collaborator_invitation_authorized=False)
 
 

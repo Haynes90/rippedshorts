@@ -987,9 +987,9 @@ def create_clip_file(video_path: Path, start: float, duration: float, output_pat
         "ffmpeg",
         "-y",
         "-ss",
-        f"{start:.2f}",
+        str(float(start)),
         "-t",
-        f"{duration:.2f}",
+        str(float(duration)),
         "-i",
         str(video_path),
     ]
@@ -1043,9 +1043,9 @@ def create_topic_segment_file(
         "ffmpeg",
         "-y",
         "-ss",
-        f"{start:.2f}",
+        str(float(start)),
         "-t",
-        f"{duration:.2f}",
+        str(float(duration)),
         "-i",
         str(video_path),
         "-map", "0:v:0",
@@ -1098,13 +1098,15 @@ def attach_topic_segment_asset(
     segment = render_complete_clip(
         video_path, segment, output_path, create_topic_segment_file, "16:9"
     )
-    uploaded = upload_clip_to_drive(output_path, segment_name, vid_title=vid_title)
+    uploaded = upload_clip_to_drive(output_path, segment_name, vid_title=vid_title,
+        **({'verified_clip':segment} if segment.get('boundary_specification_id') else {}))
     return {
         **segment,
         "segment_number": segment_number,
         "segment_name": segment_name,
         "segment_url": uploaded["clip_url"],
         "folder_id": uploaded["folder_id"],
+        **({'media_receipt_id':uploaded['media_receipt_id']} if uploaded.get('media_receipt_id') else {}),
     }
 
 
@@ -1217,7 +1219,8 @@ def list_existing_rendered_assets(video_id: str, vid_title: str) -> dict:
 
 
 def upload_clip_to_drive(
-    clip_path: Path, clip_name: str, *, vid_title: Optional[str] = None
+    clip_path: Path, clip_name: str, *, vid_title: Optional[str] = None,
+    verified_clip: Optional[dict] = None
 ) -> dict:
     drive_service, _, _ = get_google_services()
     output_folder_id = _drive_title_folder(vid_title)
@@ -1225,6 +1228,13 @@ def upload_clip_to_drive(
         "name": clip_name,
         "parents": [output_folder_id],
     }
+    if verified_clip is not None:
+        from google_drive import retain_verified_clip
+        def create(metadata):
+            return drive_service.files().create(body=metadata,
+                media_body=MediaFileUpload(str(clip_path), mimetype="video/mp4", resumable=True),
+                fields="id", supportsAllDrives=True).execute()
+        return retain_verified_clip(drive_service, clip_path, file_metadata, verified_clip, create)
     media = MediaFileUpload(str(clip_path), mimetype="video/mp4", resumable=True)
     uploaded = drive_service.files().create(
         body=file_metadata,
@@ -1296,11 +1306,14 @@ def attach_clip_assets(
             renderer = partial(create_clip_file, framing_mode='blurred')
         segment.update(render_complete_clip(video_path, segment, output_path, renderer, "9:16"))
         clip_info = upload_clip_to_drive(
-            output_path, clip_name, vid_title=resolved_vid_title
+            output_path, clip_name, vid_title=resolved_vid_title,
+            **({'verified_clip':segment} if segment.get('boundary_specification_id') else {})
         )
         segment["clip_name"] = clip_name
         segment["clip_url"] = clip_info["clip_url"]
         segment["folder_id"] = clip_info["folder_id"]
+        if clip_info.get('media_receipt_id'):
+            segment['media_receipt_id'] = clip_info['media_receipt_id']
     return clips_payload
 
 

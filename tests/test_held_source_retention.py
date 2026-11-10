@@ -15,6 +15,9 @@ def cache(tmp_path,monkeypatch):
     monkeypatch.setattr(tg,'DB_PATH',database)
     active=tmp_path/'sources'/'telegram-held';active.mkdir(parents=True)
     monkeypatch.setattr(tg,'_active_local_source_dirs',lambda:{active.resolve()})
+    # This fixture isolates orphan/active-file behavior with a dummy DB. Real
+    # completion/shared-source clocks use the actual SQLite tests separately.
+    monkeypatch.setattr(tg,'_source_cache_eligibility',lambda *args:{})
     def write(path,age=13):
         path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'isolated retained artifact')
         stamp=time.time()-age*3600;os.utime(path,(stamp,stamp));return path
