@@ -322,12 +322,13 @@ def render_complete_clip(video, segment, output, renderer, aspect):
     try:
         # consume() has verified the immutable spec/source identity. Reuse its
         # decoded-source measurement only inside this exact renderer invocation.
-        token = _VALIDATED_SOURCE_AUDIO.set((str(Path(video).resolve()), start, end,
-                    specification.get('source_audio')) if specification else None)
+        token = (_VALIDATED_SOURCE_AUDIO.set((str(Path(video).resolve()), start, end,
+                    specification['source_audio'])) if specification and specification.get('source_audio') else None)
         try:
             renderer(video, start, end - start, output)
         finally:
-            _VALIDATED_SOURCE_AUDIO.reset(token)
+            if token is not None:
+                _VALIDATED_SOURCE_AUDIO.reset(token)
         if not Path(output).is_file() or Path(output).stat().st_size == 0:
             raise CompletionReviewRequired("Renderer produced no video")
         # Listen to both exported edges and compare them with the approved transcript.
