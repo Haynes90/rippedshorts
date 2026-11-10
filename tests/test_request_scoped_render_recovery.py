@@ -20,6 +20,9 @@ def batch(tmp_path, monkeypatch):
     monkeypatch.setattr(storage,'DATA_DIR',tmp_path)
     monkeypatch.setattr(tg,'DB_PATH',path)
     monkeypatch.setattr(tg,'send',Mock())
+    # These tests isolate recovery/commit behavior; boundary specifications have
+    # their own source/audio/renderer integration tests.
+    monkeypatch.setattr(tg,'_prepare_selected_boundary',lambda rid,aid,c,*args:c)
     monkeypatch.setattr(tg,'_save',Mock(side_effect=AssertionError('Retry must not replace selection state')))
     monkeypatch.setattr(tg,'_approved_clip_history_from_sheet',Mock(side_effect=AssertionError('No video-wide Sheet history')))
     monkeypatch.setattr(tg,'_active_request_for_video',Mock(side_effect=AssertionError('No request redirection')))
