@@ -1,5 +1,37 @@
 """Resolve durable copy without letting generated snapshots erase human edits."""
 from datetime import datetime, timezone
+import hashlib
+import json
+import re
+
+
+def complete_post(draft):
+    if draft.get('post_editor_version') == 1:
+        return str(draft.get('post_text') or '')
+    field = 'social_caption' if draft.get('asset_type') == '9:16_SHORT' or (not draft.get('asset_type') and draft.get('social_caption')) else 'video_description'
+    text = str(draft.get(field) or '')
+    present = {tag.casefold() for tag in re.findall(r'(?<!\w)#\w+', text, re.UNICODE)}
+    missing = []
+    for tag in re.findall(r'(?<!\w)#\w+', str(draft.get('hashtags') or ''), re.UNICODE):
+        if tag.casefold() not in present:
+            missing.append(tag); present.add(tag.casefold())
+    return text + ('\n\n' if text and missing else '') + ' '.join(missing)
+
+
+def editor_revision(draft):
+    values = [draft.get(k) for k in ('asset_id','social_caption','video_title','video_description','hashtags','post_text','post_editor_version','web_review_saved_at','copy_status','editorial_hold')]
+    return hashlib.sha256(json.dumps(values,ensure_ascii=False).encode()).hexdigest()
+
+
+def transport_copy(asset, draft=None):
+    """The single editor already includes its hashtags; never append them twice."""
+    draft = draft or asset
+    if draft.get('post_editor_version') != 1:
+        return asset
+    field = 'social_caption' if draft.get('asset_type') == '9:16_SHORT' else 'video_description'
+    return {**asset, field:complete_post(draft), 'hashtags':'',
+            'post_editor_version':1, 'post_text':complete_post(draft),
+            **({'video_title':draft.get('video_title','')} if field=='video_description' else {})}
 
 
 def _recorded_time(value):
