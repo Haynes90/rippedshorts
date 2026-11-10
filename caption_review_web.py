@@ -177,6 +177,8 @@ def _payload_for_session(token: str) -> dict[str, Any]:
 
     items = []
     for index, draft in enumerate(drafts):
+        if state.get('preview_first_version') == 1 and str(draft.get('asset_id') or '') not in playable_assets:
+            continue  # Keep original draft indexes and records; omit unavailable media from normal review.
         drive_url = media.get(str(draft.get("asset_id") or ""), "")
         items.append(
             {
@@ -222,6 +224,24 @@ def _payload_for_session(token: str) -> dict[str, Any]:
         for item in items
     )
     regenerated = sum(item["regeneration_count"] > 0 for item in items)
+    gallery = [c for c in verified_clips if c['finished']] if state.get('preview_first_version') == 1 else verified_clips
+    schedule_blockers = []
+    if state.get('preview_first_version') == 1:
+        if state.get('acceptance_demo'):
+            schedule_blockers.append('This acceptance review is not yet enabled for scheduling.')
+        approved = [c for c in gallery if c['approval_current']]
+        if not approved:
+            schedule_blockers.append('Select at least one verified preview.')
+        if creator_required and not creator_approval:
+            schedule_blockers.append('Confirm the batch collaborators.')
+        for clip in approved:
+            draft = next((d for d in drafts if d.get('asset_id') == clip['asset_id']), None)
+            if not draft or draft.get('copy_status') not in {'approved', 'edited'} or draft.get('editorial_hold'):
+                schedule_blockers.append('Finalize the caption and metadata for ' + str(clip['title']) + '.')
+        from clip_review_state import delivery_blockers
+        approved_ids = {c['asset_id'] for c in approved}
+        if any(b.split(': ',1)[0] in approved_ids for b in delivery_blockers(request_id,state)):
+            schedule_blockers.append('Resolve the selected video edit or framing request.')
     return {
         "request_id": request_id,
         "preview_first": state.get('preview_first_version')==1,
@@ -229,7 +249,10 @@ def _payload_for_session(token: str) -> dict[str, Any]:
         "batch_summary": batch,
         "candidate_evidence": candidate_evidence,
         "comparisons": __import__('clip_review_state').reviews(request_id),
-        "clips": verified_clips,
+        "clips": gallery,
+        "schedule_blockers": schedule_blockers,
+        "preview_review_total": len(gallery),
+        "preview_review_completed": sum(bool(c['decision'].get('choice')) and (c['decision'].get('choice') != 'approve' or c['approval_current']) for c in gallery),
         "creator_brand": creator_brand,
         "creator_required": creator_required,
         "creator_suggestions": creator_suggestions,
@@ -409,8 +432,8 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
 
 <div class="finish">
   <div class="finish-inner">
-    <button id="finishButton" onclick="finishReview()">Finish &amp; Schedule</button>
-    <div class="notice" id="globalStatus">Edits save directly to the durable copy record.</div>
+    <button id="finishButton" {'disabled' if payload.get('schedule_blockers') else ''} onclick="finishReview()">Finish &amp; Schedule</button>
+    <div class="notice" id="globalStatus">{html.escape(' '.join(payload.get('schedule_blockers') or [])) or 'Edits save directly to the durable copy record.'}</div>
   </div>
 </div>
 
@@ -421,6 +444,15 @@ let state = INITIAL;
 {creator_script}
 
 function updateProgress(data=state) {{
+  if(data.preview_first){{
+    const total=data.preview_review_total||0,completed=data.preview_review_completed||0;
+    document.getElementById('progressText').textContent=`${{completed}}/${{total}} playable previews reviewed`;
+    document.getElementById('bar').style.width=total?`${{Math.round(completed/total*100)}}%`:'0%';
+    const blockers=data.schedule_blockers||[];
+    document.getElementById('finishButton').disabled=blockers.length>0;
+    document.getElementById('globalStatus').textContent=blockers.join(' ')||'Selected finished videos are ready for your final scheduling approval.';
+    return;
+  }}
   const total = data.total || data.items.length || 0;
   const completed = data.completed || 0;
   const regenerated = data.regenerated || 0;
