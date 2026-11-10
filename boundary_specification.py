@@ -44,7 +44,7 @@ def construct_preview_candidate(request_id,lane,index,source):
     import json
     from render_recovery import _state, preview_ticket
     from clip_review_state import reviews
-    current_reviews=reviews(request_id)  # ensure existing review schema before claiming
+    current_reviews=reviews(request_id)  # read existing owner-review protection
     key,review_key=LANES[lane]
     with evidence.database() as db:
         db.execute('BEGIN IMMEDIATE')
@@ -67,6 +67,7 @@ def construct_preview_candidate(request_id,lane,index,source):
         if _get(db,operation+':intent','candidate_construction_intent'):
             raise BoundaryReviewRequired('CONSTRUCTION_RUNNING_OR_UNCERTAIN')
         _put(db,'candidate_construction_intent',operation+':intent',dict(candidate=deepcopy(candidate)))
+    original_candidate=deepcopy(candidate)
     aspect='9:16' if lane=='short' else '16:9'
     duration=speech.media_duration(source)
     units=transcript_units(state.get('topic_source_segments'),duration)
@@ -105,7 +106,7 @@ def construct_preview_candidate(request_id,lane,index,source):
             'construction_provenance':dict(version='sentence-first-v1',
                 source_segments=sorted({u['segment_index'] for u in included}),
                 timing_precision=sorted({u['timing_basis'] for u in included}),
-                original_proposal=[candidate['start'],candidate['end']])}
+                original_proposal=[original_candidate['start'],original_candidate['end']])}
 
     bounds=[candidate['start'],candidate['end']]
     try:
@@ -118,13 +119,12 @@ def construct_preview_candidate(request_id,lane,index,source):
             with evidence.database() as db:
                 db.execute('BEGIN IMMEDIATE')
                 _,latest=_state(db,request_id)
-                if (latest[key]['segments'][index]!=candidate or (latest.get(review_key) or {}).get(str(index)) or (latest.get('website_clip_reviews') or {}).get(identity)
+                if (latest[key]['segments'][index]!=original_candidate or (latest.get(review_key) or {}).get(str(index)) or (latest.get('website_clip_reviews') or {}).get(identity)
                         or latest.get('schedule_master') or (db.execute("SELECT 1 FROM sqlite_master WHERE name='clip_review_revisions'").fetchone() and db.execute('SELECT 1 FROM clip_review_revisions WHERE request_id=? AND asset_id=?',(request_id,identity)).fetchone())):
                     raise BoundaryReviewRequired('DRAFT_CHANGED_DURING_CONSTRUCTION')
-                latest[key]['segments'][index]=draft
                 _put(db,'candidate_construction_step',operation+':'+str(step),dict(before=candidate,after=draft))
-                db.execute('UPDATE telegram_requests SET state_json=? WHERE request_id=?',(json.dumps(latest),request_id))
-            candidate=draft; state=latest
+            candidate=draft; state=deepcopy(latest)
+            state[key]['segments'][index]=draft  # provisional state never becomes render eligible
             try:
                 prepared=prepare_for_render(request_id,identity,candidate,source,state,aspect,{},purpose='preview')
             except BoundaryReviewRequired as exc:
@@ -138,7 +138,7 @@ def construct_preview_candidate(request_id,lane,index,source):
             with evidence.database() as db:
                 db.execute('BEGIN IMMEDIATE')
                 _,latest=_state(db,request_id)
-                if (latest[key]['segments'][index]!=candidate or (latest.get(review_key) or {}).get(str(index)) or (latest.get('website_clip_reviews') or {}).get(identity)
+                if (latest[key]['segments'][index]!=original_candidate or (latest.get(review_key) or {}).get(str(index)) or (latest.get('website_clip_reviews') or {}).get(identity)
                         or latest.get('schedule_master') or (db.execute("SELECT 1 FROM sqlite_master WHERE name='clip_review_revisions'").fetchone() and db.execute('SELECT 1 FROM clip_review_revisions WHERE request_id=? AND asset_id=?',(request_id,identity)).fetchone())):
                     raise BoundaryReviewRequired('DRAFT_CHANGED_DURING_CONSTRUCTION')
                 latest[key]['segments'][index]=prepared
@@ -418,3 +418,4 @@ def verify_export(source, output, start, end):
     if not volume or float(volume.group(1)) <= -60:
         raise BoundaryReviewRequired("EXPORTED_AUDIO_INAUDIBLE")
     return dict(source_audio_edges=measurements, full_decode=True, max_volume_db=float(volume.group(1)))
+

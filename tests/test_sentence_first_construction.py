@@ -136,3 +136,18 @@ def test_replacement_uses_actual_selector_records_and_cached_distinct_identity(p
         saved=json.loads(db.execute('SELECT payload FROM intelligence_records WHERE record_id=?',(clip['candidate_id'],)).fetchone()[0])
     assert old=={'protected':True} and saved['candidate_id']==clip['candidate_id']
 
+
+
+def test_failed_draft_preserves_original_candidate_and_cannot_be_consumed(previews,monkeypatch):
+    p=previews;enable(p);s=p['read']();s['result']['segments'][0]['end']=15.7;p['write'](s)
+    before=copy.deepcopy(p['read']()['result']['segments'])
+    def reject(*args,**kwargs):
+        assert p['read']()['result']['segments']==before
+        raise RuntimeError('interrupted provider')
+    p['reviewer'].side_effect=reject
+    with pytest.raises(RuntimeError,match='interrupted provider'):
+        recovery.generate_preview('request','short',0,p['source'])
+    assert p['read']()['result']['segments']==before and not p['calls']
+    with pytest.raises(boundary.BoundaryReviewRequired,match='VALIDATED_SPECIFICATION_REQUIRED'):
+        boundary.consume(p['source'],p['read']()['result']['segments'][0],'9:16')
+
