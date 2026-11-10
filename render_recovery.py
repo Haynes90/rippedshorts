@@ -253,8 +253,15 @@ def preview_items(request_id,state):
                 clip=saved['clip'] if saved else candidate
                 review=(state.get(review_key) or {}).get(str(index)) or {}
                 if saved:
-                    review={**review,'status':'rendered','clip_url':clip.get('clip_url') or clip.get('segment_url'),
-                            'rendered_review_revisions':clip.get('rendered_review_revisions') or {}}
+                    retained=_get(db,clip.get('media_receipt_id'),'retained_media')
+                    expected=(retained or {}).get('expected') or {}
+                    remote=(retained or {}).get('remote') or {}
+                    if (expected.get('asset_id')!=identity or expected.get('specification_id')!=clip.get('boundary_specification_id')
+                            or remote.get('clip_url')!=(clip.get('clip_url') or clip.get('segment_url'))):
+                        review={**review,'status':'preview_held','render_error':'Verified media receipt unavailable; reconcile existing media without rerendering'}
+                    else:
+                        review={**review,'status':'rendered','clip_url':clip.get('clip_url') or clip.get('segment_url'),
+                                'rendered_review_revisions':clip.get('rendered_review_revisions') or {}}
                 elif held:
                     review={**review,'status':'preview_held','render_error':held['category']}
                 else:

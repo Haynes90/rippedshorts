@@ -276,6 +276,20 @@ def prepare_for_render(request_id, identity, candidate, source, state, aspect, a
         words_digest=digest(candidate.get("words")), configuration=configuration(candidate, aspect))
     key = "boundary-assessment:" + VERSION + ":" + digest(binding)
 
+    # Technical source evidence is cached independently of the semantic verdict.
+    # A changed threshold must not repeat an unchanged editorial model request.
+    minimum_db = float(os.getenv('RENDER_AUDIO_MIN_MAX_DB', '-50'))
+    audio_key = 'source-passage-audio:v1:' + digest([source_sha,start,end,minimum_db])
+    def verify_source_audio():
+        from main import _assert_source_audio
+        try:
+            level = _assert_source_audio(source,start=start,duration=end-start,aspect=aspect)
+        except RuntimeError as exc:
+            raise BoundaryReviewRequired(getattr(exc,'audio_failure_category','PASSAGE_AUDIO_UNUSABLE'), error_type=type(exc).__name__) from None
+        return dict(status='VERIFIED',source_sha256=source_sha,start=start,end=end,
+                    max_volume_db=level,minimum_db=minimum_db,basis='decoded_source_passage_and_validated_timed_speech')
+    source_audio = evidence.cached_analysis(audio_key, verify_source_audio)
+
     def analyze():
         context = dict(subject=candidate.get("title") or candidate.get("subject_description"),
             selection_reason=candidate.get("reason") or candidate.get("why_it_will_work"),
@@ -329,7 +343,7 @@ def prepare_for_render(request_id, identity, candidate, source, state, aspect, a
         _put(db, "boundary_assessment", key, assessment)
     if assessment["status"] != "VALIDATED":
         raise BoundaryReviewRequired("EVIDENCE_UNRESOLVED", assessment_id=key, reasons=assessment["reasons"])
-    spec = {**assessment, "assessment_id":key}
+    spec = {**assessment, "assessment_id":key, "source_audio":source_audio}
     spec_id = "boundary-specification:" + digest(spec)
     with evidence.database() as db:
         _put(db, "boundary_specification", spec_id, spec)
@@ -418,4 +432,3 @@ def verify_export(source, output, start, end):
     if not volume or float(volume.group(1)) <= -60:
         raise BoundaryReviewRequired("EXPORTED_AUDIO_INAUDIBLE")
     return dict(source_audio_edges=measurements, full_decode=True, max_volume_db=float(volume.group(1)))
-

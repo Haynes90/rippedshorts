@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
 
 def load_function(filename, name, namespace):
     tree = ast.parse((ROOT / filename).read_text(encoding='utf-8'))
-    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
+    node = next(n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name == name)
     exec(compile(ast.Module(body=[node], type_ignores=[]), filename, 'exec'), namespace)
     return namespace[name]
 
@@ -129,11 +129,14 @@ class RealVideoRenderTests(unittest.TestCase):
             os=os,
             re=re,
             logger=logging.getLogger('render-audio-test'),
+            math=math,
             _build_vertical_filter=lambda *args: ('crop=134:240', False),
         )
         env['_audio_max_volume_db'] = load_function(
             'main.py', '_audio_max_volume_db', env
         )
+        load_function('main.py', 'SourceAudioReviewRequired', env)
+        load_function('main.py', '_assert_source_audio', env)
         env['_assert_render_audio'] = load_function(
             'main.py', '_assert_render_audio', env
         )

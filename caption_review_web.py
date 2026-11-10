@@ -9,6 +9,7 @@ import secrets
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 
@@ -129,7 +130,10 @@ def _request_row(request_id: str):
     return row
 
 
-def _media_for_state(state: dict[str, Any], request_id: str) -> dict[str, str]:
+def _media_for_state(state: dict[str, Any], request_id: str, verified_clips=None) -> dict[str, str]:
+    if state.get('preview_first_version') == 1:
+        items = verified_clips if verified_clips is not None else __import__('finished_clip_review').clips(request_id, state)
+        return {c['asset_id']:c['media_url'] for c in items if c['finished']}
     media: dict[str, str] = {}
     clips = (state.get("result") or {}).get("segments", [])
     reviews = dict(state.get("candidate_reviews") or {})
@@ -167,7 +171,9 @@ def _payload_for_session(token: str) -> dict[str, Any]:
     parsed = state.get("parsed") or {}
     video_id = str(parsed.get("video_id") or "")
     title = str(state.get("vid_title") or "").strip() or "Ripped Shorts Review"
-    media = _media_for_state(state, request_id)
+    verified_clips = __import__('finished_clip_review').clips(request_id, state, __import__('clip_review_state').reviews(request_id))
+    media = _media_for_state(state, request_id, verified_clips)
+    playable_assets = {c['asset_id'] for c in verified_clips if c['finished']}
 
     items = []
     for index, draft in enumerate(drafts):
@@ -189,7 +195,7 @@ def _payload_for_session(token: str) -> dict[str, Any]:
                 "editorial_hold": bool(draft.get('editorial_hold')),
                 "selection_feedback": str(draft.get('selection_feedback') or ''),
                 "drive_url": drive_url,
-                "preview_url": _drive_preview(drive_url),
+                "preview_url": ('/api/ripped-shorts/review/'+token+'/clip/'+quote(str(draft.get('asset_id') or ''),safe='')+'/media') if str(draft.get('asset_id') or '') in playable_assets else '',
             }
         )
 
@@ -223,7 +229,7 @@ def _payload_for_session(token: str) -> dict[str, Any]:
         "batch_summary": batch,
         "candidate_evidence": candidate_evidence,
         "comparisons": __import__('clip_review_state').reviews(request_id),
-        "clips": __import__('finished_clip_review').clips(request_id, state, __import__('clip_review_state').reviews(request_id)),
+        "clips": verified_clips,
         "creator_brand": creator_brand,
         "creator_required": creator_required,
         "creator_suggestions": creator_suggestions,
@@ -251,7 +257,8 @@ def _card_html(item: dict[str, Any], token: str) -> str:
     status = "Edited" if item["user_edited"] else (
         "Kept" if item["copy_status"] == "approved" else "Pending"
     )
-    preview = ""  # verified finished playback lives on the primary clip card
+    preview = (f'<video controls playsinline preload="metadata" style="width:100%;max-height:70vh" src="{html.escape(item["preview_url"],quote=True)}"></video>'
+               if item.get('preview_url') else '<p role="status">Verified preview unavailable. Review its pending or held status above.</p>')
 
     if kind == "9:16_SHORT":
         fields = f"""
@@ -542,7 +549,7 @@ def copy_review_page(token: str, stage: str = 'final'):
             )
         raise
     payload['stage'] = stage
-    return Response(content=_page(payload, token), media_type="text/html")
+    return Response(content=_page(payload, token), media_type="text/html", headers={'Cache-Control':'private, no-store'})
 
 
 @router.get("/api/ripped-shorts/review/{token}")

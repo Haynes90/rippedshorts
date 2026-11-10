@@ -927,11 +927,40 @@ def _audio_max_volume_db(
     measured = subprocess.run(
         command, capture_output=True, text=True, timeout=180
     )
+    if measured.returncode != 0:
+        return None
     output = (measured.stderr or "") + "\n" + (measured.stdout or "")
     match = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", output)
     if not match:
         return None
     return float(match.group(1))
+
+
+class SourceAudioReviewRequired(RuntimeError):
+    def __init__(self, message, category):
+        super().__init__(message)
+        self.audio_failure_category = category
+
+
+def _assert_source_audio(source_path: Path, *, start: float, duration: float, aspect: str) -> float:
+    """Decode the actual passage and reject absent, corrupt or silent audio."""
+    minimum_db = float(os.getenv("RENDER_AUDIO_MIN_MAX_DB", "-50"))
+    import sys
+    scope = getattr(sys.modules.get('clip_completion'), '_VALIDATED_SOURCE_AUDIO', None)
+    scoped = scope.get() if scope is not None else None
+    if scoped and scoped[0] == str(Path(source_path).resolve()):
+        proof = scoped[3] or {}
+        level = proof.get('max_volume_db')
+        if (scoped[1] == start and abs(scoped[2]-(start+duration)) < 1e-9
+                and proof.get('status') == 'VERIFIED' and proof.get('minimum_db') == minimum_db
+                and type(level) in (int,float) and math.isfinite(level) and level >= minimum_db):
+            return level
+    source_level = _audio_max_volume_db(source_path, start=start, duration=duration)
+    if source_level is None:
+        raise SourceAudioReviewRequired(f"{aspect} source segment has no usable audio stream; refusing silent render", 'SOURCE_AUDIO_UNAVAILABLE')
+    if source_level < minimum_db:
+        raise SourceAudioReviewRequired(f"{aspect} source segment is effectively silent (max_volume={source_level:.1f} dB, minimum={minimum_db:.1f} dB)", 'PASSAGE_AUDIO_SILENT')
+    return source_level
 
 
 def _assert_render_audio(
@@ -944,18 +973,7 @@ def _assert_render_audio(
 ) -> None:
     """Reject missing/silent source or output audio before Drive upload."""
     minimum_db = float(os.getenv("RENDER_AUDIO_MIN_MAX_DB", "-50"))
-    source_level = _audio_max_volume_db(
-        source_path, start=start, duration=duration
-    )
-    if source_level is None:
-        raise RuntimeError(
-            f"{aspect} source segment has no usable audio stream; refusing silent render"
-        )
-    if source_level < minimum_db:
-        raise RuntimeError(
-            f"{aspect} source segment is effectively silent "
-            f"(max_volume={source_level:.1f} dB, minimum={minimum_db:.1f} dB)"
-        )
+    source_level = _assert_source_audio(source_path, start=start, duration=duration, aspect=aspect)
 
     output_level = _audio_max_volume_db(output_path)
     if output_level is None:
