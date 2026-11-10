@@ -90,3 +90,20 @@ def test_failed_candidate_gets_distinct_replacement_and_siblings_survive(preview
     assert p['read']()['result']['segments'][-1]['candidate_id']=='independent-replacement'
     assert not p['read']()['candidate_reviews'] and not p['read']().get('schedule_master')
 
+
+
+@pytest.mark.parametrize('start,end,reason',[(16,10,'DRAFT_REFERENCE_INVALID'),(10,150,'CONSTRUCTED_FORMAT_INELIGIBLE')])
+def test_invalid_or_format_ineligible_draft_never_reaches_renderer(previews,start,end,reason):
+    p=previews;enable(p);s=p['read']();s['result']['segments'][0].update(start=start,end=end);p['write'](s)
+    with pytest.raises(boundary.BoundaryReviewRequired,match=reason):
+        recovery.generate_preview('request','short',0,p['source'])
+    assert not p['calls'] and not p['reviewer'].called
+
+
+def test_highlight_is_constructed_independently_and_remains_unapproved(previews):
+    p=previews;enable(p)
+    clip=recovery.generate_preview('request','highlight',0,p['source'])
+    assert clip['end']-clip['start']>=180 and clip['boundary_specification_id']
+    assert p['calls'][0][0]=='16:9'
+    assert not p['read']()['topic_reviews'] and not p['read']().get('schedule_master')
+
