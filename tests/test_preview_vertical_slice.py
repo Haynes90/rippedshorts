@@ -142,7 +142,7 @@ def test_actual_ffmpeg_to_retention_authenticated_playback_and_selection(preview
         samples.append(int(32767*gate*(.25*math.sin(2*math.pi*(220*t+20*math.sin(t*.3)))+.1*math.sin(2*math.pi*(370*t+7*math.sin(t*.7))))))
     with wave.open(str(wav),'wb') as w:w.setparams((1,2,16000,0,'NONE','not compressed'));w.writeframes(samples.tobytes())
     subprocess.run([ffmpeg,'-v','error','-y','-f','lavfi','-i','color=c=blue:s=320x180:r=5:d=183','-i',str(wav),'-c:v','libx264','-c:a','aac','-b:a','192k','-shortest',str(source)],check=True)
-    state=p['read']();state['source_validation']['source_sha256']=hashlib.sha256(source.read_bytes()).hexdigest()
+    state=p['read']();state['sentence_first_version']=1;state['source_validation']['source_sha256']=hashlib.sha256(source.read_bytes()).hexdigest()
     state['topic_source_segments']=[dict(start=1.2,end=3.8,text='Complete fixture statement.'),dict(start=4.4,end=181.2,text='Complete extended fixture explanation.')]
     key='result' if lane=='short' else 'topic_result'
     state[key]['segments'][0].update(start=.9,end=4.1 if lane=='short' else 181.5,duration=3.2 if lane=='short' else 180.6,framing_mode='blurred' if lane=='short' else None)

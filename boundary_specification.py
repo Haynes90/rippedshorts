@@ -9,6 +9,8 @@ import math
 import os
 from pathlib import Path
 import re
+import threading
+from collections import OrderedDict
 
 import clip_completion as speech
 import production_intelligence as evidence
@@ -31,6 +33,124 @@ def _hash_file(path):
             return hashlib.file_digest(stream, "sha256").hexdigest()
     except OSError:
         raise BoundaryReviewRequired("SOURCE_UNAVAILABLE") from None
+
+
+def construct_preview_candidate(request_id,lane,index,source):
+    """Resolve only new, unapproved passages; freeze only the validated result.
+
+    Each distinct draft gets the existing cached semantic/acoustic assessment.
+    A claimed/interrupted construction never silently repeats provider work.
+    """
+    import json
+    from render_recovery import _state, preview_ticket
+    from clip_review_state import reviews
+    current_reviews=reviews(request_id)  # read existing owner-review protection
+    key,review_key=LANES[lane]
+    with evidence.database() as db:
+        db.execute('BEGIN IMMEDIATE')
+        _,state=_state(db,request_id)
+        candidate=deepcopy(state[key]['segments'][index])
+        identity=asset_id(request_id,lane,candidate,index)
+        if (state.get('sentence_first_version')!=1 or state.get('preview_first_version')!=1
+                or state.get('show_id') not in {'TCB','TDOG'}
+                or (state.get(review_key) or {}).get(str(index))
+                or (state.get('website_clip_reviews') or {}).get(identity)
+                or state.get('schedule_master') or state.get('schedule_requested_at')
+                or any(r['asset_id']==identity for r in current_reviews)):
+            raise BoundaryReviewRequired('DRAFT_AUTHORITY_REQUIRED')
+        operation='candidate-construction:v1:'+identity
+        prior=_get(db,operation+':result','candidate_construction_result')
+        if prior:
+            if prior['status']=='VALIDATED' and prior['revision']==preview_ticket(request_id,state,identity)['revision']:
+                return candidate
+            raise BoundaryReviewRequired('CONSTRUCTION_HELD_OR_CHANGED',result_id=operation+':result')
+        if _get(db,operation+':intent','candidate_construction_intent'):
+            raise BoundaryReviewRequired('CONSTRUCTION_RUNNING_OR_UNCERTAIN')
+        _put(db,'candidate_construction_intent',operation+':intent',dict(candidate=deepcopy(candidate)))
+    original_candidate=deepcopy(candidate)
+    aspect='9:16' if lane=='short' else '16:9'
+    duration=speech.media_duration(source)
+    units=transcript_units(state.get('topic_source_segments'),duration)
+    seen=set(); assessment=None
+
+    def resolve(bounds):
+        start,end=map(float,bounds)
+        if not math.isfinite(start+end) or not 0<=start<end<=duration:
+            raise BoundaryReviewRequired('DRAFT_REFERENCE_INVALID')
+        included=[u for u in units if u['end']>start and u['start']<end]
+        if not included:
+            raise BoundaryReviewRequired('PASSAGE_EVIDENCE_MISSING')
+        # Explicit draft construction from actual units, never invented words or
+        # a silent repair of an approved cut. Segment units stay whole segments.
+        first,last=min(u['start'] for u in included),max(u['end'] for u in included)
+        start,end=min(start,first),max(end,last)
+        previous=max((u['end'] for u in units if u['end']<=first and u not in included),default=0.)
+        following=min((u['start'] for u in units if u['start']>=last and u not in included),default=duration)
+        for edge,anchor in [('start',start),('end',end)]:
+            measured=acoustic_edge(source,anchor,edge,duration)
+            choices=[]
+            for left,right in measured['quiet_intervals']:
+                low=max(left+.02,previous if edge=='start' else last)
+                high=min(right-.02,first if edge=='start' else following)
+                if low<=high:
+                    choices.append(min(max(anchor,low),high))
+            if choices:
+                cut=min(choices,key=lambda t:abs(t-anchor))
+                if edge=='start': start=cut
+                else: end=cut
+        length=end-start
+        if length<=0 or (aspect=='9:16' and length>90) or (aspect=='16:9' and length<180):
+            raise BoundaryReviewRequired('CONSTRUCTED_FORMAT_INELIGIBLE')
+        return {**candidate,'start':start,'end':end,'duration':length,
+            'transcript':' '.join(u['word'] for u in included),
+            'construction_provenance':dict(version='sentence-first-v1',
+                source_segments=sorted({u['segment_index'] for u in included}),
+                timing_precision=sorted({u['timing_basis'] for u in included}),
+                original_proposal=[original_candidate['start'],original_candidate['end']])}
+
+    bounds=[candidate['start'],candidate['end']]
+    try:
+        for step in range(3):
+            draft=resolve(bounds)
+            signature=digest([draft['start'],draft['end'],draft['transcript']])
+            if signature in seen:
+                raise BoundaryReviewRequired('NO_EVIDENCE_SUPPORTED_PROGRESS')
+            seen.add(signature)
+            with evidence.database() as db:
+                db.execute('BEGIN IMMEDIATE')
+                _,latest=_state(db,request_id)
+                if (latest[key]['segments'][index]!=original_candidate or (latest.get(review_key) or {}).get(str(index)) or (latest.get('website_clip_reviews') or {}).get(identity)
+                        or latest.get('schedule_master') or (db.execute("SELECT 1 FROM sqlite_master WHERE name='clip_review_revisions'").fetchone() and db.execute('SELECT 1 FROM clip_review_revisions WHERE request_id=? AND asset_id=?',(request_id,identity)).fetchone())):
+                    raise BoundaryReviewRequired('DRAFT_CHANGED_DURING_CONSTRUCTION')
+                _put(db,'candidate_construction_step',operation+':'+str(step),dict(before=candidate,after=draft))
+            candidate=draft; state=deepcopy(latest)
+            state[key]['segments'][index]=draft  # provisional state never becomes render eligible
+            try:
+                prepared=prepare_for_render(request_id,identity,candidate,source,state,aspect,{},purpose='preview')
+            except BoundaryReviewRequired as exc:
+                assessment_id=exc.diagnostics.get('assessment_id')
+                with evidence.database() as db:
+                    assessment=_get(db,assessment_id,'boundary_assessment') if assessment_id else None
+                if not assessment:
+                    raise
+                bounds=assessment['suggested_semantic_bounds']
+                continue
+            with evidence.database() as db:
+                db.execute('BEGIN IMMEDIATE')
+                _,latest=_state(db,request_id)
+                if (latest[key]['segments'][index]!=original_candidate or (latest.get(review_key) or {}).get(str(index)) or (latest.get('website_clip_reviews') or {}).get(identity)
+                        or latest.get('schedule_master') or (db.execute("SELECT 1 FROM sqlite_master WHERE name='clip_review_revisions'").fetchone() and db.execute('SELECT 1 FROM clip_review_revisions WHERE request_id=? AND asset_id=?',(request_id,identity)).fetchone())):
+                    raise BoundaryReviewRequired('DRAFT_CHANGED_DURING_CONSTRUCTION')
+                latest[key]['segments'][index]=prepared
+                db.execute('UPDATE telegram_requests SET state_json=? WHERE request_id=?',(json.dumps(latest),request_id))
+                _put(db,'candidate_construction_result',operation+':result',dict(status='VALIDATED',
+                    revision=preview_ticket(request_id,latest,identity)['revision'],specification_id=prepared['boundary_specification_id']))
+            return prepared
+        raise BoundaryReviewRequired('CONSTRUCTION_UNRESOLVED',reasons=assessment['reasons'] if assessment else [])
+    except Exception as exc:
+        with evidence.database() as db:
+            _put(db,'candidate_construction_result',operation+':result',dict(status='HELD',category=type(exc).__name__,diagnostics=getattr(exc,'diagnostics',{})))
+        raise
 
 
 def configuration(candidate, aspect):
@@ -298,3 +418,4 @@ def verify_export(source, output, start, end):
     if not volume or float(volume.group(1)) <= -60:
         raise BoundaryReviewRequired("EXPORTED_AUDIO_INAUDIBLE")
     return dict(source_audio_edges=measurements, full_decode=True, max_volume_db=float(volume.group(1)))
+
