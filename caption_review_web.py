@@ -160,6 +160,7 @@ def _drive_preview(url: str) -> str:
 
 
 def _payload_for_session(token: str) -> dict[str, Any]:
+    from caption_checkpoints import complete_post, editor_revision
     session = _session(token)
     request_id = str(session["request_id"])
     row = _request_row(request_id)
@@ -190,6 +191,8 @@ def _payload_for_session(token: str) -> dict[str, Any]:
                 "video_title": str(draft.get("video_title") or ""),
                 "video_description": str(draft.get("video_description") or ""),
                 "hashtags": str(draft.get("hashtags") or ""),
+                "complete_post": complete_post(draft),
+                "copy_revision": editor_revision(draft),
                 "copy_status": str(draft.get("copy_status") or "pending"),
                 "user_edited": bool(draft.get("user_edited")),
                 "regeneration_count": int(draft.get("regeneration_count") or 0),
@@ -236,7 +239,7 @@ def _payload_for_session(token: str) -> dict[str, Any]:
             schedule_blockers.append('Confirm the batch collaborators.')
         for clip in approved:
             draft = next((d for d in drafts if d.get('asset_id') == clip['asset_id']), None)
-            if not draft or draft.get('copy_status') not in {'approved', 'edited'} or draft.get('editorial_hold'):
+            if not draft or draft.get('copy_status') not in {'approved', 'edited'} or draft.get('editorial_hold') or not complete_post(draft).strip() or (clip['format']=='16:9' and not str(draft.get('video_title') or '').strip()):
                 schedule_blockers.append('Finalize the caption and metadata for ' + str(clip['title']) + '.')
         from clip_review_state import delivery_blockers
         approved_ids = {c['asset_id'] for c in approved}
@@ -285,23 +288,19 @@ def _card_html(item: dict[str, Any], token: str) -> str:
 
     if kind == "9:16_SHORT":
         fields = f"""
-          <label>Caption</label>
-          <textarea id="caption-{index}" rows="10">{html.escape(item["social_caption"])}</textarea>
-          <label>Hashtags</label>
-          <textarea id="hashtags-{index}" rows="3">{html.escape(item["hashtags"])}</textarea>
+          <label>Complete caption, including hashtags</label>
+          <textarea id="caption-{index}" rows="10">{html.escape(item["complete_post"])}</textarea>
         """
     else:
         fields = f"""
           <label>Title</label>
           <input id="title-{index}" value="{html.escape(item["video_title"])}">
-          <label>Description</label>
-          <textarea id="description-{index}" rows="10">{html.escape(item["video_description"])}</textarea>
-          <label>Tags / hashtags</label>
-          <textarea id="hashtags-{index}" rows="3">{html.escape(item["hashtags"])}</textarea>
+          <label>Complete description, including hashtags</label>
+          <textarea id="description-{index}" rows="10">{html.escape(item["complete_post"])}</textarea>
         """
 
     return f"""
-      <article class="asset" id="asset-{index}" data-index="{index}" data-type="{html.escape(kind)}">
+      <article class="asset" id="asset-{index}" data-index="{index}" data-asset="{html.escape(item['asset_id'],quote=True)}" data-type="{html.escape(kind)}" data-copy-revision="{item['copy_revision']}">
         <div class="asset-head">
           <div>
             <span class="pill">{'9:16 Short' if kind == '9:16_SHORT' else '16:9 Highlight'}</span>
@@ -331,11 +330,7 @@ def _page(payload: dict[str, Any], token: str) -> str:
     creator_section = section()
     creator_script = SCRIPT
     cards = "".join(_card_html(item, token) for item in payload["items"])
-    failure_cards=''.join('<p>'+html.escape(str(c['format'])+' clip '+str(c['number'])+': '+str(c['error']))+'</p>'
-        for c in payload.get('candidate_evidence',[]) if c.get('error'))
-    learning_cards=''.join('<details><summary>'+html.escape(str(c['format'])+' clip '+str(c['number'])+' — recommendation/framing evidence')+'</summary><pre>'+html.escape(json.dumps(c,indent=2))+'</pre></details>'
-        for c in payload.get('candidate_evidence',[]) if c.get('learning_influence') or c.get('framing_plan'))
-    cards='<aside aria-label="Per-clip failures">'+failure_cards+'</aside>'+cards+learning_cards
+    # Technical failures/provenance stay in durable evidence, not the copy editor.
     expires = html.escape(payload["expires_at"][:10])
     thumb = (
         f'<img class="source-thumb" src="{html.escape(payload["thumbnail_url"])}" '
@@ -466,43 +461,94 @@ updateProgress();
 function bodyFor(index, action='save') {{
   const card = document.getElementById(`asset-${{index}}`);
   const type = card.dataset.type;
-  const body = {{action,favorite:document.getElementById('favorite-'+index)?.checked===true,
+  const body = {{action,copy_revision:card.dataset.copyRevision,favorite:document.getElementById('favorite-'+index)?.checked===true,
     editorial_hold:document.getElementById('hold-'+index)?.checked===true,
     selection_feedback:document.getElementById('feedback-'+index)?.value||''}};
   if (type === '9:16_SHORT') {{
-    body.social_caption = document.getElementById(`caption-${{index}}`).value;
-    body.hashtags = document.getElementById(`hashtags-${{index}}`).value;
+    body.complete_post = document.getElementById(`caption-${{index}}`).value;
   }} else {{
     body.video_title = document.getElementById(`title-${{index}}`).value;
-    body.video_description = document.getElementById(`description-${{index}}`).value;
-    body.hashtags = document.getElementById(`hashtags-${{index}}`).value;
+    body.complete_post = document.getElementById(`description-${{index}}`).value;
   }}
   return body;
 }}
 
-async function saveAsset(index, action='save') {{
+const copySaves=new Map();
+function draftKey(index) {{return 'ripped-copy:'+TOKEN+':'+document.getElementById('asset-'+index).dataset.asset;}}
+function rememberDraft(index) {{try{{localStorage.setItem(draftKey(index),JSON.stringify(bodyFor(index)));}}catch(_){{}}}}
+function clearDraft(index) {{try{{localStorage.removeItem(draftKey(index));}}catch(_){{}}}}
+function sameCopy(a,b) {{return ['complete_post','video_title','favorite','editorial_hold','selection_feedback'].every(k=>!(k in b)||a[k]===b[k]);}}
+async function reviewJson(response) {{
+  const text=await response.text();let data;
+  try{{data=JSON.parse(text);}}catch(_){{throw new Error('HTTP '+response.status+': save response was not JSON; checking the saved copy.');}}
+  if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:'HTTP '+response.status+': review request failed.');
+  return data;
+}}
+function applyReviewState(data) {{
+  state=data;
+  for(const item of data.items||[]){{const card=document.getElementById('asset-'+item.index);if(card)card.dataset.copyRevision=item.copy_revision;}}
+  updateProgress();
+}}
+async function refreshReviewState() {{
+  const data=await reviewJson(await fetch('/api/ripped-shorts/review/'+TOKEN,{{cache:'no-store'}}));
+  applyReviewState(data);return data;
+}}
+async function performCopySave(index, action) {{
   const saved = document.getElementById(`saved-${{index}}`);
+  const submitted=bodyFor(index,action);rememberDraft(index);
   saved.textContent = 'Saving…';
   try {{
     const response = await fetch(`/api/ripped-shorts/review/${{TOKEN}}/asset/${{index}}`, {{
       method:'POST',
       headers:{{'Content-Type':'application/json'}},
-      body:JSON.stringify({{...bodyFor(index, action),playback_verified:document.getElementById('playback-'+index)?.checked===true}})
+      body:JSON.stringify({{...submitted,playback_verified:document.getElementById('playback-'+index)?.checked===true}})
     }});
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || 'Save failed');
+    const data = await reviewJson(response);
+    if(data.review)applyReviewState(data.review);
+    if(sameCopy(bodyFor(index),submitted))clearDraft(index);else rememberDraft(index);
     saved.textContent = `Saved ✓ ${{new Date().toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}})}}`;
+    if(data.checkpoint_pending)saved.textContent+=' — learning sync pending; your edit is saved.';
     document.getElementById(`status-${{index}}`).textContent =
       action === 'keep' ? 'Kept' : 'Edited';
-    state.completed = data.completed;
-    state.regenerated = data.regenerated;
-    updateProgress();
     return data;
   }} catch (error) {{
-    saved.textContent = `Not saved — ${{error.message}}`;
+    // A failed response can follow a committed save. Read back once, never POST twice.
+    try{{
+      const data=await refreshReviewState();
+      const current=(data.items||[]).find(i=>i.index===index);
+      if(current&&['approved','edited'].includes(current.copy_status)&&sameCopy(current,submitted)){{
+        if(sameCopy(bodyFor(index),submitted))clearDraft(index);else rememberDraft(index);
+        saved.textContent='Saved ✓ — confirmed by server readback after an interrupted response.';
+        return {{status:'saved_reconciled',review:data}};
+      }}
+    }}catch(_){{}}
+    saved.textContent = `Save not confirmed — ${{error.message}} Your text is retained; check saved copy before retrying.`;
     throw error;
   }}
 }}
+function saveAsset(index, action='save') {{
+  if(copySaves.has(index))return copySaves.get(index);
+  const operation=performCopySave(index,action).finally(()=>copySaves.delete(index));
+  copySaves.set(index,operation);return operation;
+}}
+document.querySelectorAll('.asset[data-index]').forEach(card=>{{
+  const index=Number(card.dataset.index);
+  card.addEventListener('input',()=>rememberDraft(index));
+  let cached;try{{cached=JSON.parse(localStorage.getItem(draftKey(index))||'null');}}catch(_){{}}
+  if(!cached)return;
+  const restore=()=>{{
+    document.getElementById((card.dataset.type==='9:16_SHORT'?'caption-':'description-')+index).value=cached.complete_post;
+    if('video_title' in cached)document.getElementById('title-'+index).value=cached.video_title;
+    document.getElementById('favorite-'+index).checked=cached.favorite===true;
+    document.getElementById('hold-'+index).checked=cached.editorial_hold===true;
+    document.getElementById('feedback-'+index).value=cached.selection_feedback||'';
+    document.getElementById('saved-'+index).textContent='Unsaved text restored. Review it before saving.';
+  }};
+  if(sameCopy(bodyFor(index),cached)){{clearDraft(index);return;}}
+  if(cached.copy_revision===card.dataset.copyRevision){{restore();return;}}
+  const button=document.createElement('button');button.type='button';button.textContent='Restore unsaved text';button.onclick=restore;
+  const status=document.getElementById('saved-'+index);status.textContent='Newer saved copy exists. Your unsaved text is retained separately. ';status.append(button);
+}});
 
 async function keepAsset(index) {{
   await saveAsset(index, 'keep');
@@ -516,17 +562,15 @@ async function regenAsset(index) {{
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Regeneration failed');
     if (data.asset_type === '9:16_SHORT') {{
-      document.getElementById(`caption-${{index}}`).value = data.social_caption || '';
-      document.getElementById(`hashtags-${{index}}`).value = data.hashtags || '';
+      document.getElementById(`caption-${{index}}`).value = data.complete_post || '';
     }} else {{
       document.getElementById(`title-${{index}}`).value = data.video_title || '';
-      document.getElementById(`description-${{index}}`).value = data.video_description || '';
-      document.getElementById(`hashtags-${{index}}`).value = data.hashtags || '';
+      document.getElementById(`description-${{index}}`).value = data.complete_post || '';
     }}
     document.getElementById(`status-${{index}}`).textContent = 'Pending';
     saved.textContent = 'New draft generated — review and Save or Keep.';
-    state.regenerated = data.regenerated;
-    updateProgress();
+    if(data.review)applyReviewState(data.review);
+    clearDraft(index);
   }} catch(error) {{
     saved.textContent = `Regeneration failed — ${{error.message}}`;
   }}
@@ -685,6 +729,7 @@ def finished_clip_media(token: str, asset_id: str):
 
 @router.post("/api/ripped-shorts/review/{token}/asset/{index}")
 async def save_review_asset(token: str, index: int, request: Request):
+    from caption_checkpoints import editor_revision
     session = _session(token)
     request_id = str(session["request_id"])
     row = _request_row(request_id)
@@ -696,8 +741,16 @@ async def save_review_asset(token: str, index: int, request: Request):
     body = await request.json()
     action = str(body.get("action") or "save").lower()
     draft = dict(drafts[index])
+    if 'complete_post' in body:
+        if not isinstance(body['complete_post'],str):
+            raise HTTPException(status_code=400,detail='Complete post must be text')
+        if body.get('copy_revision') != editor_revision(draft):
+            raise HTTPException(status_code=409,detail='Saved copy changed; your unsaved text is retained. Refresh and reconcile before saving.')
     from batch_progress import copy_frozen
     if copy_frozen(state,str(draft.get('asset_id') or '')):
+        from caption_checkpoints import complete_post
+        if 'complete_post' in body and body['complete_post'] != complete_post(draft):
+            raise HTTPException(status_code=409,detail='Submitted copy is frozen')
         if any(k in body and body[k]!=draft.get(k, False if k!='selection_feedback' else '') for k in ('favorite','editorial_hold','selection_feedback')):
             raise HTTPException(status_code=409,detail='Submitted approvals and holds are frozen')
         if all(str(body.get(k) or '')==str(draft.get(k) or '') for k in ('social_caption','video_title','video_description','hashtags') if k in body):
@@ -717,6 +770,13 @@ async def save_review_asset(token: str, index: int, request: Request):
         raise HTTPException(status_code=409,detail='Submitted copy is frozen')
     asset_type = str(draft.get("asset_type") or "")
     changed = False
+
+    if 'complete_post' in body:
+        import re
+        field='social_caption' if asset_type=='9:16_SHORT' else 'video_description'
+        body[field]=body['complete_post']
+        body['hashtags']=' '.join(dict.fromkeys(re.findall(r'(?<!\w)#\w+',body['complete_post'],re.UNICODE)))
+        draft.update(post_editor_version=1,post_text=body['complete_post'])
 
     if asset_type == "9:16_SHORT":
         for key in ("social_caption", "hashtags"):
@@ -772,6 +832,8 @@ async def save_review_asset(token: str, index: int, request: Request):
         matching=next((i for i,d in enumerate(latest_drafts) if d.get('asset_id')==draft.get('asset_id')),None)
         if matching is None or copy_frozen(current,str(draft.get('asset_id') or '')):
             raise HTTPException(status_code=409,detail='Clip changed or was submitted while editing; refresh review')
+        if 'complete_post' in body and body['copy_revision'] != editor_revision(latest_drafts[matching]):
+            raise HTTPException(status_code=409,detail='Saved copy changed while editing; your text is retained. Refresh before saving.')
         latest_drafts[matching]=draft
         current['copy_drafts']=latest_drafts
         current['copy_review_index']=matching
@@ -789,8 +851,14 @@ async def save_review_asset(token: str, index: int, request: Request):
         observe(request_id,state)
     except Exception:
         __import__('logging').getLogger(__name__).exception('Review evidence projection pending')
-    tg._checkpoint_copy_edit(request_id, state, draft, str(row["user_id"] or "web_review"))
-    tg._refresh_copy_review(str(row["chat_id"]), request_id, index=index)
+    checkpoint_pending=False
+    try:
+        tg._checkpoint_copy_edit(request_id, state, draft, str(row["user_id"] or "web_review"))
+    except Exception:
+        checkpoint_pending=True
+        __import__('logging').getLogger(__name__).exception('Copy saved locally; learning checkpoint pending request=%s',request_id)
+    # No legacy Telegram callback menu after a website save: long request IDs
+    # exceed Telegram's 64-byte limit AFTER the successful database commit.
 
     payload = _payload_for_session(token)
     return {
@@ -798,6 +866,8 @@ async def save_review_asset(token: str, index: int, request: Request):
         "asset_index": index,
         "completed": payload["completed"],
         "regenerated": payload["regenerated"],
+        "checkpoint_pending": checkpoint_pending,
+        "review": payload,
     }
 
 
@@ -824,6 +894,8 @@ def regenerate_review_asset(token: str, index: int):
         str((state.get("parsed") or {}).get("source_value") or ""),
     )[0]
     fresh["ai_social_caption"] = fresh.get("social_caption", "")
+    fresh.pop('post_editor_version',None)
+    fresh.pop('post_text',None)
     fresh["ai_video_title"] = fresh.get("video_title", "")
     fresh["ai_video_description"] = fresh.get("video_description", "")
     fresh["copy_status"] = "pending"
@@ -840,10 +912,9 @@ def regenerate_review_asset(token: str, index: int):
             (json.dumps(state), _iso(_now()), request_id),
         )
 
-    tg._refresh_copy_review(str(row["chat_id"]), request_id, index=index)
     payload = _payload_for_session(token)
-    current = payload["items"][index]
-    return {**current, "status": "regenerated", "regenerated": payload["regenerated"]}
+    current = next(item for item in payload['items'] if item['index']==index)
+    return {**current, "status": "regenerated", "regenerated": payload["regenerated"], "review":payload}
 
 
 @router.post("/api/ripped-shorts/review/{token}/creators")
@@ -912,6 +983,9 @@ def finish_review(token: str):
     eligible_ids = {c['asset_id'] for c in finished}
     if any(d.get('copy_status') not in {'approved','edited'} for d in drafts if str(d.get('asset_id') or '') in eligible_ids):
         raise HTTPException(status_code=409, detail='Approve every selected clip caption before finishing')
+    from caption_checkpoints import complete_post
+    if any(not complete_post(d).strip() or (d.get('asset_type')=='16:9_HIGHLIGHT' and not str(d.get('video_title') or '').strip()) for d in drafts if d.get('asset_id') in eligible_ids):
+        raise HTTPException(status_code=409,detail='Enter the complete caption or description and required video title before scheduling')
     state.pop("awaiting_copy_input", None)
     state["copy_review_completed_at"] = _iso(_now())
     state["schedule_requested_at"] = _iso(_now())

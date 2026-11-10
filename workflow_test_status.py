@@ -18,6 +18,8 @@ def stamp():
 
 
 def copy_revision(drafts):
+    from caption_checkpoints import transport_copy
+    drafts = [transport_copy(d) for d in drafts]
     fields = ('asset_id','asset_type','social_caption','video_title','video_description','hashtags','copy_status')
     frozen = sorted(({k:(d.get(k) or '') for k in fields} for d in drafts), key=lambda d:d['asset_id'])
     return hashlib.sha256(json.dumps(frozen,sort_keys=True,ensure_ascii=False).encode()).hexdigest()

@@ -36,6 +36,7 @@ async function saveCreators() {
  if(entries.filter(p=>p.intent==='invite').length>3){document.getElementById('creatorStatus').textContent='Choose at most 3 native Instagram collaborators.';return;}
  const response=await fetch(`/api/ripped-shorts/review/${TOKEN}/creators`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:true,entries})});
  const result=await response.json();document.getElementById('creatorStatus').textContent=response.ok?'Batch creators confirmed.':(result.detail||'Could not save creator approval.');
+ if(response.ok&&typeof refreshReviewState==='function')await refreshReviewState();
 }
 if(state.creator_required){
  const saved=state.creator_approval;

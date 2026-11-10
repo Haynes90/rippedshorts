@@ -1545,6 +1545,8 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
             for asset in assets
         ]
     from workflow_test_status import journal, context, copy_revision
+    from caption_checkpoints import transport_copy
+    assets = [transport_copy(asset, reviewed_copy.get(str(asset.get('asset_id') or ''))) for asset in assets]
     journal(request_id,state,creators)
     workflow_context = {**context(request_id,state), 'approved_caption_revision':copy_revision(assets),
         'approved_collaborator_revision':(creators or {}).get('approval_revision'),
