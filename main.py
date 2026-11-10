@@ -945,8 +945,9 @@ class SourceAudioReviewRequired(RuntimeError):
 def _assert_source_audio(source_path: Path, *, start: float, duration: float, aspect: str) -> float:
     """Decode the actual passage and reject absent, corrupt or silent audio."""
     minimum_db = float(os.getenv("RENDER_AUDIO_MIN_MAX_DB", "-50"))
-    from clip_completion import _VALIDATED_SOURCE_AUDIO
-    scoped = _VALIDATED_SOURCE_AUDIO.get()
+    import sys
+    scope = getattr(sys.modules.get('clip_completion'), '_VALIDATED_SOURCE_AUDIO', None)
+    scoped = scope.get() if scope is not None else None
     if scoped and scoped[0] == str(Path(source_path).resolve()):
         proof = scoped[3] or {}
         level = proof.get('max_volume_db')
