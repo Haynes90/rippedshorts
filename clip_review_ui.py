@@ -8,6 +8,8 @@ def finished_cards(items, token):
     cards = []
     reasons = [('poor_topic','Poor topic choice'),('weak_hook','Weak hook'),('incomplete_thought','Incomplete thought'),('unnecessary_length','Unnecessary length'),('inaccurate_transcript','Inaccurate transcript'),('unsuitable_framing','Unsuitable framing'),('bad_audio','Bad audio')]
     for item in items:
+        if item.get('preview') and not item['finished']:
+            continue  # Optional failures remain in backend evidence, never selectable cards.
         asset = item['asset_id']; key = asset.replace(':','-'); decision = item['decision']
         video = '<p role="status">Finished video unavailable — '+html.escape(str(item.get('error') or item['render_status']))+'. No source preview is presented as a final export.</p>'
         if item['finished']:
@@ -56,7 +58,7 @@ async function clipDecision(asset,choice){
   const response=await fetch('/api/ripped-shorts/review/'+TOKEN+'/clip/'+encodeURIComponent(asset),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice,version:Number(card.dataset.version),reason:document.getElementById('clip-reason-'+key).value,feedback:document.getElementById('clip-feedback-'+key).value,changed_fields:choice==='request_adjustment'?[document.getElementById('clip-edit-'+key).value]:[],playback_verified:document.getElementById('clip-playback-'+key).checked,framing_verified:document.getElementById('clip-framing-'+key)?.checked===true})});
   const result=await response.json();if(!response.ok)throw new Error(result.detail||'Save failed');
   card.dataset.version=result.decision.version;status.textContent='Saved: '+result.decision.choice+'. No rendering, scheduling or collaborator invitation started.';
-  if(result.copy_review_ready)location.reload();
+  if(result.copy_review_ready||INITIAL.preview_first)location.reload();
  }catch(error){status.textContent='Not saved: '+error.message;}
 }
 </script>'''
