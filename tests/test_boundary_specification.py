@@ -18,12 +18,15 @@ import boundary_specification as boundary
 import clip_completion as speech
 REAL_DURATION = speech.media_duration
 REAL_EDGE = boundary.acoustic_edge
+REAL_SOURCE_AUDIO = __import__("main")._assert_source_audio
 
 
 @pytest.fixture
 def passage(tmp_path, monkeypatch):
     import audio_master_handoff as storage
     import telegram_intake as tg
+    import main
+    monkeypatch.setattr(main,"_assert_source_audio",lambda *a,**k:-1.)
     monkeypatch.setattr(storage,"DB_PATH",tmp_path/"isolated.db")
     monkeypatch.setattr(storage,"DATA_DIR",tmp_path)
     monkeypatch.setattr(tg,"DB_PATH",storage.DB_PATH)
@@ -193,7 +196,7 @@ def test_invalid_semantic_references_persist_sanitized_deterministic_failure(pas
     with pytest.raises(ValueError,match="Saved analysis failed"):p["prepare"]()
     assert p["reviewer"].call_count==1
     with boundary.evidence.database() as db:
-        saved=db.execute("SELECT result,status FROM source_analyses").fetchone()
+        saved=db.execute("SELECT result,status FROM source_analyses WHERE analysis_id LIKE ?",("boundary-assessment:%",)).fetchone()
     assert saved["status"]=="FAILED" and "SEMANTIC_REFERENCE_INVALID" in saved["result"]
     assert "Dry tiny seeds" not in saved["result"]
 
@@ -294,6 +297,7 @@ def test_persisted_contract_through_actual_ffmpeg_export_in_both_formats(passage
     if not shutil.which("ffprobe"):pytest.skip("FFprobe required; GitHub installs FFmpeg tools")
     p=passage;ffmpeg=pytest.importorskip("imageio_ffmpeg").get_ffmpeg_exe()
     monkeypatch.setenv("FFMPEG_BINARY",ffmpeg);monkeypatch.setattr(speech,"media_duration",REAL_DURATION)
+    monkeypatch.setattr(__import__("main"),"_assert_source_audio",REAL_SOURCE_AUDIO)
     monkeypatch.setattr(boundary,"acoustic_edge",REAL_EDGE)
     source=p["tmp"]/"real-source.mp4";audio=p["tmp"]/"source-audio.wav";output=p["tmp"]/"actual-export.mp4"
     total,release,end=(6.,3.8,4.1) if aspect=="9:16" else (183.,181.2,181.5)

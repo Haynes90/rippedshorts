@@ -15,27 +15,41 @@ def finished_cards(items, token):
         disabled = 'disabled' if item['frozen'] else ''
         unused = f'<button type="button" {disabled} onclick="clipDecision(\'{asset}\',\'unused\')">Leave unused</button>' if item.get('preview') else ''
         framing = f'<label><input type="checkbox" id="clip-framing-{key}" style="width:auto"> I approve this preview framing</label>' if item.get('preview') else ''
-        approve_disabled = 'disabled' if item['frozen'] or not item['finished'] else ''
+        approve_disabled = 'disabled'  # enable only after this exact player decodes media
+        player_status = '<p data-player-status role="status">Loading verified preview...</p>' if item['finished'] else ''
         why = item.get('reason') or 'No selection explanation was saved for this legacy candidate.'
-        evidence = item.get('provenance') or {'status':'NOT_RECORDED — legacy candidate; no prompt/map revision inferred retroactively'}
+        try:
+            seconds = max(0., float(item['bounds'][1])-float(item['bounds'][0]))
+            duration_text = f'{int(seconds//60)}:{seconds%60:04.1f}'
+        except (ValueError,TypeError,KeyError,IndexError):
+            duration_text = 'Duration pending'
         saved_status = 'Previous approval needs renewed review for this render' if decision.get('choice')=='approve' and not item['approval_current'] else str(decision.get('choice') or 'Undecided')
         options = ''.join(f'<option value="{code}" {"selected" if decision.get("reason")==code else ""}>{label}</option>' for code,label in reasons)
-        cards.append(f'''<article class="clip-card" id="clip-{key}" data-asset="{html.escape(asset)}" data-version="{decision.get('version',0)}" style="border:1px solid #315163;border-radius:16px;padding:14px;margin:16px 0">
+        cards.append(f'''<article class="clip-card" id="clip-{key}" data-asset="{html.escape(asset)}" data-version="{decision.get('version',0)}" data-frozen="{int(bool(item['frozen']))}" style="border:1px solid #315163;border-radius:16px;padding:14px;margin:16px 0">
 <span class="pill">{item['format']}</span><h2>{html.escape(str(item['title']))}</h2>
-<p>Category: {html.escape(str(item['category']))} · Clip {item['number']}</p>
+<p>{duration_text} · Clip {item['number']}</p>
 <details><summary>Complete excerpt transcript{' — awaiting final render' if not item['finished'] else ''}</summary><p style="white-space:pre-wrap">{html.escape(item['transcript'])}</p></details>
-{video}<p><strong>Why selected:</strong> {html.escape(str(why))}</p>
-<details><summary>Selection evidence</summary><pre style="white-space:pre-wrap">{html.escape(json.dumps(evidence,indent=2))}</pre></details>
+{video}{player_status}<p><strong>Why this clip?</strong> {html.escape(str(why))}</p>
 <label><input type="checkbox" id="clip-playback-{key}" style="width:auto"> I watched this finished clip and heard its audio</label>
 {framing}
 <label for="clip-reason-{key}">Reason if rejecting</label><select id="clip-reason-{key}"><option value="">Choose a reason</option>{options}</select>
 <label for="clip-feedback-{key}">Optional feedback / adjustment request</label><textarea id="clip-feedback-{key}">{html.escape(str(decision.get('feedback') or ''))}</textarea>
 <label for="clip-edit-{key}">If requesting an adjustment</label><select id="clip-edit-{key}"><option value="boundaries">Boundaries</option><option value="topic_context">Topic/context</option><option value="caption">Caption</option><option value="framing">Framing</option><option value="audio">Audio</option></select>
-<div class="actions"><button type="button" {approve_disabled} onclick="clipDecision('{asset}','approve')">Approve Clip</button><button type="button" {disabled} onclick="clipDecision('{asset}','reject')">Reject Clip</button><button type="button" {disabled} onclick="clipDecision('{asset}','request_adjustment')">Request Adjustment</button></div>
+<div class="actions"><button type="button" data-approve-clip {approve_disabled} onclick="clipDecision('{asset}','approve')">Approve Clip</button><button type="button" {disabled} onclick="clipDecision('{asset}','reject')">Reject Clip</button><button type="button" {disabled} onclick="clipDecision('{asset}','request_adjustment')">Request Adjustment</button></div>
 {unused}<button type="button" class="secondary" onclick="document.getElementById('editing-workflow').open=true;document.getElementById('editing-workflow').scrollIntoView()">Edit / compare alternatives</button>
 <p id="clip-status-{key}" role="status">Saved clip decision: {html.escape(saved_status)}</p>
 <p class="meta">Clip approval does not approve copy, invite collaborators or start scheduling.</p></article>''')
     return ''.join(cards) + '''<script>
+document.querySelectorAll('.clip-card').forEach(card=>{
+ const video=card.querySelector('video'),approve=card.querySelector('[data-approve-clip]'),status=card.querySelector('[data-player-status]');
+ if(!video)return;
+ const update=()=>{
+  const ready=!video.error&&video.readyState>=2;
+  approve.disabled=card.dataset.frozen==='1'||!ready;
+  status.textContent=video.error?'Preview could not load. Refresh or report media access; do not rerender.':ready?'Preview ready to watch.':'Loading verified preview...';
+ };
+ ['loadeddata','error','emptied'].forEach(event=>video.addEventListener(event,update));update();
+});
 async function clipDecision(asset,choice){
  const key=asset.replaceAll(':','-'),card=document.getElementById('clip-'+key),status=document.getElementById('clip-status-'+key);
  try{

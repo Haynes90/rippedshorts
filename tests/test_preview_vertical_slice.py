@@ -23,6 +23,7 @@ import clip_completion as speech
 from test_boundary_specification import passage, REAL_DURATION, REAL_EDGE
 
 REAL_RENDER=speech.render_complete_clip
+REAL_SOURCE_AUDIO=__import__("main")._assert_source_audio
 
 
 @pytest.fixture
@@ -132,6 +133,7 @@ def test_actual_ffmpeg_to_retention_authenticated_playback_and_selection(preview
     p=previews;import imageio_ffmpeg
     ffmpeg=imageio_ffmpeg.get_ffmpeg_exe();monkeypatch.setenv('FFMPEG_BINARY',ffmpeg)
     monkeypatch.setattr(speech,'render_complete_clip',REAL_RENDER)
+    monkeypatch.setattr(p['main'],'_assert_source_audio',REAL_SOURCE_AUDIO)
     monkeypatch.setattr(speech,'media_duration',REAL_DURATION);monkeypatch.setattr(boundary,'acoustic_edge',REAL_EDGE)
     source=p['tmp']/'real-fixture.mp4';wav=p['tmp']/'real-fixture.wav'
     from array import array
