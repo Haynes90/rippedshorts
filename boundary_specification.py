@@ -418,4 +418,3 @@ def verify_export(source, output, start, end):
     if not volume or float(volume.group(1)) <= -60:
         raise BoundaryReviewRequired("EXPORTED_AUDIO_INAUDIBLE")
     return dict(source_audio_edges=measurements, full_decode=True, max_volume_db=float(volume.group(1)))
-

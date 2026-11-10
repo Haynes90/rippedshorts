@@ -195,4 +195,3 @@ def test_discovery_dispatches_both_lanes_on_existing_bounded_executor_once(previ
         assert all(f.result(timeout=10)==['verified'] for f in results.values())
         assert recovery.start_preview_pipeline('request',p['source'])=={}
     assert sorted(seen)==['highlight','short'] and not p['read']()['candidate_reviews']
-

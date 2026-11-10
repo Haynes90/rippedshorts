@@ -634,4 +634,3 @@ def restore_from_receipt(request_id, receipt_id, verify_media):
              dict(request_id=request_id, receipt_id=receipt_id, previous_collections={k:current.get(k) for k in receipt['collections']}))
         db.execute('UPDATE telegram_requests SET state_json=? WHERE request_id=?', (json.dumps(latest), request_id))
     return latest
-

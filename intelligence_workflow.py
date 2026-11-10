@@ -176,4 +176,3 @@ def sync():
     if not sheet:
         return
     return intelligence.sync_sheets(sheets_service(), sheet)
-

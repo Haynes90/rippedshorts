@@ -90,4 +90,3 @@ def test_failed_candidate_gets_distinct_replacement_and_siblings_survive(preview
     assert p['read']()['result']['segments'][-1]['candidate_id']=='independent-replacement'
     assert not p['read']()['candidate_reviews'] and not p['read']().get('schedule_master')
 
-
