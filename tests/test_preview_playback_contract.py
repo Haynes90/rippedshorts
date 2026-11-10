@@ -131,3 +131,22 @@ video.error=null;card.dataset.frozen='1';listeners.loadeddata();assert.equal(app
 """
     file=tmp_path/'player-gate.cjs';file.write_text(harness,encoding='utf-8')
     subprocess.run(['node',str(file)],check=True,capture_output=True,text=True)
+
+
+
+def test_render_scope_reuses_exact_source_measurement_and_always_resets(passage,monkeypatch):
+    import main,clip_completion as speech
+    from test_preview_vertical_slice import REAL_SOURCE_AUDIO
+    p=passage;prepared=p['prepare']()
+    measure=Mock(return_value=-2.)
+    monkeypatch.setattr(main,'_audio_max_volume_db',measure)
+    monkeypatch.setattr(main,'_assert_source_audio',REAL_SOURCE_AUDIO)
+    def renderer(source,start,duration,out):
+        assert main._assert_source_audio(source,start=start,duration=duration,aspect='9:16')==-1.
+        assert not measure.called
+        raise RuntimeError('isolated renderer stopped')
+    with pytest.raises(RuntimeError,match='isolated renderer stopped'):
+        speech.render_complete_clip(p['source'],prepared,p['tmp']/'out.mp4',renderer,'9:16')
+    assert speech._VALIDATED_SOURCE_AUDIO.get() is None
+    assert main._assert_source_audio(p['source'],start=10.,duration=6.,aspect='9:16')==-2.
+    assert measure.call_count==1

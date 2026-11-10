@@ -12,11 +12,13 @@ import threading
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import ContextVar
 
 import requests
 
 logger = logging.getLogger(__name__)
 _TRANSCRIPTION_GATE = threading.Semaphore(1)
+_VALIDATED_SOURCE_AUDIO = ContextVar('validated_source_audio', default=None)
 
 
 class CompletionReviewRequired(RuntimeError):
@@ -318,7 +320,14 @@ def render_complete_clip(video, segment, output, renderer, aspect):
     if any(thought.get(k) is not True for k in ('complete_start','complete_end','complete_thought')):
         raise CompletionReviewRequired('The approved excerpt does not establish a complete thought; review its boundaries')
     try:
-        renderer(video, start, end - start, output)
+        # consume() has verified the immutable spec/source identity. Reuse its
+        # decoded-source measurement only inside this exact renderer invocation.
+        token = _VALIDATED_SOURCE_AUDIO.set((str(Path(video).resolve()), start, end,
+                    specification.get('source_audio')) if specification else None)
+        try:
+            renderer(video, start, end - start, output)
+        finally:
+            _VALIDATED_SOURCE_AUDIO.reset(token)
         if not Path(output).is_file() or Path(output).stat().st_size == 0:
             raise CompletionReviewRequired("Renderer produced no video")
         # Listen to both exported edges and compare them with the approved transcript.

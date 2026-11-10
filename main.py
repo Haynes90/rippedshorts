@@ -945,6 +945,15 @@ class SourceAudioReviewRequired(RuntimeError):
 def _assert_source_audio(source_path: Path, *, start: float, duration: float, aspect: str) -> float:
     """Decode the actual passage and reject absent, corrupt or silent audio."""
     minimum_db = float(os.getenv("RENDER_AUDIO_MIN_MAX_DB", "-50"))
+    from clip_completion import _VALIDATED_SOURCE_AUDIO
+    scoped = _VALIDATED_SOURCE_AUDIO.get()
+    if scoped and scoped[0] == str(Path(source_path).resolve()):
+        proof = scoped[3] or {}
+        level = proof.get('max_volume_db')
+        if (scoped[1] == start and abs(scoped[2]-(start+duration)) < 1e-9
+                and proof.get('status') == 'VERIFIED' and proof.get('minimum_db') == minimum_db
+                and type(level) in (int,float) and math.isfinite(level) and level >= minimum_db):
+            return level
     source_level = _audio_max_volume_db(source_path, start=start, duration=duration)
     if source_level is None:
         raise SourceAudioReviewRequired(f"{aspect} source segment has no usable audio stream; refusing silent render", 'SOURCE_AUDIO_UNAVAILABLE')
