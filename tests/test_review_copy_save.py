@@ -71,10 +71,21 @@ def test_stale_copy_revision_is_not_resubmitted_or_overwritten(editor):
 
 def test_legacy_hashtags_combined_once_and_submitted_post_is_frozen(editor):
     assert complete_post(dict(asset_type='9:16_SHORT',social_caption='Exact #seeds\nWords',hashtags='#seeds #garden #garden'))=='Exact #seeds\nWords\n\n#garden'
+    assert complete_post(dict(asset_type='9:16_SHORT',social_caption='Exact #Seeds',hashtags='#seeds #Garden #garden'))=='Exact #Seeds\n\n#Garden'
     r=editor;s=read_state(r);s['schedule_master']={'shorts_status':'accepted','shorts_response':{'asset_group_ids':['existing:short:1']}};save_state(r,s)
     d=s['copy_drafts'][0]
     response=r['client'].post('/api/ripped-shorts/review/'+r['token']+'/asset/0',json={'complete_post':'Attempt to alter submitted copy','copy_revision':editor_revision(d)})
     assert response.status_code==409 and read_state(r)==s
+
+
+def test_final_approval_requires_nonempty_copy_without_changing_saved_selection(editor,monkeypatch):
+    r=editor;s=read_state(r);s['copy_drafts'][0].update(social_caption='',hashtags='',copy_status='approved');save_state(r,s)
+    monkeypatch.setattr(__import__('creator_approval'),'approved_batch',lambda _:dict(approved_at='now',approval_revision=1))
+    notify=Mock();monkeypatch.setattr(r['tg'],'_notify_render_queue_complete',notify)
+    result=r['client'].post('/api/ripped-shorts/review/'+r['token']+'/finish')
+    assert result.status_code==409 and 'complete caption' in result.json()['detail']
+    assert read_state(r)==s
+    notify.assert_not_called()
 
 
 def test_frontend_uncertain_response_reads_back_without_duplicate_post(editor,tmp_path):
