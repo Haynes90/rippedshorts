@@ -7,6 +7,7 @@ on:
       - 'google_drive.py'
       - 'tests/test_retained_preview_upload.py'
       - 'tests/test_preview_vertical_slice.py'
+      - 'tests/test_sentence_first_construction.py'
       - 'tests/test_completion_cache_expiry.py'
       - 'finished_clip_review.py'
       - 'caption_review_web.py'
@@ -57,10 +58,11 @@ jobs:
           DATA_DIR: ${{ runner.temp }}/topic-contract-data
           PYTHONPATH: .
           PREVIEW_ACCEPTANCE_EXPORT_DIR: ${{ runner.temp }}/preview-acceptance-evidence
-        run: python -m pytest tests/test_topic_map_reference_contract.py tests/test_semantic_boundary_recovery.py tests/test_production_intelligence.py tests/test_retry_loop_prevention.py tests/test_hierarchical_intelligence.py tests/test_conversation_relationships.py tests/test_chronological_topics.py tests/test_optional_intelligence_fallback.py tests/test_held_source_retention.py tests/test_request_scoped_render_recovery.py tests/test_clip_completion.py tests/test_boundary_specification.py tests/test_retained_preview_upload.py tests/test_preview_vertical_slice.py tests/test_completion_cache_expiry.py -q
+        run: python -m pytest tests/test_topic_map_reference_contract.py tests/test_semantic_boundary_recovery.py tests/test_production_intelligence.py tests/test_retry_loop_prevention.py tests/test_hierarchical_intelligence.py tests/test_conversation_relationships.py tests/test_chronological_topics.py tests/test_optional_intelligence_fallback.py tests/test_held_source_retention.py tests/test_request_scoped_render_recovery.py tests/test_clip_completion.py tests/test_boundary_specification.py tests/test_retained_preview_upload.py tests/test_preview_vertical_slice.py tests/test_completion_cache_expiry.py tests/test_sentence_first_construction.py -q
       - uses: actions/upload-artifact@v4
         with:
           name: synthetic-preview-website-evidence
           path: ${{ runner.temp }}/preview-acceptance-evidence
           retention-days: 3
+
 

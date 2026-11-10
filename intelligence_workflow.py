@@ -5,6 +5,44 @@ import os
 import production_intelligence as intelligence
 
 
+def sentence_first(state):
+    return state.get('sentence_first_version')==1 or (os.getenv('RIPPED_PREVIEW_FIRST_ENABLED','false').lower()=='true'
+        and state.get('show_id') in {'TCB','TDOG'} and not state.get('candidate_reviews'))
+
+
+def replacement_candidates(state,segments,video,lane,attempted,pass_number):
+    """Bounded independent discovery with existing selectors/rubrics/map/learning.
+
+    Rejections are machine evidence, never misattributed as owner preferences.
+    """
+    import main, telegram_intake as tg
+    from selection_specs import selector_result, highlight_framework
+    mapping=saved_mapping(state)
+    aspect='9:16' if lane=='short' else '16:9'
+    learning=intelligence.learning_context(mapping['source'],aspect,mapping['topics'])
+    specification=tg._configured_short_framework_prompt() if lane=='short' else highlight_framework()
+    context=(specification+'\nSHARED VERIFIED SOURCE MAP:\n'+intelligence.encoded(mapping)
+        +intelligence.learning_prompt(learning)+'\nMACHINE ATTEMPTS (not owner rejections):\n'+intelligence.encoded(attempted)
+        +'\nFind other worthwhile complete spoken passages across the full recording. Include necessary questions, setup, responses and payoffs. Returning subjects are allowed; substantially identical attempted intervals are not. Quality over silence and quantity. No quota. Timestamps are provisional until sentence/context/acoustic construction validates them. Never invent speech or timing. Return no suggestions if none meet the approved rubric.')
+    key='sentence-discovery-v1:'+intelligence.identity(state['discovery_operation_id'],mapping['map_id'],aspect,pass_number)
+    def analyze():
+        if lane=='short':
+            result=selector_result(main.call_openai_for_clips(segments,context))
+        else:
+            suggestions=tg._topic_break_suggestions(segments,intelligence_context=context)
+            result={'segments':tg._build_contiguous_topic_segments(segments,suggestions,minimum_seconds=180)}
+        result=intelligence.rank_with_evidence(result,learning)
+        result=intelligence.candidate_records(mapping,aspect,result,learning)
+        for clip in result.get('segments') or []:
+            clip['candidate_id']='sentence-'+intelligence.identity(key,clip['candidate_id'])
+            clip['selection_provenance']={**(clip.get('selection_provenance') or {}),
+                'discovery_recipe':'sentence-first-v1','discovery_id':key,
+                'map_id':mapping['map_id'],'rubric_sha256':__import__('hashlib').sha256(specification.encode()).hexdigest(),
+                'attempted_intervals':len(attempted),'learning_examples':len(learning.get('examples') or [])}
+        return result
+    return intelligence.cached_analysis(key,analyze)
+
+
 def prepare(state, segments):
     source = {'brand_id': str(state.get('show_id') or '').upper(), 'show_id': state.get('show_id'),
               'source_video_id': (state.get('parsed') or {}).get('video_id'),
@@ -24,7 +62,7 @@ def prepare(state, segments):
     return mapping
 
 
-def analyze_highlights(mapping, segments, video):
+def analyze_highlights(mapping, segments, video, *, drafts=False):
     import telegram_intake as tg
     context = intelligence.learning_context(mapping['source'], '16:9', mapping['topics'])
     from selection_specs import highlight_framework
@@ -34,7 +72,8 @@ def analyze_highlights(mapping, segments, video):
     prompt += '\nSHOW CONTEXT: '+brand_context+'\nDiscover valuable tangents and unusual moments throughout the source, including outside major topics. Never force a quota. Select focused topic arcs (for example a substantive seed-saving technique), not entire chapters by default. Preserve complete conversational context and the established minimum 180 seconds; no arbitrary maximum.'
     def analyze():
         suggestions = tg._topic_break_suggestions(segments, intelligence_context=prompt)
-        topics = tg._preflight_candidates(video, tg._build_contiguous_topic_segments(segments, suggestions))
+        proposals = tg._build_contiguous_topic_segments(segments, suggestions)
+        topics = proposals if drafts else tg._preflight_candidates(video, proposals)
         if not topics:
             suggestions = tg._topic_break_suggestions(segments, semantic_fallback=True, intelligence_context=prompt)
             topics = tg._preflight_candidates(video, tg._build_contiguous_topic_segments(segments, suggestions, minimum_seconds=180))
@@ -45,7 +84,7 @@ def analyze_highlights(mapping, segments, video):
         return intelligence.candidate_records(mapping, '16:9', result, context)
     # Freeze the completed lane for this unchanged source/specification. New
     # feedback applies to future sources, not a silent rerun of this batch.
-    return intelligence.cached_analysis(mapping['map_id']+':16:9:'+intelligence.identity(os.getenv('OPENAI_MODEL'), specification, brand_context, mapping.get('analysis_version'), 'minimum-180-v2'), analyze)
+    return intelligence.cached_analysis(mapping['map_id']+':16:9:'+intelligence.identity(os.getenv('OPENAI_MODEL'), specification, brand_context, mapping.get('analysis_version'), 'sentence-first-v1' if drafts else 'minimum-180-v2'), analyze)
 
 
 def start(state, segments, video, short_prompt):
@@ -66,7 +105,8 @@ def start(state, segments, video, short_prompt):
                 if str(exc).startswith('OpenAI response was not valid JSON:'):
                     raise ValueError('Shorts response failed JSON validation') from None
                 raise  # authentication/provider failures must not be disguised as editorial rejection
-            result = tg.validate_complete_candidates(selector_result(response), segments, maximum=None)
+            result = (selector_result(response) if sentence_first(state) else
+                      tg.validate_complete_candidates(selector_result(response), segments, maximum=None))
             result['selection_provenance'] = intelligence.prompt_evidence(main.OPENAI_MODEL, main.openai_clip_prompt(segments,prompt), '9:16')
             result['selection_provenance']['specification_sha256'] = __import__('hashlib').sha256(short_prompt.encode()).hexdigest()
             live = getattr(tg,'_SHORT_FRAMEWORK_LIVE_CACHE','')
@@ -76,8 +116,10 @@ def start(state, segments, video, short_prompt):
             result['segments']=select_non_overlapping(result['segments'],limit=len(result['segments']),allow_overlap=False)
             result = intelligence.rank_with_evidence(result, context)
             return intelligence.candidate_records(mapping, '9:16', result, context)
-        return intelligence.cached_analysis(mapping['map_id']+':9:16:'+intelligence.identity(main.OPENAI_MODEL,prompt), analyze)
-    futures = intelligence.parallel_analyses(short, lambda: analyze_highlights(mapping, segments, video))
+        revision=(intelligence.identity(main.OPENAI_MODEL,prompt,'sentence-first-v1') if sentence_first(state)
+                  else intelligence.identity(main.OPENAI_MODEL,prompt))
+        return intelligence.cached_analysis(mapping['map_id']+':9:16:'+revision, analyze)
+    futures = intelligence.parallel_analyses(short, lambda: analyze_highlights(mapping, segments, video, drafts=sentence_first(state)))
     state['source_intelligence'] = {'map_id': mapping['map_id'], 'analysis_id': mapping['analysis_id'],
                                   'version': intelligence.VERSION}
     # The independent highlight result is in SQLite, never merged over live review state.
@@ -104,6 +146,11 @@ def shorts_for_review(state, future, segments, video):
 
 
 def prepared_highlights(state, segments, video):
+    mapping=saved_mapping(state)
+    return analyze_highlights(mapping, segments, video, drafts=sentence_first(state))
+
+
+def saved_mapping(state):
     from production_intelligence import database
     key = state['source_intelligence']['map_id']
     with database() as db:
@@ -113,7 +160,7 @@ def prepared_highlights(state, segments, video):
         raise ValueError('Saved source map is unavailable; retain existing selections')
     mapping = json.loads(source['payload'])
     mapping['topics'] = [json.loads(r['payload']) for r in rows if json.loads(r['payload']).get('map_id') == key]
-    return analyze_highlights(mapping, segments, video)
+    return mapping
 
 
 def observe(request_id, state):
@@ -129,3 +176,4 @@ def sync():
     if not sheet:
         return
     return intelligence.sync_sheets(sheets_service(), sheet)
+

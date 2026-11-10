@@ -287,10 +287,21 @@ def generate_preview(request_id,lane,index,source):
     if item['approval_revisions']:
         candidate,_=__import__('clip_review_state').prepare_segment(request_id,identity,candidate)
     try:
-        prepared=prepare_for_render(request_id,identity,candidate,source,state,aspect,item['approval_revisions'],purpose='preview')
+        if state.get('sentence_first_version')==1 and not candidate.get('boundary_specification_id'):
+            from boundary_specification import construct_preview_candidate
+            candidate=construct_preview_candidate(request_id,lane,index,source)
+            with evidence.database() as db:
+                _,state=_state(db,request_id)
+            item=preview_ticket(request_id,state,identity)
+            prefix='preview:'+identity+':'+item['revision']
+        prepared=(candidate if candidate.get('boundary_specification_id') else
+            prepare_for_render(request_id,identity,candidate,source,state,aspect,item['approval_revisions'],purpose='preview'))
         consume(source,prepared,aspect)
     except Exception as exc:
         with evidence.database() as db:
+            _,current=_state(db,request_id)
+            item=preview_ticket(request_id,current,identity)
+            prefix='preview:'+identity+':'+item['revision']
             _put(db,'preview_hold',prefix+':hold',dict(ticket=item,category=type(exc).__name__,
                 diagnostics=getattr(exc,'diagnostics',{}),retry_requires_review=True))
         raise
@@ -341,11 +352,69 @@ def preview_lane(request_id,lane,source):
         _,state=_state(db,request_id)
     key,_=LANES[lane]
     outcomes=[]
-    for index,_ in enumerate((state.get(key) or {}).get('segments') or []):
+    import time
+    budget_end=time.monotonic()+min(1800,max(60,int(__import__('os').getenv('RIPPED_DISCOVERY_PASS_SECONDS','900'))))
+    attempted=[]; seen=[]; cursor=0
+    for discovery_pass in range(3):  # initial pool plus two bounded discovery passes
+        with evidence.database() as db:
+            _,state=_state(db,request_id)
+        pool=(state.get(key) or {}).get('segments') or []
+        for index in range(cursor,len(pool)):
+            if time.monotonic()>budget_end:
+                break  # persisted pending candidates remain recoverable; no fabricated rejection
+            proposal=pool[index]
+            try:
+                generate_preview(request_id,lane,index,source);outcomes.append('verified')
+                reason='verified'
+            except Exception as exc:
+                outcomes.append('held');reason=(getattr(exc,'diagnostics',{}) or {}).get('category',type(exc).__name__)
+                status=getattr(getattr(exc,'response',None),'status_code',None)
+                if status in {401,403} or getattr(exc,'errno',None) in {2,13,28} or reason.startswith('SOURCE_'):
+                    return outcomes  # shared essential failures cannot become replacement loops
+            attempted.append(dict(start=proposal.get('start'),end=proposal.get('end'),reason=reason))
+            seen.append((proposal.get('start'),proposal.get('end')))
+        cursor=len(pool)
+        if (state.get('sentence_first_version')!=1 or 'held' not in outcomes
+                or discovery_pass==2 or time.monotonic()>budget_end):
+            break
+        from intelligence_workflow import replacement_candidates
+        state['discovery_operation_id']=request_id
         try:
-            generate_preview(request_id,lane,index,source);outcomes.append('verified')
-        except Exception:
-            outcomes.append('held')  # preserve every independently successful sibling
+            discovered=replacement_candidates(state,state['topic_source_segments'],source,lane,attempted,discovery_pass+1)
+        except Exception as exc:
+            with evidence.database() as db:
+                _put(db,'preview_discovery_hold','preview-discovery:'+request_id+':'+lane+':'+str(discovery_pass),
+                     dict(category=type(exc).__name__,diagnostics=getattr(exc,'diagnostics',{})))
+            break
+        additions=[]
+        existing_ids={c.get('candidate_id') for c in pool}
+        for clip in discovered.get('segments') or []:
+            if clip.get('candidate_id') in existing_ids:
+                continue
+            try:
+                a,b=float(clip['start']),float(clip['end'])
+                if not __import__('math').isfinite(a+b) or b<=a:
+                    raise ValueError()
+            except (ValueError,TypeError,KeyError):
+                continue  # invalid refs never repaired into candidates
+            if any(max(0,min(b,y)-max(a,x)) / min(b-a,y-x) >= .8 for x,y in seen if isinstance(x,(int,float)) and isinstance(y,(int,float)) and y>x):
+                continue
+            seen.append((a,b));existing_ids.add(clip.get("candidate_id"));additions.append(clip)
+        if not additions:
+            if not discovered.get('segments'):
+                break
+            continue
+        with evidence.database() as db:
+            db.execute('BEGIN IMMEDIATE')
+            _,latest=_state(db,request_id)
+            if any(latest.get(k) for k in ('website_clip_reviews','schedule_master','schedule_requested_at')):
+                break  # never replace/reorder a pool already under owner review
+            for clip in additions:
+                clip['candidate_number']=1+max((c.get('candidate_number',i+1) for i,c in enumerate(latest[key]['segments'])),default=0)
+                latest[key]['segments'].append(clip)
+            _put(db,'preview_discovery_append','preview-discovery-append:'+request_id+':'+lane+':'+str(discovery_pass),
+                 dict(candidate_ids=[c['candidate_id'] for c in additions],attempted=attempted))
+            db.execute('UPDATE telegram_requests SET state_json=? WHERE request_id=?',(json.dumps(latest),request_id))
     __import__('review_navigation').notify_safely(request_id,'final','previews-'+lane)
     return outcomes
 
@@ -363,6 +432,7 @@ def start_preview_pipeline(request_id,source):
         if _get(db,key,'preview_dispatch'):
             return {}  # no duplicate workers after a repeated discovery notification
         state['preview_first_version']=1
+        state['sentence_first_version']=1
         _put(db,'preview_dispatch',key,dict(request_id=request_id,source_sha256=state.get('source_validation',{}).get('source_sha256')))
         db.execute('UPDATE telegram_requests SET state_json=? WHERE request_id=?',
                    (json.dumps(state),request_id))
@@ -564,3 +634,4 @@ def restore_from_receipt(request_id, receipt_id, verify_media):
              dict(request_id=request_id, receipt_id=receipt_id, previous_collections={k:current.get(k) for k in receipt['collections']}))
         db.execute('UPDATE telegram_requests SET state_json=? WHERE request_id=?', (json.dumps(latest), request_id))
     return latest
+
