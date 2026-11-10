@@ -107,3 +107,32 @@ def test_highlight_is_constructed_independently_and_remains_unapproved(previews)
     assert p['calls'][0][0]=='16:9'
     assert not p['read']()['topic_reviews'] and not p['read']().get('schedule_master')
 
+
+
+def test_replacement_uses_actual_selector_records_and_cached_distinct_identity(previews,monkeypatch):
+    import json
+    import intelligence_workflow as workflow
+    import production_intelligence as intelligence
+    p=previews;enable(p)
+    mapping=dict(map_id='saved-map',analysis_id='verified-analysis',transcript_revision='verified-transcript',
+        source=dict(brand_id='TDOG',show_id='TDOG',source_video_id='source'),topics=[])
+    monkeypatch.setattr(workflow,'saved_mapping',lambda state:mapping)
+    monkeypatch.setattr(p['tg'],'_configured_short_framework_prompt',lambda:'Approved short rubric')
+    requests=[]
+    def provider(segments,prompt):
+        requests.append(prompt)
+        return {'segments':[dict(candidate_id='old-approved-identity',start=30,end=45,title='Seed storage',reason='Complete useful answer',transcript='A useful answer.',score=90)]}
+    monkeypatch.setattr(p['main'],'call_openai_for_clips',provider)
+    intelligence.record('candidate','old-approved-identity',dict(protected=True))
+    state=p['read']();state['discovery_operation_id']='independent-operation'
+    first=workflow.replacement_candidates(state,state['topic_source_segments'],p['source'],'short',[],1)
+    second=workflow.replacement_candidates(state,state['topic_source_segments'],p['source'],'short',[],1)
+    assert first==second and len(requests)==1
+    clip=first['segments'][0]
+    assert clip['candidate_id'].startswith('sentence-') and clip['selection_provenance']['map_id']=='saved-map'
+    assert 'Approved short rubric' in requests[0] and 'saved-map' in requests[0]
+    with intelligence.database() as db:
+        old=json.loads(db.execute('SELECT payload FROM intelligence_records WHERE record_id=?',('old-approved-identity',)).fetchone()[0])
+        saved=json.loads(db.execute('SELECT payload FROM intelligence_records WHERE record_id=?',(clip['candidate_id'],)).fetchone()[0])
+    assert old=={'protected':True} and saved['candidate_id']==clip['candidate_id']
+

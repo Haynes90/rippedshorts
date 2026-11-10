@@ -32,14 +32,13 @@ def replacement_candidates(state,segments,video,lane,attempted,pass_number):
             suggestions=tg._topic_break_suggestions(segments,intelligence_context=context)
             result={'segments':tg._build_contiguous_topic_segments(segments,suggestions,minimum_seconds=180)}
         result=intelligence.rank_with_evidence(result,learning)
-        result=intelligence.candidate_records(mapping,aspect,result,learning)
         for clip in result.get('segments') or []:
-            clip['candidate_id']='sentence-'+intelligence.identity(key,clip['candidate_id'])
+            clip['candidate_id']='sentence-'+intelligence.identity(key,clip.get('candidate_id'),clip['start'],clip['end'])
             clip['selection_provenance']={**(clip.get('selection_provenance') or {}),
                 'discovery_recipe':'sentence-first-v1','discovery_id':key,
                 'map_id':mapping['map_id'],'rubric_sha256':__import__('hashlib').sha256(specification.encode()).hexdigest(),
                 'attempted_intervals':len(attempted),'learning_examples':len(learning.get('examples') or [])}
-        return result
+        return intelligence.candidate_records(mapping,aspect,result,learning)
     return intelligence.cached_analysis(key,analyze)
 
 
@@ -76,7 +75,8 @@ def analyze_highlights(mapping, segments, video, *, drafts=False):
         topics = proposals if drafts else tg._preflight_candidates(video, proposals)
         if not topics:
             suggestions = tg._topic_break_suggestions(segments, semantic_fallback=True, intelligence_context=prompt)
-            topics = tg._preflight_candidates(video, tg._build_contiguous_topic_segments(segments, suggestions, minimum_seconds=180))
+            proposals = tg._build_contiguous_topic_segments(segments, suggestions, minimum_seconds=180)
+            topics = proposals if drafts else tg._preflight_candidates(video, proposals)
         result = intelligence.rank_with_evidence({'segments': topics, 'selection': 'shared_full_source_map'}, context)
         from selection_specs import framework_provenance
         result['selection_provenance']={'specification_sha256':__import__('hashlib').sha256(specification.encode()).hexdigest(), 'specification':framework_provenance()}
@@ -176,3 +176,4 @@ def sync():
     if not sheet:
         return
     return intelligence.sync_sheets(sheets_service(), sheet)
+
