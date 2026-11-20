@@ -3598,7 +3598,11 @@ def _process(request_id: str) -> None:
 
         if row["source_kind"] == "youtube":
             from source_ingestion import verify_youtube_source
-            state["source_validation"] = retained_validation or verify_youtube_source(video, video_id, parsed["source_value"])
+            state["source_validation"] = retained_validation or verify_youtube_source(
+                video, video_id, parsed["source_value"], request_id=request_id,
+                audio_master_job_id=(state.get('audio_master_ingest') or {}).get('job_id'),
+                brand_id=state.get('show_id'),
+                test_run_id=(state.get('workflow_test') or {}).get('test_run_id'))
             state["youtube_channel_id"] = state["source_validation"].get("source_channel_id") or state.get("youtube_channel_id") or ""
             state["transcript_evidence"] = {'timed_segments':len(segments),
                 'speech_evidence':bool(segments) and all(str(seg.get('text') or '').strip() and float(seg.get('duration') or (float(seg.get('end') or 0)-float(seg.get('start') or 0)))>0 for seg in segments),

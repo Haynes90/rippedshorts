@@ -619,7 +619,13 @@ def sync_sheets(service, sheet_id):
     with _SYNC_LOCK:
         api = service.spreadsheets()
         with database() as db:
-            pending = db.execute('SELECT * FROM intelligence_records WHERE synced_digest IS NULL OR synced_digest!=digest ORDER BY kind,record_id').fetchall()
+            # Internal boundary/render evidence stays in SQLite, unmodified.
+            kinds = tuple(SHEET_TABS)
+            placeholders = ','.join('?' for _ in kinds)
+            pending = db.execute(
+                f'SELECT * FROM intelligence_records WHERE kind IN ({placeholders}) '
+                'AND (synced_digest IS NULL OR synced_digest!=digest) ORDER BY kind,record_id',
+                kinds).fetchall()
         if not pending:
             return 0
         metadata = api.get(spreadsheetId=sheet_id, fields='sheets(properties(title))').execute()
