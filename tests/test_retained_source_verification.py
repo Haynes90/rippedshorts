@@ -178,7 +178,8 @@ def test_forged_retained_receipt_does_not_replace_live_authenticated_binding(ret
 
 
 @pytest.mark.parametrize('measured_words',[False,True])
-def test_existing_process_reuses_authenticated_assets_before_candidate_generation(retained,monkeypatch,measured_words):
+@pytest.mark.parametrize('fresh_ingest',[False,True])
+def test_existing_process_reuses_authenticated_assets_before_candidate_generation(retained,monkeypatch,measured_words,fresh_ingest):
     import ast
     import logging
     import os
@@ -190,6 +191,8 @@ def test_existing_process_reuses_authenticated_assets_before_candidate_generatio
     retained.path=retained.path.rename(work/retained.path.name)
     state={'parsed':{'source_kind':'youtube','video_id':VIDEO,'source_value':URL},
            'show_id':'TDOG','vid_title':'Saved source title','retained_audio_master_job_id':'audio-job'}
+    if fresh_ingest:
+        state.pop('retained_audio_master_job_id')
     row={'request_id':'request','status':'error','state_json':json.dumps(state),'chat_id':'chat',
          'mode':'topics','source_kind':'youtube','updated_at':'2026-10-30T00:00:00Z'}
     class DB:
@@ -199,13 +202,18 @@ def test_existing_process_reuses_authenticated_assets_before_candidate_generatio
         def fetchone(self):return row
         def fetchall(self):return []
     saved=[];topics=Mock()
+    ingest=Mock(return_value={'job_id':'audio-job','status':'transcribed',
+                             'checkpoints':retained.evidence['checkpoints']})
+    monkeypatch.setattr(source,'reuse_audio_master_result',lambda *a:{
+        'video_path':retained.path,'segments':source._segments_from_json(retained.document)})
     env=dict(logger=logging.getLogger('retained-test'),os=os,json=json,Path=Path,
         _ensure_storage_headroom=lambda:{'free_bytes':2**40},_LOCK=threading.RLock(),_telegram_db=DB,
         _TERMINAL_JOB_STAGES={'complete','cancelled'},_resume_saved_copy_review=lambda _:False,
         _save=lambda rid,status,s:saved.append((status,dict(s))),send=Mock(),SOURCE_DIR=root,
-        _youtube_vid_title=retained.forbidden,reuse_from_drive=retained.forbidden,
+        _youtube_vid_title=retained.forbidden,
+        reuse_from_drive=(lambda *a:{}) if fresh_ingest else retained.forbidden,
         _reusable_youtube_job=lambda _:None,download_youtube_resilient=retained.forbidden,
-        ingest_with_audio_master=retained.forbidden,_transcribe=retained.forbidden,
+        ingest_with_audio_master=ingest if fresh_ingest else retained.forbidden,_transcribe=retained.forbidden,
         _segments=lambda p:json.loads(p.read_text())['segments'],_process_topics=topics,now=lambda:'now')
     tree=ast.parse((Path(__file__).resolve().parents[1]/'telegram_intake.py').read_text(encoding='utf-8'))
     node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_process')
@@ -219,4 +227,5 @@ def test_existing_process_reuses_authenticated_assets_before_candidate_generatio
     assert final['transcript_evidence']['timed_segments']==2
     assert final['source_validation']['verification_method']=='authenticated_audio_master_retained'
     assert final['transcript_evidence']['word_count']==int(measured_words)
+    assert ingest.call_count==int(fresh_ingest)
     retained.forbidden.assert_not_called()
