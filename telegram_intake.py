@@ -459,7 +459,9 @@ def _notify_render_queue_complete(request_id: str, chat_id: str) -> None:
             f"\nFailed: {failed}"
             f"{folder_line}"
         )
-        if failed:
+        if checkpoint_state and checkpoint_state.get('review_interface')=='website':
+            __import__('review_navigation').notify_safely(request_id,'final',signature)
+        elif failed:
             telegram(
                 "sendMessage",
                 {
@@ -674,6 +676,10 @@ def _refresh_copy_review(
     if not row:
         return
     state = json.loads(row["state_json"])
+    if state.get('review_interface') == 'website':
+        from review_navigation import notify_safely
+        notify_safely(request_id, 'final', 'copy-ready')
+        return
     drafts = list(state.get("copy_drafts") or [])
     if index is None:
         index = int(state.get("copy_review_index") or 0)
@@ -2705,6 +2711,8 @@ def _short_review_page_payload(
 def _refresh_short_review_message(
     chat_id: str, request_id: str, *, page_number: int | None = None
 ) -> None:
+    if _website_navigation(request_id):
+        return
     with _LOCK, _telegram_db() as db:
         row = db.execute(
             "SELECT state_json FROM telegram_requests WHERE request_id=?",
@@ -2807,6 +2815,8 @@ def _short_control_payload(request_id: str, row, state: dict[str, Any]):
 
 
 def _send_short_confirmation(chat_id: str, request_id: str) -> None:
+    if _website_navigation(request_id):
+        return
     with _LOCK, _telegram_db() as db:
         row = db.execute(
             "SELECT mode, state_json FROM telegram_requests WHERE request_id=?",
@@ -2854,10 +2864,24 @@ def _send_short_confirmation(chat_id: str, request_id: str) -> None:
                 )
 
 
+def _website_navigation(request_id):
+    """One receipt-backed website notification; no parallel Telegram decisions."""
+    with _LOCK, _telegram_db() as db:
+        row=db.execute('SELECT state_json FROM telegram_requests WHERE request_id=?',(request_id,)).fetchone()
+    if not row or json.loads(row['state_json']).get('review_interface')!='website':
+        return False
+    state=json.loads(row['state_json'])
+    stage='shorts' if (state.get('result') or {}).get('segments') else 'highlights'
+    __import__('review_navigation').notify_safely(request_id,stage,'candidates-ready')
+    return True
+
+
 def _send_candidates(
     chat_id: str, request_id: str, result: dict, *, start_index: int = 0
 ) -> None:
     """Create one persistent control card and one reusable 9:16 review page."""
+    if _website_navigation(request_id):
+        return
     clips = result.get("segments", [])
     if not clips and result.get('format_failure'):
         send(chat_id, 'Shorts analysis is held. Independently prepared highlights remain available; no clips were approved.')
@@ -3171,6 +3195,8 @@ def _topic_review_payload(
 def _refresh_topic_review(
     chat_id: str, request_id: str, *, index: int | None = None
 ) -> None:
+    if _website_navigation(request_id):
+        return
     with _LOCK, _telegram_db() as db:
         row = db.execute(
             "SELECT state_json FROM telegram_requests WHERE request_id=?",
@@ -3227,6 +3253,8 @@ def _send_topic_candidates(
     chat_id: str, request_id: str, topic_result: dict
 ) -> None:
     """Present 16:9 review in one evolving Telegram message."""
+    if _website_navigation(request_id):
+        return
     _send_short_confirmation(chat_id, request_id)
     _refresh_topic_review(chat_id, request_id, index=0)
     __import__('review_navigation').notify_safely(request_id, 'highlights')
@@ -3639,6 +3667,9 @@ def _process(request_id: str) -> None:
             approval_history = _approved_clip_history_from_sheet(video_id)
             approved_clips = approval_history["unfinished"]
             rendered_clips = approval_history["rendered"]
+            if state.get('review_interface')=='website':
+                approved_clips=[]  # Historical approvals are not this new request's selections.
+                rendered_clips=[]
             prior_shorts = _reviewed_short_history_from_sheet(video_id)
             if force_rerip:
                 # A re-rip is a fresh editorial pass; old approvals are learning
@@ -3896,6 +3927,25 @@ def _process(request_id: str) -> None:
             "candidate_reviews": reviews,
         }
         _save(request_id, "awaiting_review", final_state)
+        if final_state.get('review_interface')=='website':
+            _send_candidates(chat_id,request_id,result)
+            if row['mode']=='both' and final_state.get('source_intelligence'):
+                try:
+                    from intelligence_workflow import prepared_highlights
+                    highlights=prepared_highlights(final_state,enriched,video)
+                    with _LOCK, _telegram_db() as db:
+                        current=db.execute('SELECT state_json FROM telegram_requests WHERE request_id=?',(request_id,)).fetchone()
+                        latest=json.loads(current['state_json'])
+                        latest['topic_result']=highlights
+                        latest['topic_stage']='awaiting_review' if highlights.get('segments') else 'not_eligible'
+                        db.execute('UPDATE telegram_requests SET state_json=?,updated_at=? WHERE request_id=?',(json.dumps(latest),now(),request_id))
+                except Exception as exc:
+                    logger.exception('Independent highlight preparation held request_id=%s',request_id)
+                    with _LOCK, _telegram_db() as db:
+                        current=db.execute('SELECT state_json FROM telegram_requests WHERE request_id=?',(request_id,)).fetchone()
+                        latest=json.loads(current['state_json']);latest['topic_stage']='held';latest['topic_error_type']=type(exc).__name__
+                        db.execute('UPDATE telegram_requests SET state_json=?,updated_at=? WHERE request_id=?',(json.dumps(latest),now(),request_id))
+            return
         if (os.getenv('RIPPED_PREVIEW_FIRST_ENABLED','false').lower()=='true'
                 and str(state.get('show_id') or '').upper() in {'TCB','TDOG'} and not approved_clips):
             __import__('render_recovery').start_preview_pipeline(request_id,video)
@@ -4148,6 +4198,9 @@ def _accept_update(
         return {"status": "ignored"}
     if not trusted_source and not _authorized(chat_id, user_id):
         return {"status": "unauthorized"}
+    website_callback=re.match(r'rs:(?:approve|reject|topic_approve|topic_reject|shorts_confirm|shorts_page|topic_page|schedule_now|copy_finish|copy_approve|copy_page|copy_edit|copy_keep|copy_regenerate|copy_edit_caption|copy_edit_title|copy_edit_description):([A-Za-z0-9-]+)(?::|$)',callback_data)
+    if website_callback and _website_navigation(website_callback.group(1)):
+        return {'status':'website_review_required','request_id':website_callback.group(1)}
     if text and not callback_data:
         incoming_message_id = str(message.get("message_id") or "")
         reply_to_message_id = str(
@@ -5123,6 +5176,8 @@ def _accept_update(
             send(chat_id, "There are no sections ready to edit yet.")
             return {"status": "no_editable_sections"}
         state = json.loads(row["state_json"])
+        if _website_navigation(row['request_id']):
+            return {'status':'website_review_required','request_id':row['request_id']}
         try:
             result = apply_quick_command(state, text)
         except ValueError as exc:
@@ -5181,7 +5236,7 @@ def _accept_update(
         )
         return {"status": "ignored_non_ripped_shorts_message"}
     request_id, update_id, stamp = str(uuid.uuid4()), str(update.get("update_id", "")), now()
-    state = {"stage": "accepted", "parsed": parsed, "message_id": message.get("message_id")}
+    state = {"stage": "accepted", "parsed": parsed, "message_id": message.get("message_id"),"review_interface":"website"}
     try:
         with _LOCK, _telegram_db() as db:
             db.execute("INSERT INTO telegram_requests VALUES (?,?,?,?,?,?,?,?,?,?,?)", (request_id, update_id, chat_id, user_id, "accepted", parsed["mode"], parsed["source_kind"], parsed["source_value"], json.dumps(state), stamp, stamp))

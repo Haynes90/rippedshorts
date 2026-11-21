@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import APIRouter, Header, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request, Response
 
 from audio_master_handoff import connect
 
@@ -166,7 +166,10 @@ def _payload_for_session(token: str) -> dict[str, Any]:
     row = _request_row(request_id)
     state = json.loads(row["state_json"])
     drafts = list(state.get("copy_drafts") or [])
-    if not drafts and not state.get("result") and not state.get("topic_result"):
+    from clip_review_state import website_first, candidate_items, processing_label
+    website = website_first(state)
+    candidates = candidate_items(request_id,state) if website else []
+    if not website and not drafts and not state.get("result") and not state.get("topic_result"):
         raise HTTPException(status_code=409, detail="Copy review is not ready yet")
 
     parsed = state.get("parsed") or {}
@@ -178,7 +181,7 @@ def _payload_for_session(token: str) -> dict[str, Any]:
 
     items = []
     for index, draft in enumerate(drafts):
-        if state.get('preview_first_version') == 1 and str(draft.get('asset_id') or '') not in playable_assets:
+        if (website or state.get('preview_first_version') == 1) and str(draft.get('asset_id') or '') not in playable_assets:
             continue  # Keep original draft indexes and records; omit unavailable media from normal review.
         drive_url = media.get(str(draft.get("asset_id") or ""), "")
         items.append(
@@ -227,9 +230,9 @@ def _payload_for_session(token: str) -> dict[str, Any]:
         for item in items
     )
     regenerated = sum(item["regeneration_count"] > 0 for item in items)
-    gallery = [c for c in verified_clips if c['finished']] if state.get('preview_first_version') == 1 else verified_clips
+    gallery = [c for c in verified_clips if c['finished']] if website or state.get('preview_first_version') == 1 else verified_clips
     schedule_blockers = []
-    if state.get('preview_first_version') == 1:
+    if website or state.get('preview_first_version') == 1:
         if state.get('acceptance_demo'):
             schedule_blockers.append('This acceptance review is not yet enabled for scheduling.')
         approved = [c for c in gallery if c['approval_current']]
@@ -247,6 +250,12 @@ def _payload_for_session(token: str) -> dict[str, Any]:
             schedule_blockers.append('Resolve the selected video edit or framing request.')
     return {
         "request_id": request_id,
+        "website_first": website,
+        "candidates": candidates,
+        "candidate_total": len(candidates),
+        "candidate_reviewed": sum(bool(c['choice']) for c in candidates),
+        "processing_status": processing_label(row['status'],state,candidates,gallery),
+        "processing_stage": state.get('stage') or row['status'],
         "preview_first": state.get('preview_first_version')==1,
         "acceptance_demo": bool(state.get('acceptance_demo')),
         "batch_summary": batch,
@@ -398,18 +407,25 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
   <section class="asset"><h2>Workflow test status</h2>
     <p>Internal checks do not publish content. Live testing requires separate owner approval.</p>
     <button type="button" id="refreshWorkflow">Refresh test status</button>
-    <pre id="workflowStatus" style="white-space:pre-wrap">Status not loaded.</pre>
+    <p id="processingStatus" role="status">{html.escape(payload.get('processing_status') or 'Loading processing status')}</p>
+    <pre id="workflowStatus" style="white-space:pre-wrap">Loading status…</pre>
   </section>
   <script>
-  document.getElementById('refreshWorkflow').onclick=async()=>{{
+  async function refreshWorkflow(){{
+   try{{
     const result=await fetch('/api/ripped-shorts/review/{token}/test-status');
     const data=await result.json();
-    document.getElementById('workflowStatus').textContent=result.ok ?
-      'Test run: '+data.test_run_id+'\n'+Object.entries(data.checkpoints).map(([name,v])=>name+': '+v.status).join('\n')+
-      '\nOverall: '+data.overall_status+'\nPublishing: '+(data.publishing_globally_paused===true?'PAUSED':'NOT VERIFIED PAUSED')+
-      '\nInstagram Collab: '+(data.instagram_collaborators_in_approved_payload?'VALIDATED APPROVAL, NOT PROOF OF SUBMISSION':'NOT VERIFIED')+
-      '\nBatch: '+(data.batch_summary?.status||'NOT STARTED')+'\nCompleted clips: '+(data.batch_summary?.completed_clips||0)+'/'+(data.batch_summary?.selected_clips||0)+'\nScheduled deliveries:\n'+(data.batch_summary?.clips||[]).flatMap(c=>(c.deliveries||[]).map(d=>c.format+' • '+d.destination_id+' • '+d.scheduled_at)).join('\n')+'\nNext: '+data.next_required_action : 'Status unavailable. Refresh after the service recovers.';
-  }};
+    if(result.ok && data.request_id!=={json.dumps(payload['request_id'])})throw new Error('Review request identity mismatch');
+    if(!result.ok)throw new Error('Status API returned HTTP '+result.status);
+    document.getElementById('workflowStatus').textContent=[
+      'Request: '+data.request_id,
+      ...Object.entries(data.checkpoints).map(([name,v])=>name.replaceAll('_',' ')+': '+v.status),
+      'Next: '+data.next_required_action].join(String.fromCharCode(10));
+   }}catch(error){{document.getElementById('workflowStatus').textContent='Status could not load. Your saved decisions remain intact. '+error.message;}}
+  }}
+  document.getElementById('refreshWorkflow').onclick=refreshWorkflow;
+  refreshWorkflow();
+  {'setInterval(async()=>{if(document.hidden)return;try{const r=await fetch("/api/ripped-shorts/review/'+token+'",{cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status);const d=await r.json();if(d.request_id!=='+json.dumps(payload['request_id'])+')throw new Error("Review request mismatch");if(d.candidate_total!=='+str(payload.get('candidate_total',0))+'||d.preview_review_total!=='+str(payload.get('preview_review_total',0))+')location.reload();document.getElementById("processingStatus").textContent=d.processing_status;}catch(e){document.getElementById("workflowStatus").textContent="Status refresh failed. Saved decisions remain intact. "+e.message;}},15000);' if payload.get('website_first') and payload.get('processing_stage') in {'accepted','source_resolution','selection','parallel_format_analysis','processing','retrying','awaiting_render_completion'} else ''}
   </script>
   <div class="progress">
     <div class="progressbar"><div id="bar"></div></div>
@@ -420,8 +436,7 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
   <details id="editing-workflow" {'open' if payload.get('stage') in {'editorial','framing'} else ''}><summary>Edit boundaries or framing / compare alternatives</summary>
   {__import__('clip_review_ui').sections(payload.get('comparisons', []), token)}
   </details>
-  <section id="shorts"><h2>9:16 candidate review</h2><p>{'Watch and choose Shorts above. Telegram provides notifications only.' if payload.get('preview_first') else 'Candidate selection remains in Telegram; saved selections are preserved.'}</p></section>
-  <section id="highlights"><h2>16:9 candidate review</h2><p>{'Review the highlight previews after Shorts above; each decision is saved independently.' if payload.get('preview_first') else 'Highlight selection follows Shorts confirmation in Telegram.'}</p></section>
+  {__import__('clip_review_ui').candidate_cards(payload.get('candidates', []),token) if payload.get('website_first') else '<section id="shorts"><h2>9:16 candidate review</h2></section><section id="highlights"><h2>16:9 candidate review</h2></section>'}
   <section id="final"><h2>Final rendered video and copy approval</h2><section id="assets">{cards}</section></section>
 </main>
 
@@ -439,6 +454,14 @@ let state = INITIAL;
 {creator_script}
 
 function updateProgress(data=state) {{
+  if(data.website_first){{
+    const total=data.candidate_total||0,done=data.candidate_reviewed||0;
+    document.getElementById('progressText').textContent=total?`${{done}}/${{total}} candidates reviewed`:data.processing_status;
+    document.getElementById('bar').style.width=total?`${{Math.round(done/total*100)}}%`:'0%';
+    document.getElementById('finishButton').disabled=(data.schedule_blockers||[]).length>0;
+    document.getElementById('globalStatus').textContent=(data.schedule_blockers||[]).join(' ');
+    return;
+  }}
   if(data.preview_first){{
     const total=data.preview_review_total||0,completed=data.preview_review_completed||0;
     document.getElementById('progressText').textContent=`${{completed}}/${{total}} playable previews reviewed`;
@@ -631,6 +654,28 @@ def copy_review_page(token: str, stage: str = 'final'):
 @router.get("/api/ripped-shorts/review/{token}")
 def review_data(token: str):
     return _payload_for_session(token)
+
+
+@router.post('/api/ripped-shorts/review/{token}/candidate/{asset_id}')
+async def save_candidate_review(token: str, asset_id: str, request: Request):
+    session=_session(token)
+    try:
+        return __import__('clip_review_state').save_candidate(str(session['request_id']),asset_id,await request.json())
+    except ValueError as exc:
+        raise HTTPException(status_code=409,detail=str(exc))
+
+
+@router.post('/api/ripped-shorts/review/{token}/candidates/{lane}/confirm')
+def confirm_candidate_review(token: str, lane: str, background_tasks: BackgroundTasks):
+    session=_session(token);rid=str(session['request_id'])
+    try:
+        result=__import__('clip_review_state').confirm_candidates(rid,lane)
+    except ValueError as exc:
+        raise HTTPException(status_code=409,detail=str(exc))
+    import telegram_intake as tg
+    for item in result.pop('plan'):
+        background_tasks.add_task(tg._submit_render,item['lane'],rid,item['index'],result['chat_id'])
+    return {**result,'scheduling_started':False}
 
 
 @router.post('/api/ripped-shorts/review/{token}/comparison/{revision}')

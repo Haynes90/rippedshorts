@@ -9,6 +9,137 @@ import re
 from audio_master_handoff import connect
 
 
+def website_first(state):
+    return state.get('review_interface') == 'website'
+
+
+def processing_label(status, state, candidates, finished):
+    stage=state.get('stage') or status
+    if stage in {'error','failed','awaiting_topic_map_review'}:
+        return 'Blocked — '+str(state.get('error_type') or 'processing needs review')
+    if finished: return 'Finished-video review ready'
+    if any(c['frozen'] for c in candidates): return 'Rendering selected clips'
+    if candidates: return 'Candidate review ready'
+    if (state.get('transcript_evidence') or {}).get('timed_segments') or state.get('topic_source_segments'):
+        return 'Transcript ready — discovering candidates'
+    if (state.get('source_validation') or {}).get('status')=='verified': return 'Source verified — preparing transcript'
+    return 'Preparing source and transcript'
+
+
+def enable_website_review(request_id, actor):
+    """Audited operator transition of an unselected request, never a recovery."""
+    if not actor: raise ValueError('Transition actor is required')
+    with closing(connect()) as db, db:
+        db.execute('BEGIN IMMEDIATE')
+        row=db.execute('SELECT * FROM telegram_requests WHERE request_id=?',(request_id,)).fetchone()
+        if not row: raise ValueError('Request not found')
+        state=json.loads(row['state_json'])
+        if website_first(state): return {'status':'already_enabled'}
+        if state.get('schedule_master') or state.get('schedule_requested_at') or state.get('copy_review_completed_at'):
+            raise ValueError('Submitted history cannot be migrated')
+        if any(r.get('status') not in {'pending',''} for key in ('candidate_reviews','topic_reviews') for r in (state.get(key) or {}).values()):
+            raise ValueError('Existing selections require separate receipt-based review')
+        before=hashlib.sha256(encoded(state).encode()).hexdigest()
+        mapping=(state.get('source_intelligence') or {}).get('map_id')
+        if row['mode']=='both' and mapping and not state.get('topic_result'):
+            cached=db.execute("SELECT analysis_id,result FROM source_analyses WHERE status='PASSED' AND analysis_id LIKE ?",(mapping+':16:9:%',)).fetchall()
+            if len(cached)>1: raise ValueError('Multiple highlight revisions require reconciliation')
+            if cached:
+                result=json.loads(cached[0]['result'])
+                if not isinstance(result,dict) or not isinstance(result.get('segments'),list): raise ValueError('Invalid cached highlight result')
+                state['topic_result']=result
+                state['topic_stage']='awaiting_review' if result['segments'] else 'not_eligible'
+        state['review_interface']='website'
+        state['website_review_transition']={'actor':actor,'at':datetime.now(timezone.utc).isoformat(),'previous_state_sha256':before,'candidate_discovery_repeated':False}
+        db.execute('UPDATE telegram_requests SET state_json=?,updated_at=? WHERE request_id=?',
+                   (json.dumps(state),state['website_review_transition']['at'],request_id))
+    return {'status':'enabled','candidate_count':len(candidate_items(request_id,state)),'processing_dispatched':False}
+
+
+def candidate_items(request_id, state):
+    """Editorial proposals, separate from finished-media approvals."""
+    from render_recovery import LANES, asset_id, digest
+    items = []
+    for lane, (key, review_key) in LANES.items():
+        for index, clip in enumerate((state.get(key) or {}).get('segments') or []):
+            review = (state.get(review_key) or {}).get(str(index)) or {}
+            revision = digest({'candidate':{k:clip.get(k) for k in ('candidate_id','start','end','transcript','framing_mode')},
+                'source_sha256':(state.get('source_validation') or {}).get('source_sha256'),
+                'transcript_file_id':(state.get('source_validation') or {}).get('transcript_file_id')})
+            items.append(dict(asset_id=asset_id(request_id,lane,clip,index),lane=lane,index=index,
+                format='9:16' if lane=='short' else '16:9', revision=revision,
+                title=clip.get('title') or clip.get('subject_description') or 'Clip '+str(clip.get('candidate_number') or index+1),
+                transcript=str(clip.get('transcript') or ''), reason=str(clip.get('reason') or clip.get('why_it_will_work') or ''),
+                start=clip['start'],end=clip['end'],framing=clip.get('framing_mode') or 'auto',
+                choice=review.get('selection_choice') or '',version=review.get('selection_version',0),
+                feedback=review.get('selection_feedback') or '',
+                frozen=bool((state.get('website_selection_confirmed') or {}).get(lane)) or review.get('status') in {'queued','rendering','rendered','render_failed','approved'}))
+    return items
+
+
+def save_candidate(request_id, identity, body):
+    """Save one proposal decision; never render or approve finished media here."""
+    if body.get('choice') not in {'select','reject','request_adjustment','unused'}:
+        raise ValueError('Choose Select, Reject, Request Adjustment or Leave Unused')
+    feedback=str(body.get('feedback') or '').strip()[:2000]
+    if body['choice']=='request_adjustment' and not feedback:
+        raise ValueError('Describe the requested boundary, context or framing adjustment')
+    with closing(connect()) as db, db:
+        db.execute('BEGIN IMMEDIATE')
+        row=db.execute('SELECT * FROM telegram_requests WHERE request_id=?',(request_id,)).fetchone()
+        if not row: raise ValueError('Request not found')
+        state=json.loads(row['state_json'])
+        if not website_first(state) or state.get('schedule_requested_at') or state.get('schedule_master'):
+            raise ValueError('This candidate collection is not editable in this review')
+        item=next((c for c in candidate_items(request_id,state) if c['asset_id']==identity),None)
+        if not item or item['frozen']: raise ValueError('Candidate is missing or already confirmed for rendering')
+        if body.get('revision')!=item['revision'] or type(body.get('version')) is not int or body['version']!=item['version']:
+            raise ValueError('Candidate changed; refresh before saving')
+        framing=body.get('framing') or item['framing']
+        if framing not in {'auto','blurred'} or (item['lane']=='highlight' and framing!='auto'):
+            raise ValueError('Unsupported framing option')
+        from render_recovery import LANES
+        key,review_key=LANES[item['lane']]
+        if item['lane']=='short' and body['choice']=='select' and framing!=item['framing']:
+            state[key]['segments'][item['index']]['framing_mode']=framing
+        current=(state.get(review_key) or {}).get(str(item['index'])) or {}
+        status={'select':'selected','reject':'rejected','request_adjustment':'adjustment_requested','unused':'unused'}[body['choice']]
+        state.setdefault(review_key,{})[str(item['index'])]={**current,'status':status,
+            'selection_choice':body['choice'],'selection_version':item['version']+1,
+            'selection_feedback':feedback,'user_id':str(row['user_id']),
+            'reviewed_at':datetime.now(timezone.utc).isoformat(),
+            'selection_history':list(current.get('selection_history') or [])+([{k:v for k,v in current.items() if k!='selection_history'}] if current else [])}
+        db.execute('UPDATE telegram_requests SET state_json=?,updated_at=? WHERE request_id=?',
+            (json.dumps(state),datetime.now(timezone.utc).isoformat(),request_id))
+    return dict(status='saved',candidate=next(c for c in candidate_items(request_id,state) if c['asset_id']==identity),
+                rendering_started=False,scheduling_started=False)
+
+
+def confirm_candidates(request_id, lane):
+    """Commit selected identities once before the existing render dispatcher runs."""
+    from render_recovery import LANES
+    if lane not in LANES: raise ValueError('Unknown format')
+    with closing(connect()) as db, db:
+        db.execute('BEGIN IMMEDIATE')
+        row=db.execute('SELECT * FROM telegram_requests WHERE request_id=?',(request_id,)).fetchone()
+        if not row: raise ValueError('Request not found')
+        state=json.loads(row['state_json'])
+        if not website_first(state) or state.get('schedule_requested_at'):
+            raise ValueError('Request is not in website candidate review')
+        if (state.get('website_selection_confirmed') or {}).get(lane):
+            return dict(status='already_confirmed',plan=[],chat_id=str(row['chat_id']))
+        selected=[c for c in candidate_items(request_id,state) if c['lane']==lane and c['choice']=='select' and not c['frozen']]
+        if not selected: raise ValueError('Select at least one candidate before confirming this format')
+        _,review_key=LANES[lane];stamp=datetime.now(timezone.utc).isoformat()
+        for item in selected:
+            state[review_key][str(item['index'])].update(status='queued',approved_at=stamp)
+        state.setdefault('website_selection_confirmed',{})[lane]=stamp
+        state['stage']='awaiting_render_completion'
+        db.execute('UPDATE telegram_requests SET status=?,state_json=?,updated_at=? WHERE request_id=?',
+                   ('awaiting_render_completion',json.dumps(state),stamp,request_id))
+    return dict(status='confirmed',plan=[{'lane':lane,'index':c['index']} for c in selected],chat_id=str(row['chat_id']))
+
+
 def encoded(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
 
