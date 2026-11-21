@@ -153,3 +153,39 @@ def test_audited_transition_reuses_cached_highlights_without_processing(candidat
     assert current['website_review_transition']['previous_state_sha256']
     assert r['reviews'].enable_website_review('existing','authorized-owner')['status']=='already_enabled'
     r['submit'].assert_not_called()
+
+
+def test_transition_refuses_legacy_approval_without_changing_it(candidates):
+    r=candidates;state=read(r);state.pop('review_interface')
+    state['candidate_reviews']={'0':{'status':'rendered','clip_url':'retained-success','approved_at':'original'}}
+    write(r,state)
+    with pytest.raises(ValueError,match='Existing selections'):
+        r['reviews'].enable_website_review('existing','owner')
+    assert read(r)==state
+
+
+def test_copy_notification_has_only_website_navigation(candidates):
+    r=candidates;before=read(r)
+    r['tg']._refresh_copy_review('saved-chat','existing')
+    r['tg']._refresh_copy_review('saved-chat','existing')
+    assert r['telegram'].call_count==1 and read(r)==before
+    payload=r['telegram'].call_args.args[1]
+    assert '/review/' in payload['reply_markup']['inline_keyboard'][0][0]['url']
+    assert 'callback_data' not in payload['reply_markup']['inline_keyboard'][0][0]
+
+
+def test_website_finished_approval_preserves_copy_and_never_schedules(review):
+    from test_finished_clip_review import render_fixture,post,read_state,save_state
+    r=review;state=render_fixture(r);state['review_interface']='website'
+    state['copy_drafts']=[];save_state(r,state)
+    response=post(r,choice='approve',version=0,playback_verified=True)
+    assert response.status_code==200 and response.json()['copy_review_ready']
+    current=read_state(r)
+    assert len(current['copy_drafts'])==1 and current['copy_drafts'][0]['copy_status']=='pending'
+    assert current['website_clip_reviews']['existing:short:1']['choice']=='approve'
+    draft=dict(current['copy_drafts'][0]);draft['social_caption']='Owner text 🌱 #Seeds'
+    current['copy_drafts'][0]=draft;save_state(r,current)
+    assert post(r,choice='approve',version=1,playback_verified=True).status_code==200
+    assert read_state(r)['copy_drafts']==[draft]
+    assert not read_state(r).get('schedule_requested_at')
+    r['telegram'].assert_not_called()
