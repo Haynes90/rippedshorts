@@ -52,7 +52,7 @@ def test_both_formats_are_visible_before_render_and_session_is_request_specific(
     assert data['request_id']=='existing' and data['candidate_total']==6
     assert {c['format'] for c in data['candidates']}=={'9:16','16:9'}
     assert page.count('class="candidate-card asset"')==6
-    assert '<video' not in page and 'watched this finished clip' not in page
+    assert page.count('data-source-excerpt data-start=')==6 and 'watched this finished clip' not in page
     assert 'Intended transcript and boundaries' in page and 'Full frame on blurred background' in page
     assert 'Status not loaded' not in page and 'Candidate selection remains in Telegram' not in page
     assert 'refreshWorkflow();' in page and 'id="finishButton" disabled' in page
