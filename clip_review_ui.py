@@ -1,6 +1,7 @@
 """Editorial and framing sections of the existing review portal."""
 import html
 import json
+from urllib.parse import quote
 
 
 def candidate_cards(items, token):
@@ -15,6 +16,10 @@ def candidate_cards(items, token):
 <span class="pill">{item['format']}</span><h2>{html.escape(item['title'])}</h2>
 <p>Proposed passage: {item['start']:.2f}–{item['end']:.2f} seconds ({item['end']-item['start']:.1f}s)</p>
 <p>Editorial candidate — rendering starts only after you confirm your selections. Final speech and media checks still apply.</p>
+<p><strong>Source excerpt — not a finished render.</strong> Final framing and exported media are reviewed after rendering.</p>
+<video data-source-excerpt data-start="{item['start']}" data-end="{item['end']}" controls playsinline preload="none" style="width:100%;max-height:65vh" src="/api/ripped-shorts/review/{quote(token,safe='')}/candidate/{quote(item['asset_id'],safe='')}/source?revision={item['revision']}#t={item['start']},{item['end']}"></video>
+<label>Seek within this excerpt<input data-excerpt-seek type="range" min="0" max="{item['end']-item['start']}" step="0.05" value="0" style="width:100%"></label>
+<p data-excerpt-status role="status">Play to hear the proposed source passage ({item['start']:.2f}–{item['end']:.2f}s).</p>
 <details><summary>Intended transcript and boundaries</summary><p style="white-space:pre-wrap">{html.escape(item['transcript'])}</p></details>
 <p><strong>Why this clip?</strong> {html.escape(item['reason'])}</p>{framing}
 <label>Adjustment request or feedback<textarea data-feedback {disabled}>{html.escape(item['feedback'])}</textarea></label>
@@ -22,6 +27,25 @@ def candidate_cards(items, token):
 <p data-candidate-status role="status">Saved choice: {html.escape(item['choice'] or 'Undecided')}{' — confirmed for this rendering batch' if item['frozen'] else ''}</p></article>''')
         sections.append(f'<section id="{"shorts" if lane=="short" else "highlights"}"><h2>{title}</h2>'+(''.join(cards) if cards else '<p>No candidates available for this format yet. Processing status appears above; this is not a completed review.</p>')+(f'<button type="button" data-confirm-candidates="{lane}">Confirm selected {"Shorts" if lane=="short" else "highlights"} and render</button>' if cards and any(not c['frozen'] for c in items if c['lane']==lane) else '')+'</section>')
     return ''.join(sections)+'''<script>
+document.querySelectorAll('[data-source-excerpt]').forEach(video=>{
+ const card=video.closest('.candidate-card'),seek=card.querySelector('[data-excerpt-seek]'),status=card.querySelector('[data-excerpt-status]');
+ const start=Number(video.dataset.start),end=Number(video.dataset.end);let timer;
+ const clear=()=>clearTimeout(timer);
+ const stop=()=>{clear();video.pause();video.currentTime=end;seek.value=end-start;status.textContent='End of source excerpt. Play to replay.';};
+ const arm=()=>{clear();if(!video.paused&&video.currentTime<end)timer=setTimeout(stop,Math.max(0,(end-video.currentTime)/video.playbackRate*1000));};
+ video.addEventListener('loadedmetadata',()=>{video.currentTime=start;status.textContent='Source excerpt ready; audio and volume use the player controls.';});
+ video.addEventListener('play',()=>{
+  document.querySelectorAll('video').forEach(other=>{if(other!==video)other.pause();});
+  if(video.currentTime<start||video.currentTime>=end)video.currentTime=start;
+  arm();
+ });
+ video.addEventListener('pause',clear);
+ video.addEventListener('seeking',()=>{clear();if(video.currentTime<start)video.currentTime=start;if(video.currentTime>end)stop();});
+ video.addEventListener('seeked',arm);video.addEventListener('ratechange',arm);
+ video.addEventListener('timeupdate',()=>{if(video.currentTime>=end&&!video.paused)stop();seek.value=Math.max(0,Math.min(end-start,video.currentTime-start));});
+ video.addEventListener('error',()=>{clear();status.textContent='Source excerpt unavailable. Your decisions are preserved; no render or download was started.';});
+ seek.addEventListener('input',()=>{video.currentTime=start+Math.max(0,Math.min(end-start,Number(seek.value)));});
+});
 document.querySelectorAll('[data-candidate-choice]').forEach(button=>button.onclick=async()=>{
  const card=button.closest('[data-asset]'),status=card.querySelector('[data-candidate-status]');
  const buttons=card.querySelectorAll('button');buttons.forEach(b=>b.disabled=true);

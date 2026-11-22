@@ -656,6 +656,53 @@ def review_data(token: str):
     return _payload_for_session(token)
 
 
+# Range requests for seven cards must not rehash the same unchanged source.
+from functools import lru_cache
+
+
+@lru_cache(maxsize=32)
+def _candidate_source_fingerprint(path, signature):
+    import hashlib
+    from pathlib import Path
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+@router.get('/api/ripped-shorts/review/{token}/candidate/{asset_id}/source')
+def candidate_source_media(token: str, asset_id: str, revision: str):
+    """Authenticated source excerpt, never a finished export or a download job."""
+    import math
+    from pathlib import Path
+    from audio_master_handoff import DATA_DIR
+    from clip_review_state import candidate_items, website_first
+    session = _session(token)
+    rid = str(session['request_id'])
+    state = json.loads(_request_row(rid)['state_json'])
+    candidate = next((c for c in candidate_items(rid,state) if c['asset_id']==asset_id),None) if website_first(state) else None
+    if not candidate or candidate['revision'] != revision:
+        raise HTTPException(status_code=409,detail='Candidate changed or is unavailable; refresh the review')
+    proof = state.get('source_validation') or {}
+    if (proof.get('status')!='verified' or proof.get('request_id')!=rid
+            or proof.get('source_id')!=(state.get('parsed') or {}).get('video_id')
+            or not re.fullmatch(r'[0-9a-f]{64}',str(proof.get('source_sha256') or ''))
+            or not (state.get('transcript_evidence') or {}).get('timed_segments')):
+        raise HTTPException(status_code=409,detail='Verified source identity unavailable')
+    try:
+        start,end,duration = float(candidate['start']),float(candidate['end']),float(proof['duration'])
+        assert all(math.isfinite(v) for v in (start,end,duration)) and 0<=start<end<=duration
+        path = Path(state['video_path']).resolve()
+        assert path.is_relative_to(Path(DATA_DIR).resolve()) and path.is_file()
+        stat = path.stat()
+        assert stat.st_size==int(proof['size'])>0
+        signature = (stat.st_dev,stat.st_ino,stat.st_size,stat.st_mtime_ns,stat.st_ctime_ns)
+        assert _candidate_source_fingerprint(str(path),signature)==proof['source_sha256']
+        current=path.stat()
+        assert signature==(current.st_dev,current.st_ino,current.st_size,current.st_mtime_ns,current.st_ctime_ns)
+    except (AssertionError,KeyError,ValueError,TypeError,OSError):
+        raise HTTPException(status_code=409,detail='Retained source unavailable or changed; no new download was started')
+    return _preview_response({'local_path':str(path),'size':stat.st_size})
+
+
 @router.post('/api/ripped-shorts/review/{token}/candidate/{asset_id}')
 async def save_candidate_review(token: str, asset_id: str, request: Request):
     session=_session(token)
