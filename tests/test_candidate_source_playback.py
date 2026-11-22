@@ -87,8 +87,12 @@ def test_excerpt_controls_clamp_seek_stop_replay_and_pause_siblings(source,tmp_p
 const assert=require('node:assert/strict');let timers=[];
 global.setTimeout=(fn,ms)=>{timers.push({fn,ms});return timers.length;};global.clearTimeout=()=>{};
 function player(start,end){const handlers={},seek={value:0,addEventListener(n,fn){this[n]=fn;}},status={};return {dataset:{start,end},currentTime:0,playbackRate:1,paused:true,handlers,seek,status,addEventListener(n,fn){handlers[n]=fn;},pause(){this.paused=true;handlers.pause?.();},closest(){return {querySelector:s=>s==='[data-excerpt-seek]'?seek:status};}};}
-const a=player(10,30),b=player(40,80);global.document={querySelectorAll:()=>[a,b]};
+const a=player(10,30),b=player(168.27999877929688,247.33999633789062);
+let clock=0,seeks=0;Object.defineProperty(b,'currentTime',{get(){return clock;},set(value){clock=Math.floor(value*1e6)/1e6;if(++seeks>10)throw Error('Repeated quantized seek');b.handlers.seeking?.();}});
+global.document={querySelectorAll:()=>[a,b]};
 """+script+"""
+b.handlers.loadedmetadata();assert(Math.abs(b.currentTime-Number(b.dataset.start))<.001);assert.equal(seeks,1);
+b.currentTime=Number(b.dataset.end);b.paused=false;b.handlers.play();assert(Math.abs(b.currentTime-Number(b.dataset.start))<.001);
 a.handlers.loadedmetadata();assert.equal(a.currentTime,10);
 b.paused=false;a.paused=false;a.handlers.play();assert(b.paused);assert.equal(timers.at(-1).ms,20000);
 timers.at(-1).fn();assert.equal(a.currentTime,10);assert(!a.paused); // buffering cannot skip speech

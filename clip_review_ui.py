@@ -29,19 +29,19 @@ def candidate_cards(items, token):
     return ''.join(sections)+'''<script>
 document.querySelectorAll('[data-source-excerpt]').forEach(video=>{
  const card=video.closest('.candidate-card'),seek=card.querySelector('[data-excerpt-seek]'),status=card.querySelector('[data-excerpt-status]');
- const start=Number(video.dataset.start),end=Number(video.dataset.end);let timer;
+ const start=Number(video.dataset.start),end=Number(video.dataset.end),timingEpsilon=.001;let timer;
  const clear=()=>clearTimeout(timer);
  const stop=()=>{clear();video.pause();video.currentTime=end;seek.value=end-start;status.textContent='End of source excerpt. Play to replay.';};
  const arm=()=>{clear();if(!video.paused&&video.currentTime<end)timer=setTimeout(()=>{if(video.currentTime>=end-.01)stop();else arm();},Math.max(10,(end-video.currentTime)/video.playbackRate*1000));};
  video.addEventListener('loadedmetadata',()=>{video.currentTime=start;status.textContent='Source excerpt ready; audio and volume use the player controls.';});
  video.addEventListener('play',()=>{
   document.querySelectorAll('video').forEach(other=>{if(other!==video)other.pause();});
-  if(video.currentTime<start||video.currentTime>=end)video.currentTime=start;
+  if(video.currentTime<start-timingEpsilon||video.currentTime>=end-timingEpsilon)video.currentTime=start;
   arm();
  });
  video.addEventListener('pause',clear);
  video.addEventListener('waiting',clear);video.addEventListener('stalled',clear);video.addEventListener('playing',arm);
- video.addEventListener('seeking',()=>{clear();if(video.currentTime<start)video.currentTime=start;if(video.currentTime>end)stop();});
+ video.addEventListener('seeking',()=>{clear();if(video.currentTime<start-timingEpsilon)video.currentTime=start;if(video.currentTime>end)stop();});
  video.addEventListener('seeked',arm);video.addEventListener('ratechange',arm);
  video.addEventListener('timeupdate',()=>{if(video.currentTime>=end&&!video.paused)stop();seek.value=Math.max(0,Math.min(end-start,video.currentTime-start));});
  video.addEventListener('error',()=>{clear();status.textContent='Source excerpt unavailable. Your decisions are preserved; no render or download was started.';});
