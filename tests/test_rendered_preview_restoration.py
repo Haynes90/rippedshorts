@@ -198,3 +198,14 @@ def test_verified_historical_preview_beyond_ceiling_is_reused_without_rendering(
         recovery._put(db,'preview_success','preview:'+identity+':'+ticket['revision']+':success',{'ticket':ticket,'clip':saved})
     assert recovery.generate_preview('request','short',20,p['source'])==saved
     assert p['read']()==state and not p['calls'] and p['files'].create.call_count==0
+
+
+def test_unrelated_brand_does_not_enter_rendered_preview_dispatch(previews,monkeypatch):
+    p=previews;state=website(p);state['show_id']='AGAPE_CHURCH';state['source_intelligence']={'map_id':'existing'}
+    monkeypatch.setattr(workflow,'prepared_highlights',lambda *a:state['topic_result'])
+    monkeypatch.setattr(p['tg'],'send',Mock());monkeypatch.setattr(p['tg'],'_save',Mock())
+    forbidden=Mock(side_effect=AssertionError('Unrelated brand dispatch is forbidden'))
+    monkeypatch.setattr(recovery,'start_preview_pipeline',forbidden)
+    notification=Mock();monkeypatch.setattr(p['tg'],'_send_topic_candidates',notification)
+    p['tg']._process_topics('request',state,'chat','source',p['source'],state['topic_source_segments'],True)
+    forbidden.assert_not_called();notification.assert_called_once()
