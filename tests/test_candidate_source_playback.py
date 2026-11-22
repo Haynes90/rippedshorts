@@ -91,6 +91,8 @@ const a=player(10,30),b=player(40,80);global.document={querySelectorAll:()=>[a,b
 """+script+"""
 a.handlers.loadedmetadata();assert.equal(a.currentTime,10);
 b.paused=false;a.paused=false;a.handlers.play();assert(b.paused);assert.equal(timers.at(-1).ms,20000);
+timers.at(-1).fn();assert.equal(a.currentTime,10);assert(!a.paused); // buffering cannot skip speech
+a.handlers.waiting();a.handlers.playing();
 a.currentTime=5;a.handlers.seeking();assert.equal(a.currentTime,10);
 a.seek.value=7;a.seek.input();assert.equal(a.currentTime,17);
 a.currentTime=31;a.handlers.timeupdate();assert(a.paused);assert.equal(a.currentTime,30);
