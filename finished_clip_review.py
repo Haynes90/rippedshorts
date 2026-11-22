@@ -112,6 +112,12 @@ def save(request_id, asset_id, body):
                     'video_title':selected.get('title') or '', 'video_description':'',
                     'hashtags':'','copy_status':'pending','user_edited':False})
                 copy_added=True  # Separate copy approval; no automatic AI or scheduling.
+        if state.get('review_interface')=='website' and choice=='approve' and not any(d.get('asset_id')==asset_id for d in state.get('copy_drafts') or []):
+            selected=next(a for a in __import__('telegram_intake')._copy_review_assets(state,request_id) if a['asset_id']==asset_id)
+            state.setdefault('copy_drafts',[]).append({**selected,'social_caption':'',
+                'video_title':selected.get('title') or '', 'video_description':'',
+                'hashtags':'','copy_status':'pending','user_edited':False})
+            copy_added=True
         state['clip_review_ui_version'] = 2
         db.execute('UPDATE telegram_requests SET state_json=?,updated_at=? WHERE request_id=?',
                    (json.dumps(state), decision['decided_at'], request_id))

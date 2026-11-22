@@ -3,6 +3,47 @@ import html
 import json
 
 
+def candidate_cards(items, token):
+    """Use the existing portal for proposals; no finished-video claims here."""
+    sections=[]
+    for lane,title in [('short','9:16 Shorts candidates'),('highlight','16:9 highlight candidates')]:
+        cards=[]
+        for item in [c for c in items if c['lane']==lane]:
+            disabled='disabled' if item['frozen'] else ''
+            framing=(f'<label>Framing<select data-framing {disabled}><option value="auto">Automatic safe framing</option><option value="blurred" '+('selected' if item['framing']=='blurred' else '')+'>Full frame on blurred background</option></select></label>') if lane=='short' else ''
+            cards.append(f'''<article class="candidate-card asset" data-asset="{html.escape(item['asset_id'])}" data-revision="{item['revision']}" data-version="{item['version']}">
+<span class="pill">{item['format']}</span><h2>{html.escape(item['title'])}</h2>
+<p>Proposed passage: {item['start']:.2f}–{item['end']:.2f} seconds ({item['end']-item['start']:.1f}s)</p>
+<p>Editorial candidate — rendering starts only after you confirm your selections. Final speech and media checks still apply.</p>
+<details><summary>Intended transcript and boundaries</summary><p style="white-space:pre-wrap">{html.escape(item['transcript'])}</p></details>
+<p><strong>Why this clip?</strong> {html.escape(item['reason'])}</p>{framing}
+<label>Adjustment request or feedback<textarea data-feedback {disabled}>{html.escape(item['feedback'])}</textarea></label>
+<div class="actions">{''.join(f'<button type="button" data-candidate-choice="{choice}" {disabled}>{label}</button>' for choice,label in [('select','Select'),('reject','Reject'),('request_adjustment','Request Adjustment'),('unused','Leave Unused')])}</div>
+<p data-candidate-status role="status">Saved choice: {html.escape(item['choice'] or 'Undecided')}{' — confirmed for this rendering batch' if item['frozen'] else ''}</p></article>''')
+        sections.append(f'<section id="{"shorts" if lane=="short" else "highlights"}"><h2>{title}</h2>'+(''.join(cards) if cards else '<p>No candidates available for this format yet. Processing status appears above; this is not a completed review.</p>')+(f'<button type="button" data-confirm-candidates="{lane}">Confirm selected {"Shorts" if lane=="short" else "highlights"} and render</button>' if cards and any(not c['frozen'] for c in items if c['lane']==lane) else '')+'</section>')
+    return ''.join(sections)+'''<script>
+document.querySelectorAll('[data-candidate-choice]').forEach(button=>button.onclick=async()=>{
+ const card=button.closest('[data-asset]'),status=card.querySelector('[data-candidate-status]');
+ const buttons=card.querySelectorAll('button');buttons.forEach(b=>b.disabled=true);
+ try{
+  const response=await fetch('/api/ripped-shorts/review/'+TOKEN+'/candidate/'+encodeURIComponent(card.dataset.asset),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice:button.dataset.candidateChoice,version:Number(card.dataset.version),revision:card.dataset.revision,feedback:card.querySelector('[data-feedback]').value,framing:card.querySelector('[data-framing]')?.value||'auto'})});
+  const data=await response.json();if(!response.ok)throw new Error(data.detail||'Save failed');
+  card.dataset.version=data.candidate.version;card.dataset.revision=data.candidate.revision;
+  status.textContent='Saved: '+data.candidate.choice+'. Rendering and scheduling have not started.';
+  await refreshReviewState();
+ }catch(e){status.textContent='Save not confirmed: '+e.message+'. Your entered text is still here; refresh the saved state before repeating an uncertain save.';}
+ finally{buttons.forEach(b=>b.disabled=false);}
+});
+document.querySelectorAll('[data-confirm-candidates]').forEach(button=>button.onclick=async()=>{
+ button.disabled=true;
+ try{
+  const r=await fetch('/api/ripped-shorts/review/'+TOKEN+'/candidates/'+button.dataset.confirmCandidates+'/confirm',{method:'POST'});
+  const d=await r.json();if(!r.ok)throw new Error(d.detail||'Confirmation failed');location.reload();
+ }catch(e){button.textContent=e.message;button.disabled=false;}
+});
+</script>'''
+
+
 def finished_cards(items, token):
     from urllib.parse import quote
     cards = []

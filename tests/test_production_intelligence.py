@@ -198,6 +198,28 @@ def test_sheet_write_readback_and_uncertain_retry_does_not_duplicate(db,timeline
     assert all(w['valueInputOption']=='RAW' for w in service.writes)
 
 
+@pytest.mark.parametrize('supported',[False,True])
+def test_sheet_sync_preserves_internal_evidence_without_blocking_supported_records(db,supported):
+    internal={'boundary_assessment':{'complete':False,'diagnostic':'held'},
+              'boundary_specification':{'revision':'immutable','start':10,'end':30},
+              'render_attempt':{'status':'verified'},
+              'future_internal_kind':{'private_evidence':'retain unchanged'}}
+    for kind,payload in internal.items():
+        pi.record(kind,kind,payload)
+    with pi.database() as c:
+        before=[tuple(r) for r in c.execute('SELECT * FROM intelligence_records ORDER BY record_id')]
+    service=FakeSheets()
+    if supported:
+        for kind in pi.SHEET_TABS:
+            pi.record(kind,'supported-'+kind,{'title':kind,'request_id':'isolated'})
+    assert pi.sync_sheets(service,'isolated')==len(pi.SHEET_TABS)*int(supported)
+    assert pi.sync_sheets(service,'isolated')==0
+    assert set(service.tabs)==(set(pi.SHEET_TABS.values()) if supported else set())
+    with pi.database() as c:
+        after=[tuple(r) for r in c.execute("SELECT * FROM intelligence_records WHERE record_id NOT LIKE 'supported-%' ORDER BY record_id")]
+    assert after==before  # Payloads, digests and unsynced markers all preserved.
+
+
 def test_sheet_schema_conflict_holds_projection_not_processing(db,timeline):
     result=pi.topic_map(SOURCE,timeline,mapped)
     service=FakeSheets();service.tabs[pi.SHEET_TABS['source']]=[['unrelated schema']]
