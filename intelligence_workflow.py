@@ -6,7 +6,7 @@ import production_intelligence as intelligence
 
 
 def sentence_first(state):
-    return state.get('sentence_first_version')==1 or (os.getenv('RIPPED_PREVIEW_FIRST_ENABLED','false').lower()=='true'
+    return state.get('sentence_first_version')==1 or ((state.get('review_interface')=='website' or os.getenv('RIPPED_PREVIEW_FIRST_ENABLED','false').lower()=='true')
         and state.get('show_id') in {'TCB','TDOG'} and not state.get('candidate_reviews'))
 
 
@@ -146,7 +146,21 @@ def shorts_for_review(state, future, segments, video):
 
 
 def prepared_highlights(state, segments, video):
+    # Completed editorial decisions stay frozen when preview mode is enabled.
+    saved=state.get('topic_result')
+    if isinstance(saved,dict) and isinstance(saved.get('segments'),list):
+        return saved
     mapping=saved_mapping(state)
+    with intelligence.database() as db:
+        cached=db.execute("SELECT result FROM source_analyses WHERE status='PASSED' AND analysis_id LIKE ?",
+                          (mapping['map_id']+':16:9:%',)).fetchall()
+    if len(cached)>1:
+        raise ValueError('Multiple saved highlight revisions require reconciliation')
+    if cached:
+        saved=json.loads(cached[0]['result'])
+        if not isinstance(saved,dict) or not isinstance(saved.get('segments'),list):
+            raise ValueError('Saved highlight candidates are invalid')
+        return saved
     return analyze_highlights(mapping, segments, video, drafts=sentence_first(state))
 
 
@@ -176,4 +190,5 @@ def sync():
     if not sheet:
         return
     return intelligence.sync_sheets(sheets_service(), sheet)
+
 

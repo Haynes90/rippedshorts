@@ -168,7 +168,7 @@ def _payload_for_session(token: str) -> dict[str, Any]:
     drafts = list(state.get("copy_drafts") or [])
     from clip_review_state import website_first, candidate_items, processing_label
     website = website_first(state)
-    candidates = candidate_items(request_id,state) if website else []
+    candidates = candidate_items(request_id,state) if website and state.get('preview_first_version')!=1 else []
     if not website and not drafts and not state.get("result") and not state.get("topic_result"):
         raise HTTPException(status_code=409, detail="Copy review is not ready yet")
 
@@ -254,7 +254,10 @@ def _payload_for_session(token: str) -> dict[str, Any]:
         "candidates": candidates,
         "candidate_total": len(candidates),
         "candidate_reviewed": sum(bool(c['choice']) for c in candidates),
-        "processing_status": processing_label(row['status'],state,candidates,gallery),
+        "processing_status": (('Finished-video review ready' if gallery else
+            'Preparing rendered previews' if any(c['render_status']=='preview_pending' for c in verified_clips) else
+            'No playable previews — candidate validation needs review') if state.get('preview_first_version')==1
+            else processing_label(row['status'],state,candidates,gallery)),
         "processing_stage": state.get('stage') or row['status'],
         "preview_first": state.get('preview_first_version')==1,
         "acceptance_demo": bool(state.get('acceptance_demo')),
@@ -425,7 +428,7 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
   }}
   document.getElementById('refreshWorkflow').onclick=refreshWorkflow;
   refreshWorkflow();
-  {'setInterval(async()=>{if(document.hidden)return;try{const r=await fetch("/api/ripped-shorts/review/'+token+'",{cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status);const d=await r.json();if(d.request_id!=='+json.dumps(payload['request_id'])+')throw new Error("Review request mismatch");if(d.candidate_total!=='+str(payload.get('candidate_total',0))+'||d.preview_review_total!=='+str(payload.get('preview_review_total',0))+')location.reload();document.getElementById("processingStatus").textContent=d.processing_status;}catch(e){document.getElementById("workflowStatus").textContent="Status refresh failed. Saved decisions remain intact. "+e.message;}},15000);' if payload.get('website_first') and payload.get('processing_stage') in {'accepted','source_resolution','selection','parallel_format_analysis','processing','retrying','awaiting_render_completion'} else ''}
+  {'setInterval(async()=>{if(document.hidden)return;try{const r=await fetch("/api/ripped-shorts/review/'+token+'",{cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status);const d=await r.json();if(d.request_id!=='+json.dumps(payload['request_id'])+')throw new Error("Review request mismatch");if(d.candidate_total!=='+str(payload.get('candidate_total',0))+'||d.preview_review_total!=='+str(payload.get('preview_review_total',0))+')location.reload();document.getElementById("processingStatus").textContent=d.processing_status;}catch(e){document.getElementById("workflowStatus").textContent="Status refresh failed. Saved decisions remain intact. "+e.message;}},15000);' if payload.get('website_first') and (payload.get('preview_first') or payload.get('processing_stage') in {'accepted','source_resolution','selection','parallel_format_analysis','processing','retrying','awaiting_render_completion'}) else ''}
   </script>
   <div class="progress">
     <div class="progressbar"><div id="bar"></div></div>
@@ -436,7 +439,7 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
   <details id="editing-workflow" {'open' if payload.get('stage') in {'editorial','framing'} else ''}><summary>Edit boundaries or framing / compare alternatives</summary>
   {__import__('clip_review_ui').sections(payload.get('comparisons', []), token)}
   </details>
-  {__import__('clip_review_ui').candidate_cards(payload.get('candidates', []),token) if payload.get('website_first') else '<section id="shorts"><h2>9:16 candidate review</h2></section><section id="highlights"><h2>16:9 candidate review</h2></section>'}
+  {__import__('clip_review_ui').candidate_cards(payload.get('candidates', []),token) if payload.get('website_first') and not payload.get('preview_first') else '<section id="shorts"><h2>9:16 candidate review</h2></section><section id="highlights"><h2>16:9 candidate review</h2></section>'}
   <section id="final"><h2>Final rendered video and copy approval</h2><section id="assets">{cards}</section></section>
 </main>
 
@@ -454,7 +457,7 @@ let state = INITIAL;
 {creator_script}
 
 function updateProgress(data=state) {{
-  if(data.website_first){{
+  if(data.website_first&&!data.preview_first){{
     const total=data.candidate_total||0,done=data.candidate_reviewed||0;
     document.getElementById('progressText').textContent=total?`${{done}}/${{total}} candidates reviewed`:data.processing_status;
     document.getElementById('bar').style.width=total?`${{Math.round(done/total*100)}}%`:'0%';
@@ -464,7 +467,7 @@ function updateProgress(data=state) {{
   }}
   if(data.preview_first){{
     const total=data.preview_review_total||0,completed=data.preview_review_completed||0;
-    document.getElementById('progressText').textContent=`${{completed}}/${{total}} playable previews reviewed`;
+    document.getElementById('progressText').textContent=total?`${{completed}}/${{total}} playable previews reviewed`:data.processing_status;
     document.getElementById('bar').style.width=total?`${{Math.round(completed/total*100)}}%`:'0%';
     const blockers=data.schedule_blockers||[];
     document.getElementById('finishButton').disabled=blockers.length>0;

@@ -30,7 +30,7 @@ def test_watchdog_pauses_when_storage_is_below_hard_floor():
 
 def test_emergency_cleanup_can_reclaim_recent_retired_job_files():
     assert "def _active_local_source_dirs()" in TELEGRAM
-    assert "emergency_reclaimable = emergency and not _path_is_under(path, protected_dirs)" in TELEGRAM
+    assert "emergency_reclaimable = emergency and not preview_file and not _path_is_under(path, protected_dirs)" in TELEGRAM
     assert "EMERGENCY_TARGET_FREE_BYTES" in TELEGRAM
 
 

@@ -89,6 +89,8 @@ def save_candidate(request_id, identity, body):
         row=db.execute('SELECT * FROM telegram_requests WHERE request_id=?',(request_id,)).fetchone()
         if not row: raise ValueError('Request not found')
         state=json.loads(row['state_json'])
+        if state.get('preview_first_version')==1:
+            raise ValueError('Use the rendered-preview review for this request; refresh the website')
         if not website_first(state) or state.get('schedule_requested_at') or state.get('schedule_master'):
             raise ValueError('This candidate collection is not editable in this review')
         item=next((c for c in candidate_items(request_id,state) if c['asset_id']==identity),None)
@@ -124,6 +126,8 @@ def confirm_candidates(request_id, lane):
         row=db.execute('SELECT * FROM telegram_requests WHERE request_id=?',(request_id,)).fetchone()
         if not row: raise ValueError('Request not found')
         state=json.loads(row['state_json'])
+        if state.get('preview_first_version')==1:
+            raise ValueError('Previews use the existing dispatcher; select the verified rendered videos instead')
         if not website_first(state) or state.get('schedule_requested_at'):
             raise ValueError('Request is not in website candidate review')
         if (state.get('website_selection_confirmed') or {}).get(lane):
