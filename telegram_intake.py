@@ -3286,7 +3286,7 @@ def _process_topics(
         state.update(video_path=str(video), source_reused=reused, topic_result=topic_result,
                      topic_reviews=state.get("topic_reviews") or {}, topic_stage="awaiting_review" if topics else "not_eligible")
         _save(request_id, "awaiting_review" if topics else "processing", state)
-        if state.get('review_interface')=='website' and state.get('show_id') in {'TCB','TDOG'}:
+        if state.get('review_interface')=='website' and str(state.get('show_id') or '').upper() in {'TCB','TDOG'}:
             __import__('render_recovery').start_preview_pipeline(request_id,video)
         elif topics:
             _send_topic_candidates(chat_id, request_id, topic_result)
@@ -3426,7 +3426,7 @@ def _process(request_id: str) -> None:
     if _resume_saved_copy_review(row):
         return
 
-    if (state.get('review_interface')=='website' and state.get('show_id') in {'TCB','TDOG'}
+    if (state.get('review_interface')=='website' and str(state.get('show_id') or '').upper() in {'TCB','TDOG'}
             and not state.get('force_rerip') and (state.get('result') or state.get('topic_result'))):
         from render_recovery import start_preview_pipeline, RenderReviewRequired
         proof=state.get('source_validation') or {}

@@ -7,7 +7,7 @@ import production_intelligence as intelligence
 
 def sentence_first(state):
     return state.get('sentence_first_version')==1 or ((state.get('review_interface')=='website' or os.getenv('RIPPED_PREVIEW_FIRST_ENABLED','false').lower()=='true')
-        and state.get('show_id') in {'TCB','TDOG'} and not state.get('candidate_reviews'))
+        and str(state.get('show_id') or '').upper() in {'TCB','TDOG'} and not state.get('candidate_reviews'))
 
 
 def replacement_candidates(state,segments,video,lane,attempted,pass_number):

@@ -212,7 +212,7 @@ def current_asset_id(default):
 
 def preview_ticket(request_id, state, identity):
     """Validated candidate authority is separate from any owner selection."""
-    if state.get('preview_first_version') != 1 or state.get('show_id') not in {'TCB','TDOG'}:
+    if state.get('preview_first_version') != 1 or str(state.get('show_id') or '').upper() not in {'TCB','TDOG'}:
         raise RenderReviewRequired('Preview-first processing is not enabled for this request')
     for lane,(key,_) in LANES.items():
         for index,clip in enumerate((state.get(key) or {}).get('segments') or []):
@@ -444,7 +444,7 @@ def start_preview_pipeline(request_id,source):
         key='preview-dispatch:'+request_id
         if _get(db,key,'preview_dispatch'):
             return {}  # Owner decisions after dispatch never cause another worker.
-        if state.get('show_id') not in {'TCB','TDOG'} or any(state.get(k) for k in
+        if str(state.get('show_id') or '').upper() not in {'TCB','TDOG'} or any(state.get(k) for k in
                 ('candidate_reviews','topic_reviews','website_clip_reviews','schedule_master','schedule_requested_at')):
             raise RenderReviewRequired('Existing owner decisions cannot be migrated to preview-first automatically')
         mode=row['mode']

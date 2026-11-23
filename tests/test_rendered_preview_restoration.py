@@ -28,8 +28,9 @@ def website(p):
     p['write'](state);return state
 
 
-def test_saved_website_request_enters_existing_dispatcher_without_any_reanalysis(previews,monkeypatch):
-    p=previews;before=website(p);tg=p['tg'];seen=[]
+@pytest.mark.parametrize('brand',['TDOG','tcb','tdog'])
+def test_saved_website_request_enters_existing_dispatcher_without_any_reanalysis(previews,monkeypatch,brand):
+    p=previews;before=website(p);before['show_id']=brand;p['write'](before);tg=p['tg'];seen=[]
     monkeypatch.setattr(tg,'_ensure_storage_headroom',lambda:{'free_bytes':2**40})
     monkeypatch.setattr(tg,'_resume_saved_copy_review',lambda row:False)
     monkeypatch.setattr(tg,'RENDER_EXECUTOR',ImmediateExecutor())
@@ -209,3 +210,20 @@ def test_unrelated_brand_does_not_enter_rendered_preview_dispatch(previews,monke
     notification=Mock();monkeypatch.setattr(p['tg'],'_send_topic_candidates',notification)
     p['tg']._process_topics('request',state,'chat','source',p['source'],state['topic_source_segments'],True)
     forbidden.assert_not_called();notification.assert_called_once()
+
+
+@pytest.mark.parametrize('brand',['tcb','tdog'])
+@pytest.mark.parametrize('lane',['short','highlight'])
+def test_lowercase_brand_preserves_identity_through_specification_render_and_receipt_reuse(previews,brand,lane):
+    p=previews;state=website(p)
+    state.update(show_id=brand,preview_first_version=1,sentence_first_version=1)
+    state['result']['segments'][0].update(end=16.1,duration=6.1)
+    p['write'](state)
+    assert workflow.sentence_first(state)
+    rendered=recovery.generate_preview('request',lane,0,p['source'])
+    assert rendered['boundary_specification_id'] and rendered['media_receipt_id']
+    assert p['read']()['show_id']==brand
+    calls=p['reviewer'].call_count
+    assert recovery.generate_preview('request',lane,0,p['source'])==rendered
+    assert p['reviewer'].call_count==calls and len(p['calls'])==1 and p['files'].create.call_count==1
+    assert not p['read']().get('schedule_master') and not p['read']().get('website_clip_reviews')
