@@ -1,0 +1,30 @@
+name: Codebase index smoke test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  index-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install existing indexer
+        run: python -m pip install codebase-index
+      - name: Build index and validate search
+        run: |
+          codebase-index index
+          codebase-index doctor
+          codebase-index --json search "Audio Master handoff" > /tmp/codebase-index-search.json
+          python -c "import json; json.load(open('/tmp/codebase-index-search.json'))"
+      - name: Verify incremental refresh
+        run: codebase-index update
