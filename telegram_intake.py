@@ -3286,7 +3286,9 @@ def _process_topics(
         state.update(video_path=str(video), source_reused=reused, topic_result=topic_result,
                      topic_reviews=state.get("topic_reviews") or {}, topic_stage="awaiting_review" if topics else "not_eligible")
         _save(request_id, "awaiting_review" if topics else "processing", state)
-        if topics:
+        if state.get('review_interface')=='website' and state.get('show_id') in {'TCB','TDOG'}:
+            __import__('render_recovery').start_preview_pipeline(request_id,video)
+        elif topics:
             _send_topic_candidates(chat_id, request_id, topic_result)
         return state
     suggestions = _topic_break_suggestions(segments)
@@ -3422,6 +3424,16 @@ def _process(request_id: str) -> None:
         return
 
     if _resume_saved_copy_review(row):
+        return
+
+    if (state.get('review_interface')=='website' and state.get('show_id') in {'TCB','TDOG'}
+            and not state.get('force_rerip') and (state.get('result') or state.get('topic_result'))):
+        from render_recovery import start_preview_pipeline, RenderReviewRequired
+        proof=state.get('source_validation') or {}
+        source=Path(str(state.get('video_path') or ''))
+        if proof.get('status')!='verified' or proof.get('request_id')!=request_id or not source.is_file():
+            raise RenderReviewRequired('Saved candidates require their existing verified retained source; ingestion was not restarted')
+        start_preview_pipeline(request_id,source)
         return
 
     parsed = state.get("parsed") or {}
@@ -3637,6 +3649,8 @@ def _process(request_id: str) -> None:
                 'word_count':sum(len(seg.get('words') or []) for seg in segments),
                 'audio_master_job_id':(state.get('audio_master_ingest') or {}).get('job_id'), 'observed_at':now()}
             _save(request_id, "processing", {**state, "stage":"source_validated"})
+        if state.get('review_interface')=='website':
+            state.update(video_path=str(video),topic_source_segments=segments)
         if row["mode"] == "topics":
             _process_topics(
                 request_id,
@@ -3879,7 +3893,8 @@ def _process(request_id: str) -> None:
             result = shorts_for_review(state, short_future, enriched, video)
         else:
             result = main.call_openai_for_clips(enriched, "\n\n".join(prompt_layers))
-        result = validate_complete_candidates(result, enriched, maximum=None if state.get('source_intelligence') else 20)
+        if not __import__('intelligence_workflow').sentence_first(state):
+            result = validate_complete_candidates(result, enriched, maximum=None if state.get('source_intelligence') else 20)
         excluded_history = (
             [item for item in prior_shorts if item.get("decision") == "rejected"]
             if force_rerip
@@ -3905,7 +3920,8 @@ def _process(request_id: str) -> None:
         for offset, clip in enumerate(new_segments):
             clip["candidate_number"] = next_number + offset
 
-        new_segments = _preflight_candidates(video, new_segments)
+        if not __import__('intelligence_workflow').sentence_first(state):
+            new_segments = _preflight_candidates(video, new_segments)
         combined = approved_clips + new_segments
         result["segments"] = combined
         reviews = {
@@ -3927,25 +3943,11 @@ def _process(request_id: str) -> None:
             "candidate_reviews": reviews,
         }
         _save(request_id, "awaiting_review", final_state)
-        if final_state.get('review_interface')=='website':
-            _send_candidates(chat_id,request_id,result)
-            if row['mode']=='both' and final_state.get('source_intelligence'):
-                try:
-                    from intelligence_workflow import prepared_highlights
-                    highlights=prepared_highlights(final_state,enriched,video)
-                    with _LOCK, _telegram_db() as db:
-                        current=db.execute('SELECT state_json FROM telegram_requests WHERE request_id=?',(request_id,)).fetchone()
-                        latest=json.loads(current['state_json'])
-                        latest['topic_result']=highlights
-                        latest['topic_stage']='awaiting_review' if highlights.get('segments') else 'not_eligible'
-                        db.execute('UPDATE telegram_requests SET state_json=?,updated_at=? WHERE request_id=?',(json.dumps(latest),now(),request_id))
-                except Exception as exc:
-                    logger.exception('Independent highlight preparation held request_id=%s',request_id)
-                    with _LOCK, _telegram_db() as db:
-                        current=db.execute('SELECT state_json FROM telegram_requests WHERE request_id=?',(request_id,)).fetchone()
-                        latest=json.loads(current['state_json']);latest['topic_stage']='held';latest['topic_error_type']=type(exc).__name__
-                        db.execute('UPDATE telegram_requests SET state_json=?,updated_at=? WHERE request_id=?',(json.dumps(latest),now(),request_id))
-            return
+        if (final_state.get('review_interface')=='website'
+                and str(final_state.get('show_id') or '').upper() in {'TCB','TDOG'}
+                and not approved_clips):
+            __import__('render_recovery').start_preview_pipeline(request_id,video)
+            return  # Existing encoded previews, then website selection; no Telegram votes.
         if (os.getenv('RIPPED_PREVIEW_FIRST_ENABLED','false').lower()=='true'
                 and str(state.get('show_id') or '').upper() in {'TCB','TDOG'} and not approved_clips):
             __import__('render_recovery').start_preview_pipeline(request_id,video)
@@ -6275,6 +6277,29 @@ def _purge_expired_local_artifacts(
     protected_dirs.difference_update(path for path,eligible in source_clocks.items() if eligible is not None)
     protected_dirs.update(path for path,eligible in source_clocks.items() if eligible is None)
     protected_dirs.add((data_dir / "release-backups").resolve())
+    # Drive is durable; these are only local HTTP/FFmpeg preview caches.
+    # Preserve caches still needed by unresolved owner review or delivery.
+    with _telegram_db() as db:
+        requests=db.execute('SELECT request_id,state_json FROM telegram_requests').fetchall()
+        previews=(db.execute("SELECT payload FROM intelligence_records WHERE kind='preview_success'").fetchall()
+                  if db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='intelligence_records'").fetchone() else [])
+    protected_requests=set()
+    def protect_preview_url(url):
+        match=DRIVE_RE.search(str(url or ''))
+        if match:
+            protected_files.add((data_dir/'review-previews'/(match.group(1)+'.mp4')).resolve())
+    for row in requests:
+        state=json.loads(row['state_json'])
+        if source_clocks.get((SOURCE_DIR/f"telegram-{row['request_id']}").resolve()) is None:
+            protected_requests.add(row['request_id'])
+            records=list((state.get('candidate_reviews') or {}).values())+list((state.get('topic_reviews') or {}).values())
+            for record in records:
+                protect_preview_url(record.get('clip_url') or record.get('segment_url'))
+    for row in previews:
+        record=json.loads(row['payload'])
+        if (record.get('ticket') or {}).get('request_id') in protected_requests:
+            protect_preview_url((record.get('clip') or {}).get('clip_url') or (record.get('clip') or {}).get('segment_url'))
+    preview_cutoff=datetime.now(timezone.utc).timestamp()-48*3600
     candidates: list[Path] = []
     for path in data_dir.rglob("*"):
         try:
@@ -6284,15 +6309,17 @@ def _purge_expired_local_artifacts(
                 continue
             if _path_is_under(path, protected_dirs):
                 continue
+            preview_file=(_path_is_under(path,{(data_dir/'review-previews').resolve()})
+                          or (_path_is_under(path,{SOURCE_DIR.resolve()}) and 'previews' in path.relative_to(SOURCE_DIR).parts))
             clocks=[eligible for parent,eligible in source_clocks.items() if _path_is_under(path,{parent})]
             if clocks:
                 # Neither file mtime nor emergency cleanup can shorten the clock.
-                if any(value is None or value >= source_cutoff for value in clocks):
+                if any(value is None or value >= (preview_cutoff if preview_file else source_cutoff) for value in clocks):
                     continue
                 candidates.append(path)
                 continue
-            old_enough = path.stat().st_mtime < cutoff
-            emergency_reclaimable = emergency and not _path_is_under(path, protected_dirs)
+            old_enough = path.stat().st_mtime < (preview_cutoff if preview_file else cutoff)
+            emergency_reclaimable = emergency and not preview_file and not _path_is_under(path, protected_dirs)
             if old_enough or emergency_reclaimable:
                 candidates.append(path)
         except OSError:

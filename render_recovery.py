@@ -286,6 +286,8 @@ def generate_preview(request_id,lane,index,source):
         done=_get(db,prefix+':success','preview_success')
         if done:
             return done['clip']  # no provider, FFmpeg or upload repeated after restart
+        if index>=MAX_PREVIEW_CANDIDATES:
+            raise RenderReviewRequired('Preview candidate limit reached; historical records are preserved')
         held=_get(db,prefix+':hold','preview_hold')
         exported=_get(db,prefix+':export','preview_export')
         if held and not (exported and held['category'] in {'Timeout','ReadTimeout','ConnectTimeout',
@@ -354,6 +356,9 @@ def generate_preview(request_id,lane,index,source):
         raise
 
 
+MAX_PREVIEW_CANDIDATES = 20
+
+
 def preview_lane(request_id,lane,source):
     with evidence.database() as db:
         _,state=_state(db,request_id)
@@ -366,7 +371,7 @@ def preview_lane(request_id,lane,source):
         with evidence.database() as db:
             _,state=_state(db,request_id)
         pool=(state.get(key) or {}).get('segments') or []
-        for index in range(cursor,len(pool)):
+        for index in range(cursor,min(len(pool),MAX_PREVIEW_CANDIDATES)):
             if time.monotonic()>budget_end:
                 break  # persisted pending candidates remain recoverable; no fabricated rejection
             proposal=pool[index]
@@ -382,7 +387,7 @@ def preview_lane(request_id,lane,source):
             seen.append((proposal.get('start'),proposal.get('end')))
         cursor=len(pool)
         if (state.get('sentence_first_version')!=1 or 'held' not in outcomes
-                or discovery_pass==2 or time.monotonic()>budget_end):
+                or len(pool)>=MAX_PREVIEW_CANDIDATES or discovery_pass==2 or time.monotonic()>budget_end):
             break
         from intelligence_workflow import replacement_candidates
         state['discovery_operation_id']=request_id
@@ -396,6 +401,8 @@ def preview_lane(request_id,lane,source):
         additions=[]
         existing_ids={c.get('candidate_id') for c in pool}
         for clip in discovered.get('segments') or []:
+            if len(pool)+len(additions)>=MAX_PREVIEW_CANDIDATES:
+                break
             if clip.get('candidate_id') in existing_ids:
                 continue
             try:
@@ -416,6 +423,8 @@ def preview_lane(request_id,lane,source):
             _,latest=_state(db,request_id)
             if any(latest.get(k) for k in ('website_clip_reviews','schedule_master','schedule_requested_at')):
                 break  # never replace/reorder a pool already under owner review
+            remaining=max(0,MAX_PREVIEW_CANDIDATES-len(latest[key]['segments']))
+            additions=additions[:remaining]
             for clip in additions:
                 clip['candidate_number']=1+max((c.get('candidate_number',i+1) for i,c in enumerate(latest[key]['segments'])),default=0)
                 latest[key]['segments'].append(clip)
@@ -431,13 +440,14 @@ def start_preview_pipeline(request_id,source):
     import telegram_intake as tg
     with evidence.database() as db:
         db.execute('BEGIN IMMEDIATE')
-        _,state=_state(db,request_id)
-        if state.get('show_id') not in {'TCB','TDOG'} or any(state.get(k) for k in
-                ('candidate_reviews','topic_reviews','website_clip_reviews','schedule_master')):
-            raise RenderReviewRequired('Existing owner decisions cannot be migrated to preview-first automatically')
+        row,state=_state(db,request_id)
         key='preview-dispatch:'+request_id
         if _get(db,key,'preview_dispatch'):
-            return {}  # no duplicate workers after a repeated discovery notification
+            return {}  # Owner decisions after dispatch never cause another worker.
+        if state.get('show_id') not in {'TCB','TDOG'} or any(state.get(k) for k in
+                ('candidate_reviews','topic_reviews','website_clip_reviews','schedule_master','schedule_requested_at')):
+            raise RenderReviewRequired('Existing owner decisions cannot be migrated to preview-first automatically')
+        mode=row['mode']
         state['preview_first_version']=1
         state['sentence_first_version']=1
         _put(db,'preview_dispatch',key,dict(request_id=request_id,source_sha256=state.get('source_validation',{}).get('source_sha256')))
@@ -460,8 +470,11 @@ def start_preview_pipeline(request_id,source):
                      dict(category=type(exc).__name__,diagnostics=getattr(exc,'diagnostics',{})))
             __import__('review_navigation').notify_safely(request_id,'final','highlight-preview-held')
             return ['held']
-    results={'9:16':tg.RENDER_EXECUTOR.submit(preview_lane,request_id,'short',source),
-             '16:9':tg.RENDER_EXECUTOR.submit(highlights)}
+    results={}
+    if mode in {'both','shorts'}:
+        results['9:16']=tg.RENDER_EXECUTOR.submit(preview_lane,request_id,'short',source)
+    if mode in {'both','topics'}:
+        results['16:9']=tg.RENDER_EXECUTOR.submit(highlights)
     __import__('review_navigation').notify_safely(request_id,'final','previews-preparing')
     return results
 
