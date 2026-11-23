@@ -67,7 +67,7 @@ jobs:
 
           def indexed_probe(name):
               result = index("symbol", name)
-              return not result["index"]["stale"] and any(
+              return any(
                   item["name"] == name and item["path"] == source.as_posix()
                   for item in result["symbols"]
               )
@@ -76,7 +76,8 @@ jobs:
           watched = "codebase_index_watch_refresh_probe"
           try:
               insert_probe(manual)
-              assert index("symbol", manual)["index"]["stale"], "Source edit must make the index stale"
+              freshness = next(item for item in index("doctor")["findings"] if item["id"] == "index_fresh")
+              assert not freshness["ok"], freshness
               update = index("update")
               assert update["indexed"] >= 1 and indexed_probe(manual), update
               print("Manual update indexed the temporary symbol", flush=True)
@@ -113,5 +114,7 @@ jobs:
 
           assert not index("symbol", manual)["symbols"]
           assert not index("symbol", watched)["symbols"]
+          freshness = next(item for item in index("doctor")["findings"] if item["id"] == "index_fresh")
+          assert freshness["ok"], freshness
           print("Source and index restored", flush=True)
           PY
