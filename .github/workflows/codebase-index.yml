@@ -100,8 +100,14 @@ jobs:
                               raise AssertionError("Index watcher did not start")
                           insert_probe(watched)
                           deadline = time.monotonic() + 20
-                          while time.monotonic() < deadline and not indexed_probe(watched):
+                          # Poll the log outside the checkout so index reads do not reset the debounce.
+                          while time.monotonic() < deadline and watch.poll() is None:
+                              output = Path(log.name).read_text(encoding="utf-8")
+                              if "[watch] updated " in output:
+                                  break
                               time.sleep(0.2)
+                          else:
+                              raise AssertionError(Path(log.name).read_text(encoding="utf-8"))
                           assert indexed_probe(watched), "Watcher did not index the temporary symbol"
                           print("Watcher indexed the temporary symbol", flush=True)
                       finally:
