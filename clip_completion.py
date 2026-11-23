@@ -206,14 +206,20 @@ def review_thought(words, start, end, aspect, *, context=None):
         )
         if context.get('editorial_contract'):
             prompt += (
-                "\nThe constructed passage has different spoken content from the original recommendation. "
+                "\nConstruct the complete passage supporting the original editorial recommendation. "
+                "This is boundary resolution, not selection of a different moment. Do not substitute "
+                "a generic final sentence for the substantive setup, explanation, method or payoff. "
+                "first_word/last_word must contain that complete meaningful passage; trim unrelated "
+                "material only when the original message and value remain. Include cited setup/payoff units. "
                 "Apply the supplied existing editorial playbook to THIS final passage, not the earlier score. "
                 "Check that the original substantive message, truthful hook, necessary context and payoff remain. "
                 "A complete generic sentence is not enough; reject a passage that loses the promised method, "
                 "example, answer or emotional payoff. Do not impose a new minimum duration. "
                 "Also return editorial:{eligible:boolean,original_message_preserved:boolean,hook_fulfilled:boolean,"
                 "payoff_preserved:boolean,score:number,reason:string}. Score 0–100 using the supplied rubric; "
-                "reason must describe the actual final passage. Uncertain editorial evidence must return false."
+                "reason must describe the actual passage in the returned unit range. "
+                "If that range loses the promised recipe or answer, return false even if grammatical. "
+                "Uncertain editorial evidence must return false."
             )
     response = requests.post("https://api.openai.com/v1/chat/completions",
         headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', '')}"},
@@ -225,7 +231,7 @@ def review_thought(words, start, end, aspect, *, context=None):
     result = json.loads(response.json()["choices"][0]["message"]["content"])
     if context is not None and isinstance(result, dict):
         import hashlib
-        result["provenance"] = dict(prompt_version="speech-context-editorial-v3" if context.get('editorial_contract') else "speech-context-v2", prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        result["provenance"] = dict(prompt_version="speech-context-editorial-v4" if context.get('editorial_contract') else "speech-context-v2", prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
                                     provider="openai", model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
     return result
 

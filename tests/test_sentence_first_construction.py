@@ -70,8 +70,12 @@ def test_failed_candidate_gets_distinct_replacement_and_siblings_survive(preview
     import intelligence_workflow as workflow
     def review(units,start,end,aspect,*,context):
         a,b=context['included_unit_indices']
-        return dict(complete_start=start>=20,complete_end=True,complete_thought=start>=20,
+        result= dict(complete_start=start>=20,complete_end=True,complete_thought=start>=20,
             context_sufficient=True,first_word=a,last_word=b,setup_units=[a],payoff_units=[b])
+        if context.get('editorial_contract'):
+            result['editorial']=dict(eligible=True,original_message_preserved=True,hook_fulfilled=True,
+                payoff_preserved=True,score=82,reason='Fixture original worthwhile passage preserved.')
+        return result
     p['reviewer'].side_effect=review
     proposed=dict(candidate_id='independent-replacement',candidate_number=99,start=30,end=45,duration=15,
                   transcript='Here is a complete, substantial seed-storage explanation.',reason='A useful complete explanation.')
@@ -150,4 +154,5 @@ def test_failed_draft_preserves_original_candidate_and_cannot_be_consumed(previe
     assert p['read']()['result']['segments']==before and not p['calls']
     with pytest.raises(boundary.BoundaryReviewRequired,match='VALIDATED_SPECIFICATION_REQUIRED'):
         boundary.consume(p['source'],p['read']()['result']['segments'][0],'9:16')
+
 

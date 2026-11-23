@@ -78,25 +78,28 @@ def construct_preview_candidate(request_id,lane,index,source):
         transcript=' '.join(units[i]['word'] for i in original_units))
     seen=set(); assessment=None
 
-    def resolve(bounds):
+    def resolve(bounds, intended_units=None):
         start,end=map(float,bounds)
         if not math.isfinite(start+end) or not 0<=start<end<=duration:
             raise BoundaryReviewRequired('DRAFT_REFERENCE_INVALID')
-        included=[u for u in units if u['end']>start and u['start']<end]
+        indices=(list(range(intended_units[0],intended_units[1]+1)) if intended_units is not None else
+                 [i for i,u in enumerate(units) if u['end']>start and u['start']<end])
+        included=[units[i] for i in indices]
         if not included:
             raise BoundaryReviewRequired('PASSAGE_EVIDENCE_MISSING')
         # Explicit draft construction from actual units, never invented words or
         # a silent repair of an approved cut. Segment units stay whole segments.
         first,last=min(u['start'] for u in included),max(u['end'] for u in included)
         start,end=min(start,first),max(end,last)
-        previous=max((u['end'] for u in units if u['end']<=first and u not in included),default=0.)
-        following=min((u['start'] for u in units if u['start']>=last and u not in included),default=duration)
         for edge,anchor in [('start',start),('end',end)]:
             measured=acoustic_edge(source,anchor,edge,duration)
             choices=[]
             for left,right in measured['quiet_intervals']:
-                low=max(left+.02,previous if edge=='start' else last)
-                high=min(right-.02,first if edge=='start' else following)
+                # Resolve a measured acoustic margin around the intended speech.
+                # Adjacent ASR segments often share a timestamp; that is not
+                # evidence that the real silence between them has zero length.
+                low=max(left+.02,0. if edge=='start' else last)
+                high=min(right-.02,first if edge=='start' else duration)
                 if low<=high:
                     choices.append(min(max(anchor,low),high))
             if choices:
@@ -108,17 +111,20 @@ def construct_preview_candidate(request_id,lane,index,source):
             raise BoundaryReviewRequired('CONSTRUCTED_FORMAT_INELIGIBLE')
         return {**candidate,'start':start,'end':end,'duration':length,
             'transcript':' '.join(u['word'] for u in included),
-            'construction_provenance':dict(version='sentence-first-v1',
+            'construction_provenance':dict(version='sentence-first-v2',
                 source_segments=sorted({u['segment_index'] for u in included}),
                 timing_precision=sorted({u['timing_basis'] for u in included}),
                 original_proposal=[original_candidate['start'],original_candidate['end']],
                 editorial_origin=original_editorial,
+                editorial_validation_required=True,
+                intended_unit_range=[indices[0],indices[-1]],
+                acoustic_margin_basis='measured_quiet_outside_complete_intended_speech',
                 editorial_content_changed=[i for i,u in enumerate(units) if u in included]!=original_units)}
 
-    bounds=[candidate['start'],candidate['end']]
+    bounds=[candidate['start'],candidate['end']]; intended_units=None
     try:
         for step in range(3):
-            draft=resolve(bounds)
+            draft=resolve(bounds,intended_units)
             signature=digest([draft['start'],draft['end'],draft['transcript']])
             if signature in seen:
                 raise BoundaryReviewRequired('NO_EVIDENCE_SUPPORTED_PROGRESS')
@@ -143,6 +149,7 @@ def construct_preview_candidate(request_id,lane,index,source):
                 if 'EDITORIAL_VALUE_NOT_PRESERVED' in assessment.get('reasons',[]):
                     raise  # A lost recommendation is not another timestamp retry.
                 bounds=assessment['suggested_semantic_bounds']
+                intended_units=assessment.get('suggested_unit_range')
                 continue
             with evidence.database() as db:
                 db.execute('BEGIN IMMEDIATE')
@@ -273,19 +280,36 @@ def prepare_for_render(request_id, identity, candidate, source, state, aspect, a
     transcript = state.get("topic_source_segments") or []
     units = transcript_units(transcript, duration)
     included = [i for i,u in enumerate(units) if u["end"] > start and u["start"] < end]
+    construction=candidate.get('construction_provenance') or {}
+    intended=construction.get('intended_unit_range')
+    if intended is not None:
+        if (construction.get('version')!='sentence-first-v2' or not isinstance(intended,list) or len(intended)!=2
+                or any(type(i) is not int for i in intended) or not 0<=intended[0]<=intended[1]<len(units)):
+            raise BoundaryReviewRequired('INTENDED_SPEECH_REFERENCE_INVALID')
+        included=list(range(intended[0],intended[1]+1))
+        passage=units[included[0]:included[-1]+1]
+        if (candidate.get('transcript')!=' '.join(u['word'] for u in passage)
+                or min(u['start'] for u in passage)<start or max(u['end'] for u in passage)>end):
+            raise BoundaryReviewRequired('INTENDED_SPEECH_NOT_CAPTURED')
     if not included:
         raise BoundaryReviewRequired("PASSAGE_EVIDENCE_MISSING")
     first, last = min(included), max(included)
-    left, right = max(0, first-4), min(len(units), last+5)
+    # Four words are not four transcript segments. With word-timed sources the
+    # old window commonly omitted the question or sentence preceding the cut.
+    first_segment, last_segment = units[first]['segment_index'], units[last]['segment_index']
+    left = next(i for i,u in enumerate(units) if u['segment_index'] >= max(0,first_segment-4))
+    right = next((i for i,u in enumerate(units) if u['segment_index'] > last_segment+4),len(units))
     context_units = units[left:right]
     binding = dict(request_id=request_id, asset_id=identity, candidate_id=selected["candidate_id"],
         approved_input_revision=selected["revision"], approved_revisions=approved_revisions,
         source_video_id=source_id, source_sha256=source_sha, transcript_revision=digest(transcript),
         aspect=aspect, purpose=purpose, start=start, end=end, transcript=candidate.get("transcript"),
-        words_digest=digest(candidate.get("words")), configuration=configuration(candidate, aspect))
-    construction=candidate.get('construction_provenance') or {}
+        words_digest=digest(candidate.get("words")), configuration=configuration(candidate, aspect),
+        semantic_context_revision=digest(context_units))
+    if intended is not None:
+        binding['intended_unit_range']=intended
     editorial_contract=None
-    if purpose=='preview' and construction.get('editorial_content_changed'):
+    if purpose=='preview' and (construction.get('editorial_content_changed') or construction.get('editorial_validation_required')):
         if not isinstance(construction.get('editorial_origin'),dict):
             raise BoundaryReviewRequired('EDITORIAL_ORIGIN_MISSING')
         # Reuse the existing approved playbook and review call. Do not fetch a
@@ -296,7 +320,7 @@ def prepare_for_render(request_id, identity, candidate, source, state, aspect, a
         else:
             import selection_specs
             rubric=selection_specs._cache or (Path(__file__).parent/'ripped_shorts_16x9_framework.txt').read_text(encoding='utf-8')
-        editorial_contract=dict(version='changed-passage-editorial-v1',
+        editorial_contract=dict(version='constructed-passage-editorial-v2',
             original=construction['editorial_origin'],playbook=rubric,
             playbook_sha256=hashlib.sha256(rubric.encode()).hexdigest())
         binding['editorial_revision']=digest(editorial_contract)
@@ -345,11 +369,16 @@ def prepare_for_render(request_id, identity, candidate, source, state, aspect, a
             reasons.append("SEMANTIC_INCOMPLETE")
         if semantic.get("context_sufficient") is not True:
             reasons.append("CONTEXT_NOT_ESTABLISHED")
+        required_units = {a,b}
         for name in ("setup_units", "payoff_units"):
             references = semantic.get(name)
             if (not isinstance(references, list) or not references or
-                    any(type(i) is not int or not a <= i <= b for i in references) or len(set(references)) != len(references)):
+                    any(type(i) is not int or not 0 <= i < len(context_units) for i in references) or len(set(references)) != len(references)):
                 raise BoundaryReviewRequired("SEMANTIC_EVIDENCE_REFERENCE_INVALID", field=name)
+            required_units.update(references)
+        # A cited question/payoff outside the suggested range is a request to
+        # include context, not an invalid reference. Never discard that evidence.
+        a,b = min(required_units),max(required_units)
         if a != first-left or b != last-left:
             reasons.append("CONTEXT_REQUIRES_EXPLICIT_EDIT")
         chosen = context_units[a:b+1]
@@ -363,6 +392,7 @@ def prepare_for_render(request_id, identity, candidate, source, state, aspect, a
         for edge,cut in [('start',start),('end',end)]:
             margin = chosen[0]['start']-cut if edge=='start' else cut-chosen[-1]['end']
             crossing = any(u['start'] < cut < u['end'] for u in units)
+            edges[edge]['neighboring_timing_crosses_cut'] = crossing
             edges[edge]['timed_capture_supported'] = word_timed and margin >= .1 and not crossing
             edges[edge]['timing_allowance_seconds'] = .1 if word_timed else None
             edges[edge]['captured_margin_seconds'] = margin
@@ -375,6 +405,7 @@ def prepare_for_render(request_id, identity, candidate, source, state, aspect, a
             intended_transcript=candidate.get("transcript"), timing_precision=sorted({u["timing_basis"] for u in units[first:last+1]}),
             selection_provenance=deepcopy(candidate.get("selection_provenance") or {}),
             suggested_semantic_bounds=[chosen[0]["start"],chosen[-1]["end"]],
+            suggested_unit_range=[left+a,left+b],
             boundary_changes_applied=False, approval_scope="existing_selected_asset_only")
 
     assessment = evidence.cached_analysis(key, analyze)
@@ -426,6 +457,8 @@ def consume(source, candidate, aspect):
             or candidate.get("transcript") != binding["transcript"] or digest(candidate.get("words")) != binding["words_digest"]
             or configuration(candidate, aspect) != binding["configuration"]):
         raise BoundaryReviewRequired("RENDER_INPUT_DIFFERS_FROM_SPECIFICATION")
+    if binding.get('intended_unit_range') != (candidate.get('construction_provenance') or {}).get('intended_unit_range'):
+        raise BoundaryReviewRequired('INTENDED_SPEECH_REVISION_CHANGED')
     if binding.get('editorial_revision'):
         editorial=spec['semantic']['editorial']
         if (candidate.get('editorial_revision')!=binding['editorial_revision']

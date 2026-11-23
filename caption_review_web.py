@@ -265,6 +265,7 @@ def _payload_for_session(token: str) -> dict[str, Any]:
         "candidate_evidence": candidate_evidence,
         "comparisons": __import__('clip_review_state').reviews(request_id),
         "clips": gallery,
+        "preview_statuses": __import__('clip_review_ui').preview_status_items(verified_clips) if state.get('preview_first_version') == 1 else [],
         "schedule_blockers": schedule_blockers,
         "preview_review_total": len(gallery),
         "preview_review_completed": sum(bool(c['decision'].get('choice')) and (c['decision'].get('choice') != 'approve' or c['approval_current']) for c in gallery),
@@ -439,7 +440,7 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
   <details id="editing-workflow" {'open' if payload.get('stage') in {'editorial','framing'} else ''}><summary>Edit boundaries or framing / compare alternatives</summary>
   {__import__('clip_review_ui').sections(payload.get('comparisons', []), token)}
   </details>
-  {__import__('clip_review_ui').candidate_cards(payload.get('candidates', []),token) if payload.get('website_first') and not payload.get('preview_first') else '<section id="shorts"><h2>9:16 candidate review</h2></section><section id="highlights"><h2>16:9 candidate review</h2></section>'}
+  {__import__('clip_review_ui').candidate_cards(payload.get('candidates', []),token) if payload.get('website_first') and not payload.get('preview_first') else __import__('clip_review_ui').preview_status_sections(payload.get('preview_statuses', []))}
   <section id="final"><h2>Final rendered video and copy approval</h2><section id="assets">{cards}</section></section>
 </main>
 

@@ -94,4 +94,4 @@ def test_changed_passage_editorial_is_part_of_the_existing_semantic_call(monkeyp
     assert len(calls)==1 and calls[0][0]=='https://api.openai.com/v1/chat/completions'
     prompt=calls[0][1]['messages'][1]['content']
     assert json.dumps(context) in prompt and 'Existing quality-first rubric' in prompt and 'Do not impose a new minimum duration' in prompt
-    assert result['provenance']['prompt_version']=='speech-context-editorial-v3'
+    assert result['provenance']['prompt_version']=='speech-context-editorial-v4'
