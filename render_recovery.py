@@ -263,7 +263,8 @@ def preview_items(request_id,state):
                         review={**review,'status':'rendered','clip_url':clip.get('clip_url') or clip.get('segment_url'),
                                 'rendered_review_revisions':clip.get('rendered_review_revisions') or {}}
                 elif held:
-                    review={**review,'status':'preview_held','render_error':held['category']}
+                    review={**review,'status':'preview_held','render_error':held['category'],
+                            'render_diagnostics':held.get('diagnostics') or {}}
                 else:
                     review={**review,'status':'preview_pending'}
                 result.append((identity,lane,review,clip))

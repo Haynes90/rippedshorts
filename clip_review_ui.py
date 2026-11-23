@@ -198,6 +198,47 @@ document.querySelectorAll('[data-confirm-candidates]').forEach(button=>button.on
 </script>'''
 
 
+def preview_status_items(items):
+    """Creator-safe projection; detailed diagnostic records remain unchanged."""
+    statuses=[]
+    for item in items:
+        category=(item.get('diagnostics') or {}).get('category') or ''
+        if item['finished']:
+            label='Ready to watch';reason='The verified rendered preview is available above.'
+        elif item['render_status']=='preview_pending':
+            label='Preview pending';reason='This candidate has not completed preview preparation.'
+        else:
+            label='Preview unavailable — awaiting boundary resolution'
+            reason={
+                'SEMANTIC_EVIDENCE_REFERENCE_INVALID':'The validator could not establish valid setup or payoff references.',
+                'NO_EVIDENCE_SUPPORTED_PROGRESS':'Construction could not resolve a complete passage and supported cut points.',
+                'EDITORIAL_VALUE_NOT_PRESERVED':'The adjusted passage did not retain the recommended explanation or payoff.',
+                'CONSTRUCTION_UNRESOLVED':'The bounded validation attempt could not establish complete speech and safe boundaries.',
+            }.get(category,'This candidate remains held until its speech, boundaries or media can be verified.')
+        statuses.append({**{k:item.get(k) for k in ('asset_id','format','number','title','transcript','bounds','finished')},
+                         'label':label,'explanation':reason})
+    return statuses
+
+
+def preview_status_sections(items):
+    """Account for every discovered candidate; only the existing gallery selects media."""
+    result=[]
+    for aspect,anchor in [('9:16','shorts'),('16:9','highlights')]:
+        lane=[c for c in items if c['format']==aspect]
+        ready=sum(bool(c['finished']) for c in lane)
+        result.append(f'<section id="{anchor}"><h2>{aspect} candidate progress</h2><p>{ready}/{len(lane)} rendered previews available.</p>')
+        for item in lane:
+            asset=item['asset_id']; title=html.escape(str(item['title']))
+            if item['finished']:
+                result.append(f'<p><a href="#clip-{html.escape(asset.replace(":","-"),quote=True)}">Clip {item["number"]}: {title}</a> — Ready to watch above.</p>')
+                continue
+            label=html.escape(item['label']);reason=html.escape(item['explanation'])
+            start,end=item.get('bounds') or [None,None]
+            result.append(f'<article class="preview-status" data-preview-status="{html.escape(asset,quote=True)}"><h3>Clip {item["number"]}: {title}</h3><p role="status">{label}. {reason}</p><p>Proposed source boundaries: {html.escape(str(start))}–{html.escape(str(end))} seconds.</p><details><summary>Intended transcript</summary><p style="white-space:pre-wrap">{html.escape(item.get("transcript") or "Transcript not available.")}</p></details></article>')
+        result.append('</section>')
+    return ''.join(result)
+
+
 def finished_cards(items, token):
     from urllib.parse import quote
     cards = []
