@@ -152,6 +152,15 @@ def _media_for_state(state: dict[str, Any], request_id: str, verified_clips=None
     return media
 
 
+def _scheduling_result(request_id, state):
+    schedule=state.get('schedule_master') or {}
+    receipt=schedule.get('shorts_response') or {}
+    accepted=schedule.get('shorts_status')=='accepted' and bool(receipt.get('asset_group_ids'))
+    return {'status':'scheduler_accepted' if accepted else 'schedule_requested',
+            'request_id':request_id,'receipt':receipt if accepted else {},
+            'error':schedule.get('shorts_error') if not accepted else None}
+
+
 def _drive_preview(url: str) -> str:
     match = _DRIVE_ID_RE.search(url or "")
     if not match:
@@ -232,6 +241,7 @@ def _payload_for_session(token: str) -> dict[str, Any]:
     regenerated = sum(item["regeneration_count"] > 0 for item in items)
     gallery = [c for c in verified_clips if c['finished']] if website or state.get('preview_first_version') == 1 else verified_clips
     schedule_blockers = []
+    schedule_copy_blockers = []
     if website or state.get('preview_first_version') == 1:
         if state.get('acceptance_demo'):
             schedule_blockers.append('This acceptance review is not yet enabled for scheduling.')
@@ -243,7 +253,12 @@ def _payload_for_session(token: str) -> dict[str, Any]:
         for clip in approved:
             draft = next((d for d in drafts if d.get('asset_id') == clip['asset_id']), None)
             if not draft or draft.get('copy_status') not in {'approved', 'edited'} or draft.get('editorial_hold') or not complete_post(draft).strip() or (clip['format']=='16:9' and not str(draft.get('video_title') or '').strip()):
-                schedule_blockers.append('Finalize the caption and metadata for ' + str(clip['title']) + '.')
+                from caption_checkpoints import missing_copy_fields
+                missing = missing_copy_fields(draft) if draft else ['copy draft']
+                requirement = ', '.join(missing) or ('remove the scheduling hold' if draft.get('editorial_hold') else 'save and approve the copy')
+                message = 'Complete ' + requirement + ' for ' + str(clip['title']) + '.'
+                schedule_blockers.append(message)
+                schedule_copy_blockers.append({'asset_id':clip['asset_id'], 'message':message})
         from clip_review_state import delivery_blockers
         approved_ids = {c['asset_id'] for c in approved}
         if any(b.split(': ',1)[0] in approved_ids for b in delivery_blockers(request_id,state)):
@@ -267,6 +282,7 @@ def _payload_for_session(token: str) -> dict[str, Any]:
         "clips": gallery,
         "preview_statuses": __import__('clip_review_ui').preview_status_items(verified_clips) if state.get('preview_first_version') == 1 else [],
         "schedule_blockers": schedule_blockers,
+        "schedule_copy_blockers": schedule_copy_blockers,
         "preview_review_total": len(gallery),
         "preview_review_completed": sum(bool(c['decision'].get('choice')) and (c['decision'].get('choice') != 'approve' or c['approval_current']) for c in gallery),
         "creator_brand": creator_brand,
@@ -286,6 +302,7 @@ def _payload_for_session(token: str) -> dict[str, Any]:
         "expires_at": str(session["expires_at"]),
         "review_complete": bool(state.get("copy_review_completed_at")),
         "schedule_requested": bool(state.get("schedule_requested_at")),
+        "scheduling_result": _scheduling_result(request_id,state) if state.get('schedule_requested_at') else None,
     }
 
 
@@ -312,6 +329,8 @@ def _card_html(item: dict[str, Any], token: str) -> str:
           <textarea id="description-{index}" rows="10">{html.escape(item["complete_post"])}</textarea>
         """
 
+    missing_button = (f'<button class="secondary" onclick="regenAsset({index}, true)">Generate missing copy</button>'
+                      if not item['user_edited'] and not item['complete_post'].strip() else '')
     return f"""
       <article class="asset" id="asset-{index}" data-index="{index}" data-asset="{html.escape(item['asset_id'],quote=True)}" data-type="{html.escape(kind)}" data-copy-revision="{item['copy_revision']}">
         <div class="asset-head">
@@ -329,6 +348,7 @@ def _card_html(item: dict[str, Any], token: str) -> str:
         <label>Selection feedback (optional)</label>
         <textarea id="feedback-{index}" rows="2">{html.escape(item.get('selection_feedback',''))}</textarea>
         <div class="actions">
+          {missing_button}
           <button class="secondary" onclick="keepAsset({index})">Keep</button>
           <button class="secondary" onclick="regenAsset({index})">Regenerate</button>
           <button class="primary" onclick="saveAsset({index})">Save</button>
@@ -457,6 +477,21 @@ const INITIAL = {state_json};
 let state = INITIAL;
 {creator_script}
 
+function pageScheduleBlockers(data) {{
+  const copyBlocks=data.schedule_copy_blockers||[];
+  const blockers=(data.schedule_blockers||[]).filter(b=>!copyBlocks.some(c=>c.message===b&&(data.items||[]).some(i=>i.asset_id===c.asset_id)));
+  for(const item of data.items||[]){{
+    if(!(data.clips||[]).some(c=>c.asset_id===item.asset_id&&c.approval_current))continue;
+    const index=item.index,card=document.getElementById('asset-'+index);
+    const text=card?document.getElementById((item.asset_type==='9:16_SHORT'?'caption-':'description-')+index)?.value:item.complete_post;
+    const title=card?document.getElementById('title-'+index)?.value:item.video_title;
+    const label=item.asset_type==='9:16_SHORT'?'Short '+item.candidate_number:'Highlight '+item.candidate_number;
+    if(!text?.trim())blockers.push('Enter the '+(item.asset_type==='9:16_SHORT'?'caption':'description')+' for '+label+'.');
+    if(item.asset_type==='16:9_HIGHLIGHT'&&!title?.trim())blockers.push('Enter the video title for '+label+'.');
+    if(card?document.getElementById('hold-'+index)?.checked:item.editorial_hold)blockers.push('Resolve the scheduling hold for '+label+'.');
+  }}
+  return blockers;
+}}
 function updateProgress(data=state) {{
   if(data.website_first&&!data.preview_first){{
     const total=data.candidate_total||0,done=data.candidate_reviewed||0;
@@ -470,7 +505,7 @@ function updateProgress(data=state) {{
     const total=data.preview_review_total||0,completed=data.preview_review_completed||0;
     document.getElementById('progressText').textContent=total?`${{completed}}/${{total}} playable previews reviewed`:data.processing_status;
     document.getElementById('bar').style.width=total?`${{Math.round(completed/total*100)}}%`:'0%';
-    const blockers=data.schedule_blockers||[];
+    const blockers=pageScheduleBlockers(data);
     document.getElementById('finishButton').disabled=blockers.length>0;
     document.getElementById('globalStatus').textContent=blockers.join(' ')||'Selected finished videos are ready for your final scheduling approval.';
     return;
@@ -535,8 +570,8 @@ async function performCopySave(index, action) {{
     if(sameCopy(bodyFor(index),submitted))clearDraft(index);else rememberDraft(index);
     saved.textContent = `Saved ✓ ${{new Date().toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}})}}`;
     if(data.checkpoint_pending)saved.textContent+=' — learning sync pending; your edit is saved.';
-    document.getElementById(`status-${{index}}`).textContent =
-      action === 'keep' ? 'Kept' : 'Edited';
+    const item=(data.review?.items||[]).find(i=>i.index===index);
+    document.getElementById(`status-${{index}}`).textContent = item?.copy_status==='pending'?'Saved draft — incomplete':action === 'keep' ? 'Kept' : 'Edited';
     return data;
   }} catch (error) {{
     // A failed response can follow a committed save. Read back once, never POST twice.
@@ -560,7 +595,7 @@ function saveAsset(index, action='save') {{
 }}
 document.querySelectorAll('.asset[data-index]').forEach(card=>{{
   const index=Number(card.dataset.index);
-  card.addEventListener('input',()=>rememberDraft(index));
+  card.addEventListener('input',()=>{{rememberDraft(index);updateProgress();}});
   let cached;try{{cached=JSON.parse(localStorage.getItem(draftKey(index))||'null');}}catch(_){{}}
   if(!cached)return;
   const restore=()=>{{
@@ -581,13 +616,21 @@ async function keepAsset(index) {{
   await saveAsset(index, 'keep');
 }}
 
-async function regenAsset(index) {{
+async function regenAsset(index, missingOnly=false) {{
   const saved = document.getElementById(`saved-${{index}}`);
+  const original=bodyFor(index),stored=(state.items||[]).find(i=>i.index===index);
+  if(stored&&!sameCopy(original,stored)){{
+    rememberDraft(index);saved.textContent='Your unsaved edits are retained. Save or reconcile them before generating copy.';return;
+  }}
   saved.textContent = 'Regenerating…';
   try {{
-    const response = await fetch(`/api/ripped-shorts/review/${{TOKEN}}/asset/${{index}}/regenerate`, {{method:'POST'}});
+    const response = await fetch(`/api/ripped-shorts/review/${{TOKEN}}/asset/${{index}}/regenerate?missing_only=${{missingOnly}}`, {{method:'POST'}});
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Regeneration failed');
+    if(!sameCopy(bodyFor(index),original)){{
+      rememberDraft(index);if(data.review)applyReviewState(data.review);
+      saved.textContent='Generated copy is saved, but your newer unsaved text is retained in this editor. Review before saving.';return;
+    }}
     if (data.asset_type === '9:16_SHORT') {{
       document.getElementById(`caption-${{index}}`).value = data.complete_post || '';
     }} else {{
@@ -603,7 +646,10 @@ async function regenAsset(index) {{
   }}
 }}
 
+let finishing=false;
 async function finishReview() {{
+  if(finishing)return;
+  finishing=true;
   const button = document.getElementById('finishButton');
   const globalStatus = document.getElementById('globalStatus');
   button.disabled = true;
@@ -611,22 +657,27 @@ async function finishReview() {{
   try {{
     // Finish must use exactly what is currently written in the review fields,
     // even if the user did not tap Save on each individual card first.
-    const cards = Array.from(document.querySelectorAll('.asset')).filter(card => card.hasAttribute('data-index'));
+    const cards = Array.from(document.querySelectorAll('.asset')).filter(card => card.hasAttribute('data-index')&&
+      (!state.preview_first&&!state.website_first||(state.clips||[]).some(c=>c.asset_id===card.dataset.asset&&c.approval_current)));
     for (const card of cards) {{
       const index = Number(card.dataset.index);
       await saveAsset(index, 'save');
     }}
     button.textContent = 'Finishing…';
-    const response = await fetch(`/api/ripped-shorts/review/${{TOKEN}}/finish`, {{method:'POST'}});
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || 'Finish failed');
+    let data;
+    try{{data=await reviewJson(await fetch(`/api/ripped-shorts/review/${{TOKEN}}/finish`, {{method:'POST'}}));}}
+    catch(error){{
+      const current=await refreshReviewState();
+      if(!current.schedule_requested)throw error;
+      data=current.scheduling_result||{{status:'schedule_requested'}};
+    }}
     button.textContent = data.status === 'scheduler_accepted' ? 'Schedule Master acknowledged ✓' : 'Scheduling requested';
     globalStatus.textContent = data.status === 'scheduler_accepted' ? 'Receipt confirmed. Check the actual delivery dates below.' : 'Your copy and scheduling request were saved. Scheduling is pending; no successful handoff is claimed.';
   }} catch(error) {{
     button.disabled = false;
     button.textContent = 'Finish & Schedule';
     globalStatus.textContent = `Could not finish: ${{error.message}}`;
-  }}
+  }} finally{{finishing=false;}}
 }}
 </script>
 </body>
@@ -797,9 +848,21 @@ def _preview_response(artifact):
 async def save_clip_decision(token: str, asset_id: str, request: Request):
     session = _session(token)
     try:
-        return __import__('finished_clip_review').save(str(session['request_id']), asset_id, await request.json())
+        result = __import__('finished_clip_review').save(str(session['request_id']), asset_id, await request.json())
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    if result.get('copy_review_ready') and result['decision']['choice']=='approve':
+        state=json.loads(_request_row(str(session['request_id']))['state_json'])
+        for index,draft in enumerate(state.get('copy_drafts') or []):
+            if draft.get('asset_id')==asset_id and draft.get('asset_type')=='16:9_HIGHLIGHT':
+                try:
+                    regenerate_review_asset(token,index,missing_only=True)
+                except Exception:
+                    # The editorial decision is already durable. Copy failure must
+                    # never disguise it as a failed Approve or cause a repeated vote.
+                    result['copy_generation_pending']=True
+                    __import__('logging').getLogger(__name__).exception('Highlight copy preparation pending request=%s',session['request_id'])
+    return result
 
 
 @router.get('/api/ripped-shorts/review/{token}/clip/{asset_id}/media')
@@ -889,7 +952,12 @@ async def save_review_asset(token: str, index: int, request: Request):
                     changed = True
                 draft[key] = value
 
-    if action == "keep":
+    from caption_checkpoints import missing_copy_fields
+    if missing_copy_fields(draft):
+        draft['copy_status']='pending'  # Save incomplete text, never approve it.
+        if changed:
+            draft['user_edited']=True
+    elif action == "keep":
         draft["copy_status"] = "approved"
     else:
         draft["copy_status"] = "edited" if changed or draft.get("user_edited") else "approved"
@@ -968,7 +1036,7 @@ async def save_review_asset(token: str, index: int, request: Request):
 
 
 @router.post("/api/ripped-shorts/review/{token}/asset/{index}/regenerate")
-def regenerate_review_asset(token: str, index: int):
+def regenerate_review_asset(token: str, index: int, missing_only: bool = False):
     session = _session(token)
     request_id = str(session["request_id"])
     row = _request_row(request_id)
@@ -983,12 +1051,27 @@ def regenerate_review_asset(token: str, index: int):
     import telegram_intake as tg
 
     old = drafts[index]
-    fresh = tg._generate_schedule_copy(
-        [old],
-        str(state.get("show_id") or ""),
-        tg._state_vid_title(state),
-        str((state.get("parsed") or {}).get("source_value") or ""),
-    )[0]
+    from caption_checkpoints import editor_revision, missing_copy_fields
+    if missing_only and (old.get('user_edited') or not missing_copy_fields(old)):
+        payload=_payload_for_session(token)
+        return {**next(item for item in payload['items'] if item['index']==index), 'status':'preserved','review':payload}
+    if old.get('user_edited'):
+        raise HTTPException(status_code=409,detail='Owner-edited copy is preserved. Edit it directly; automatic regeneration cannot replace it.')
+    if not str(old.get('transcript') or '').strip():
+        raise HTTPException(status_code=409,detail='Clip transcript is missing; copy generation is held. Your saved text is preserved.')
+    def generate():
+        return tg._generate_schedule_copy([old],str(state.get('show_id') or ''),tg._state_vid_title(state),
+            str((state.get('parsed') or {}).get('source_value') or ''))[0]
+    if missing_only:
+        import production_intelligence as evidence
+        # Existing immutable cache/lease, bound to this clip, transcript, brand,
+        # media and prompt version. No full-episode analysis or new cache system.
+        clip=next(c for c in __import__('finished_clip_review').clips(request_id,state) if c['asset_id']==old['asset_id'])
+        key='review-copy:v1:'+evidence.identity(request_id,old['asset_id'],clip['media_revision'],
+            old['transcript'],state.get('show_id'),__import__('os').getenv('OPENAI_METADATA_MODEL','gpt-5-mini'))
+        fresh=evidence.cached_analysis(key,generate)
+    else:
+        fresh=generate()
     fresh["ai_social_caption"] = fresh.get("social_caption", "")
     fresh.pop('post_editor_version',None)
     fresh.pop('post_text',None)
@@ -1003,6 +1086,14 @@ def regenerate_review_asset(token: str, index: int):
     state["copy_review_index"] = index
 
     with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        latest=json.loads(db.execute('SELECT state_json FROM telegram_requests WHERE request_id=?',(request_id,)).fetchone()['state_json'])
+        current=list(latest.get('copy_drafts') or [])
+        if index>=len(current) or editor_revision(current[index])!=editor_revision(old) or copy_frozen(latest,str(old.get('asset_id') or '')):
+            raise HTTPException(status_code=409,detail='Saved copy changed during generation. Your edits are preserved; refresh before using generated copy.')
+        current[index]=fresh
+        latest['copy_drafts']=current
+        state=latest
         db.execute(
             "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
             (json.dumps(state), _iso(_now()), request_id),
@@ -1060,8 +1151,8 @@ def finish_review(token: str):
     finished = [c for c in clips(request_id,state) if c['finished'] and c['approval_current'] and c['asset_id'] not in blocked_assets(request_id,state)]
     if not finished:
         raise HTTPException(status_code=409, detail='No approved verified final renders are available. Your saved review choices are preserved; nothing was sent to Schedule Master.')
-    playable = set(_media_for_state(state, request_id))
-    blockers = [b for b in __import__('clip_review_state').delivery_blockers(request_id, state) if b.split(': ', 1)[0] in playable]
+    eligible_ids = {c['asset_id'] for c in finished}
+    blockers = [b for b in __import__('clip_review_state').delivery_blockers(request_id, state) if b.split(': ', 1)[0] in eligible_ids]
     if blockers:
         raise HTTPException(status_code=409, detail='Editorial/framing review or verified rendering required: ' + '; '.join(blockers))
     drafts = list(state.get("copy_drafts") or [])
@@ -1070,18 +1161,19 @@ def finish_review(token: str):
     if state.get("schedule_requested_at"):
         import telegram_intake as tg
         tg._notify_render_queue_complete(request_id,str(row['chat_id']))
-        accepted = (state.get('schedule_master') or {}).get('shorts_response') or {}
-        return {"status": "scheduler_accepted" if accepted.get('asset_group_ids') else "schedule_requested", "request_id": request_id, 'receipt': accepted}
+        return _scheduling_result(request_id,json.loads(_request_row(request_id)['state_json']))
     from creator_approval import approved_batch
     if str(state.get("show_id") or "").upper() in {"TCB", "TDOG"} and not approved_batch(request_id):
         raise HTTPException(status_code=409, detail="Confirm the featured creators once at the top of this page")
 
-    eligible_ids = {c['asset_id'] for c in finished}
-    if any(d.get('copy_status') not in {'approved','edited'} for d in drafts if str(d.get('asset_id') or '') in eligible_ids):
-        raise HTTPException(status_code=409, detail='Approve every selected clip caption before finishing')
-    from caption_checkpoints import complete_post
-    if any(not complete_post(d).strip() or (d.get('asset_type')=='16:9_HIGHLIGHT' and not str(d.get('video_title') or '').strip()) for d in drafts if d.get('asset_id') in eligible_ids):
-        raise HTTPException(status_code=409,detail='Enter the complete caption or description and required video title before scheduling')
+    from caption_checkpoints import missing_copy_fields
+    for draft in drafts:
+        if draft.get('asset_id') in eligible_ids and missing_copy_fields(draft):
+            raise HTTPException(status_code=409,detail='Enter the complete caption or description and required video title before scheduling: '+str(draft['asset_id'])+' — '+', '.join(missing_copy_fields(draft)))
+        if draft.get('asset_id') in eligible_ids and (draft.get('copy_status') not in {'approved','edited'} or draft.get('editorial_hold')):
+            raise HTTPException(status_code=409,detail='Finalize selected copy and resolve any scheduling hold for '+str(draft['asset_id']))
+    if eligible_ids - {d.get('asset_id') for d in drafts}:
+        raise HTTPException(status_code=409,detail='Missing copy drafts for selected videos: '+', '.join(sorted(eligible_ids-{d.get('asset_id') for d in drafts})))
     state.pop("awaiting_copy_input", None)
     state["copy_review_completed_at"] = _iso(_now())
     state["schedule_requested_at"] = _iso(_now())
@@ -1089,6 +1181,17 @@ def finish_review(token: str):
     __import__('workflow_test_status').journal(request_id,state,approved_batch(request_id))
 
     with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        current=json.loads(db.execute('SELECT state_json FROM telegram_requests WHERE request_id=?',(request_id,)).fetchone()['state_json'])
+        # Freeze the exact reviewed snapshot, never overwrite a concurrent edit.
+        for field in ('copy_drafts','website_clip_reviews','candidate_reviews','topic_reviews','creator_approval','result','topic_result'):
+            if current.get(field)!=state.get(field):
+                raise HTTPException(status_code=409,detail='Review changed while finishing. Your saved work is preserved; reload and review the latest copy before scheduling.')
+        if current.get('schedule_requested_at'):
+            return _scheduling_result(request_id,current)
+        current.update({k:state[k] for k in ('copy_review_completed_at','schedule_requested_at','copy_review_source','workflow_test') if k in state})
+        current.pop('awaiting_copy_input',None)
+        state=current
         db.execute(
             "UPDATE telegram_requests SET status=?, state_json=?, updated_at=? WHERE request_id=?",
             ("awaiting_render_completion", json.dumps(state), _iso(_now()), request_id),
@@ -1101,14 +1204,16 @@ def finish_review(token: str):
 
     import telegram_intake as tg
 
-    tg._log_copy_learning(request_id, state, drafts, str(row["user_id"] or "web_review"))
-    tg.send(
-        str(row["chat_id"]),
-        "✅ Copy review finished from the mobile review page. "
-        "Schedule Master will receive the batch as soon as every approved render finishes.",
-    )
-    tg._notify_render_queue_complete(request_id, str(row["chat_id"]))
-    return {"status": "schedule_requested", "request_id": request_id}
+    try:
+        tg._log_copy_learning(request_id, state, drafts, str(row['user_id'] or 'web_review'))
+        tg.send(str(row['chat_id']),'Copy approval saved. Schedule Master handoff is pending its durable receipt.')
+    except Exception:
+        __import__('logging').getLogger(__name__).exception('Final approval saved; notification/learning sync pending request=%s',request_id)
+    try:
+        tg._notify_render_queue_complete(request_id, str(row['chat_id']))
+    except Exception:
+        __import__('logging').getLogger(__name__).exception('Final approval saved; existing handoff reconciliation pending request=%s',request_id)
+    return _scheduling_result(request_id,json.loads(_request_row(request_id)['state_json']))
 
 
 @router.get('/api/ripped-shorts/review/{token}/test-status')

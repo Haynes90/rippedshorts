@@ -23,6 +23,16 @@ def editor_revision(draft):
     return hashlib.sha256(json.dumps(values,ensure_ascii=False).encode()).hexdigest()
 
 
+def missing_copy_fields(draft):
+    """Technical completeness only; never infer editorial approval from text."""
+    missing = []
+    if not complete_post(draft).strip():
+        missing.append('caption' if draft.get('asset_type') == '9:16_SHORT' else 'description')
+    if draft.get('asset_type') == '16:9_HIGHLIGHT' and not str(draft.get('video_title') or '').strip():
+        missing.append('video title')
+    return missing
+
+
 def transport_copy(asset, draft=None):
     """The single editor already includes its hashtags; never append them twice."""
     draft = draft or asset
