@@ -1657,10 +1657,15 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
             len(assets),
             result.get("track_id", ""),
         )
-        send(
-            chat_id,
-            f"✅ Schedule Master received {len(assets)} newly approved clip(s). Failed or pending selections remain in the batch.",
-        )
+        try:
+            send(
+                chat_id,
+                f"✅ Schedule Master received {len(assets)} newly approved clip(s). Failed or pending selections remain in the batch.",
+            )
+        except Exception:
+            # The downstream receipt and accepted outbox are already durable.
+            # A notification failure must not demote them or request a retry.
+            logger.exception('Schedule Master acceptance preserved; notification pending request_id=%s',request_id)
         return True
     except Exception as exc:
         logger.exception("Schedule Master Shorts handoff failed request_id=%s", request_id)
@@ -1687,7 +1692,10 @@ def _handoff_shorts_to_schedule_master(request_id: str, chat_id: str) -> bool:
                     "UPDATE telegram_requests SET state_json=?, updated_at=? WHERE request_id=?",
                     (json.dumps(latest_state), now(), request_id),
                 )
-        send(chat_id, f"❌ Schedule Master handoff failed: {str(exc)[:1200]}")
+        try:
+            send(chat_id, f"❌ Schedule Master handoff failed: {str(exc)[:1200]}")
+        except Exception:
+            logger.exception('Handoff failure preserved; notification pending request_id=%s',request_id)
 
 
 def _csv_env(name: str) -> set[str]:
