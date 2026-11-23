@@ -15,6 +15,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -22,6 +25,7 @@ jobs:
         run: python -m pip install "codebase-index[watch]==2.1.3"
       - name: Preflight parser and exercise indexing
         run: |
+          git rev-parse HEAD
           export XDG_CACHE_HOME="$(mktemp -d "$RUNNER_TEMP/codebase-index-cache.XXXXXX")"
           python -c "from tree_sitter_language_pack import cache_dir, get_parser; get_parser('python'); print('Python parser ready:', cache_dir())"
           python - <<'PY'
@@ -79,7 +83,7 @@ jobs:
               source.write_bytes(original)
               index("update")
 
-              with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as log:
+              with tempfile.NamedTemporaryFile() as log:
                   with subprocess.Popen(
                       ["codebase-index", "watch", "--debounce", "500"],
                       stdout=log, stderr=subprocess.STDOUT,
@@ -88,8 +92,7 @@ jobs:
                       try:
                           deadline = time.monotonic() + 20
                           while time.monotonic() < deadline and watch.poll() is None:
-                              log.seek(0)
-                              if "[watch] watching" in log.read():
+                              if "[watch] watching" in Path(log.name).read_text(encoding="utf-8"):
                                   break
                               time.sleep(0.2)
                           else:
