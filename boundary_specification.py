@@ -52,7 +52,7 @@ def construct_preview_candidate(request_id,lane,index,source):
         candidate=deepcopy(state[key]['segments'][index])
         identity=asset_id(request_id,lane,candidate,index)
         if (state.get('sentence_first_version')!=1 or state.get('preview_first_version')!=1
-                or state.get('show_id') not in {'TCB','TDOG'}
+                or str(state.get('show_id') or '').upper() not in {'TCB','TDOG'}
                 or (state.get(review_key) or {}).get(str(index))
                 or (state.get('website_clip_reviews') or {}).get(identity)
                 or state.get('schedule_master') or state.get('schedule_requested_at')
