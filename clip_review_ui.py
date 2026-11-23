@@ -22,7 +22,8 @@ function clipStored(card){
 function rememberClip(p,pending=clipStored(p.card).pending){
  p.card.clipPending=pending; // Reconciliation still works when browser storage is unavailable.
  try{localStorage.setItem(clipDraftKey(p.card),JSON.stringify({reason:p.reason.value,feedback:p.feedback.value,
-  edit:p.edit.value,playback:p.playback.checked,framing:p.framing?.checked===true,pending}));}catch(_){}
+  edit:p.edit.value,playback:p.playback.checked,framing:p.framing?.checked===true,pending,
+  attempt:p.card.clipAttempt||null,error:p.card.clipSaveError||''}));}catch(_){}
 }
 function clipRequirements(p,choice){
  if(p.card.dataset.mediaChanged==='1')return 'This preview changed. Refresh and review its current media before saving.';
@@ -66,7 +67,7 @@ function refreshClipReview(d){
  }
 }
 function confirmClipSave(p,decision,message){
- p.card.dataset.version=decision.version;p.card.dataset.saveError='';rememberClip(p,null);
+ p.card.dataset.version=decision.version;p.card.dataset.saveError='';p.card.clipSaveError='';p.card.clipAttempt=null;rememberClip(p,null);
  p.status.setAttribute('role','status');p.status.textContent=message+' '+decision.choice+'. No rendering, scheduling or invitations started.';
 }
 async function reconcileClip(p,intent){
@@ -80,10 +81,11 @@ async function reconcileClip(p,intent){
 }
 async function performClipDecision(asset,choice){
  const p=clipParts(asset);let intent,knownRejection=false;
- p.card.dataset.saveError='';rememberClip(p);
+ p.card.dataset.saveError='';p.card.clipSaveError='';rememberClip(p);
  try{
   const previous=clipStored(p.card).pending;
   if(previous){await reconcileClip(p,previous);return;}
+  p.card.clipAttempt=choice;
   const missing=clipRequirements(p,choice);if(missing){knownRejection=true;throw new Error(missing);}
   intent={choice,version:Number(p.card.dataset.version),media_revision:p.card.dataset.mediaRevision,
    reason:choice==='reject'?p.reason.value:'',feedback:Array.from(p.feedback.value).slice(0,2000).join(''),
@@ -104,7 +106,8 @@ async function performClipDecision(asset,choice){
   if(intent&&!knownRejection&&clipStored(p.card).pending){
    try{await reconcileClip(p,intent);return;}catch(check){error=check;}
   }
-  p.card.dataset.saveError='1';p.status.setAttribute('role','alert');p.status.textContent=(knownRejection?'Not saved: ':'Save not confirmed: ')+error.message;
+  p.card.dataset.saveError='1';p.card.clipSaveError=(knownRejection?'Not saved: ':'Save not confirmed: ')+error.message;
+  rememberClip(p);p.status.setAttribute('role','alert');p.status.textContent=p.card.clipSaveError;
  }finally{updateClipControls(p);}
 }
 function clipDecision(asset,choice){
@@ -117,6 +120,8 @@ function initializeClipReviews(){
  document.querySelectorAll('.clip-card').forEach(card=>{
   const p=clipParts(card.dataset.asset),draft=clipStored(card);
   if('feedback' in draft){p.feedback.value=draft.feedback;p.reason.value=draft.reason;p.edit.value=draft.edit;p.playback.checked=draft.playback;if(p.framing)p.framing.checked=draft.framing;}
+  p.card.clipAttempt=draft.attempt;p.card.clipSaveError=draft.error||'';
+  if(draft.error){p.card.dataset.saveError='1';p.status.setAttribute('role','alert');p.status.textContent=draft.error+' Your inputs are retained; no review action will be resubmitted automatically.';}
   card.addEventListener('input',()=>{rememberClip(p);updateClipControls(p);});
   card.addEventListener('change',()=>{rememberClip(p);updateClipControls(p);});
   if(p.video)['loadeddata','error','emptied'].forEach(event=>p.video.addEventListener(event,()=>updateClipControls(p)));

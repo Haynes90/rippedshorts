@@ -97,6 +97,8 @@ async function fetch(url,options){
  mode='reject';await clipDecision(b.card.dataset.asset,'reject');assert(b.status.textContent.startsWith('Not saved:'));assert(b.status.textContent.includes('Stale'));
  assert.equal(b.feedback.value,'Specific owner fixture reason');assert.deepEqual(counter,[1,2]);assert.equal(saved[b.card.dataset.asset].choice,undefined);
  refreshClipReview(payload());assert(b.status.textContent.startsWith('Not saved:')); // polling cannot hide the failure
+ assert.equal(clipStored(b.card).attempt,'reject');initializeClipReviews();
+ assert(b.status.textContent.startsWith('Not saved:'));assert.equal(b.feedback.value,'Specific owner fixture reason');
  mode='lost-response';await clipDecision(b.card.dataset.asset,'reject');assert(b.status.textContent.includes('Saved and verified'));
  assert.deepEqual(counter,[2,2]);assert.equal(posts,3);assert.equal(saved[b.card.dataset.asset].version,1);
  initializeClipReviews();assert.equal(b.feedback.value,'Specific owner fixture reason');
