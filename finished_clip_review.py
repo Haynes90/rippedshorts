@@ -15,6 +15,7 @@ PROOF = ('media_duration', 'video_stream', 'audio_stream', 'format_valid', 'expo
 
 def clips(request_id, state, comparisons=()):
     result = []
+    legacy_units = None
     entries = (__import__('render_recovery').preview_items(request_id,state)
                if state.get('preview_first_version')==1 else selected_assets(request_id,state))
     for asset, lane, review, candidate in entries:
@@ -30,9 +31,25 @@ def clips(request_id, state, comparisons=()):
             transcript = str(editorial['provenance'].get('proposed_transcript') or transcript)
             bounds = editorial['proposed']
         provenance = candidate.get('selection_provenance') or {}
+        reason = candidate.get('reason') or candidate.get('why_it_will_work')
+        construction = candidate.get('construction_provenance') or {}
+        original = construction.get('original_proposal')
+        if original and not candidate.get('editorial_revision') and original != bounds:
+            # Old verified files remain intact and playable. Never present their
+            # earlier ranking as an assessment of materially different speech.
+            try:
+                if legacy_units is None:
+                    from boundary_specification import transcript_units
+                    source_transcript = state.get('topic_source_segments') or []
+                    legacy_units = transcript_units(source_transcript, max(s['end'] for s in source_transcript))
+                included = lambda span: [i for i,u in enumerate(legacy_units) if u['end']>span[0] and u['start']<span[1]]
+                if included(original) != included(bounds):
+                    reason = 'This excerpt changed after discovery. The original recommendation and score are not verified for this passage.'
+            except (ValueError, TypeError, KeyError, RuntimeError):
+                reason = 'Editorial evidence for the changed excerpt needs review; the retained video is unchanged.'
         result.append(dict(asset_id=asset, format='9:16' if lane == 'short' else '16:9',
             number=asset.rsplit(':', 1)[-1], title=candidate.get('title') or candidate.get('topic') or next(iter(candidate.get('topic_titles') or []),None) or candidate.get('main_theme') or ((state.get('result') or {}).get('analysis') or {}).get('main_theme') or 'Clip '+asset.rsplit(':',1)[-1],
-            transcript=transcript, reason=candidate.get('reason') or candidate.get('why_it_will_work'),
+            transcript=transcript, reason=reason,
             category=candidate.get('category') or candidate.get('highlight_type') or 'Not recorded',
             topic_ids=candidate.get('topic_ids') or [], provenance=provenance,
             learning_influence=candidate.get('learning_influence'), framing=candidate.get('framing_plan'),
@@ -67,6 +84,8 @@ def save(request_id, asset_id, body):
         item = next((c for c in clips(request_id, state) if c['asset_id'] == asset_id), None)
         if not item or item['frozen']:
             raise ValueError('Asset is missing or already submitted; existing approvals are frozen')
+        if body.get('media_revision') is not None and body['media_revision'] != item['media_revision']:
+            raise ValueError('This preview changed. Refresh and review its current media before saving')
         current = (state.get('website_clip_reviews') or {}).get(asset_id) or {}
         if type(body.get('version', 0)) is not int or body.get('version', 0) != current.get('version', 0):
             raise ValueError('Stale review version; refresh before saving')
@@ -77,6 +96,12 @@ def save(request_id, asset_id, body):
                 raise ValueError('Explicitly confirm the framing of this exact preview')
             if any(b.startswith(asset_id+': ') for b in delivery_blockers(request_id, state) if 'clip approval' not in b):
                 raise ValueError('The finished render does not match the editorial/framing approval')
+        if (current and current.get('choice')==choice and current.get('media_revision')==item['media_revision']
+                and current.get('reason','')==(reason if choice=='reject' else '')
+                and current.get('feedback','')==feedback and current.get('changed_fields',[])==fields
+                and (state.get('preview_first_version')!=1 or current.get('framing_reviewed')==(body.get('framing_verified') is True and choice=='approve'))):
+            return dict(status='saved',decision=current,unchanged=True,scheduling_started=False,
+                rendering_started=False,copy_review_ready=False,collaborator_invitation_authorized=False)
         decision = dict(choice=choice, reason=reason, feedback=feedback, changed_fields=fields,
             media_revision=item['media_revision'], version=current.get('version', 0)+1,
             actor=str(row['user_id']), decided_at=datetime.now(timezone.utc).isoformat(),

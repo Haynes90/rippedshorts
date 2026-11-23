@@ -71,6 +71,11 @@ def construct_preview_candidate(request_id,lane,index,source):
     aspect='9:16' if lane=='short' else '16:9'
     duration=speech.media_duration(source)
     units=transcript_units(state.get('topic_source_segments'),duration)
+    original_units=[i for i,u in enumerate(units) if u['end']>candidate['start'] and u['start']<candidate['end']]
+    original_editorial={k:deepcopy(candidate.get(k)) for k in
+        ('title','subject_description','reason','why_it_will_work','hook','summary','payoff','score','score_total')}
+    original_editorial.update(bounds=[candidate['start'],candidate['end']],
+        transcript=' '.join(units[i]['word'] for i in original_units))
     seen=set(); assessment=None
 
     def resolve(bounds):
@@ -106,7 +111,9 @@ def construct_preview_candidate(request_id,lane,index,source):
             'construction_provenance':dict(version='sentence-first-v1',
                 source_segments=sorted({u['segment_index'] for u in included}),
                 timing_precision=sorted({u['timing_basis'] for u in included}),
-                original_proposal=[original_candidate['start'],original_candidate['end']])}
+                original_proposal=[original_candidate['start'],original_candidate['end']],
+                editorial_origin=original_editorial,
+                editorial_content_changed=[i for i,u in enumerate(units) if u in included]!=original_units)}
 
     bounds=[candidate['start'],candidate['end']]
     try:
@@ -133,6 +140,8 @@ def construct_preview_candidate(request_id,lane,index,source):
                     assessment=_get(db,assessment_id,'boundary_assessment') if assessment_id else None
                 if not assessment:
                     raise
+                if 'EDITORIAL_VALUE_NOT_PRESERVED' in assessment.get('reasons',[]):
+                    raise  # A lost recommendation is not another timestamp retry.
                 bounds=assessment['suggested_semantic_bounds']
                 continue
             with evidence.database() as db:
@@ -274,6 +283,23 @@ def prepare_for_render(request_id, identity, candidate, source, state, aspect, a
         source_video_id=source_id, source_sha256=source_sha, transcript_revision=digest(transcript),
         aspect=aspect, purpose=purpose, start=start, end=end, transcript=candidate.get("transcript"),
         words_digest=digest(candidate.get("words")), configuration=configuration(candidate, aspect))
+    construction=candidate.get('construction_provenance') or {}
+    editorial_contract=None
+    if purpose=='preview' and construction.get('editorial_content_changed'):
+        if not isinstance(construction.get('editorial_origin'),dict):
+            raise BoundaryReviewRequired('EDITORIAL_ORIGIN_MISSING')
+        # Reuse the existing approved playbook and review call. Do not fetch a
+        # fresh remote prompt, rescan the episode, or score by duration alone.
+        import telegram_intake as tg
+        if aspect=='9:16':
+            rubric=getattr(tg,'_SHORT_FRAMEWORK_LIVE_CACHE','') or tg._packaged_short_framework_prompt()
+        else:
+            import selection_specs
+            rubric=selection_specs._cache or (Path(__file__).parent/'ripped_shorts_16x9_framework.txt').read_text(encoding='utf-8')
+        editorial_contract=dict(version='changed-passage-editorial-v1',
+            original=construction['editorial_origin'],playbook=rubric,
+            playbook_sha256=hashlib.sha256(rubric.encode()).hexdigest())
+        binding['editorial_revision']=digest(editorial_contract)
     key = "boundary-assessment:" + VERSION + ":" + digest(binding)
 
     # Technical source evidence is cached independently of the semantic verdict.
@@ -295,6 +321,8 @@ def prepare_for_render(request_id, identity, candidate, source, state, aspect, a
             selection_reason=candidate.get("reason") or candidate.get("why_it_will_work"),
             intended_excerpt=candidate.get("transcript"), included_unit_indices=[first-left,last-left],
             note="Surrounding units are context, not automatically included speech. Whole segments are not word-precise.")
+        if editorial_contract:
+            context['editorial_contract']=editorial_contract
         semantic = speech.review_thought(context_units, start, end, aspect, context=context)
         if not isinstance(semantic, dict):
             raise BoundaryReviewRequired("SEMANTIC_RESPONSE_INVALID")
@@ -302,6 +330,17 @@ def prepare_for_render(request_id, identity, candidate, source, state, aspect, a
         if type(a) is not int or type(b) is not int or not 0 <= a <= b < len(context_units):
             raise BoundaryReviewRequired("SEMANTIC_REFERENCE_INVALID", first_type=type(a).__name__, last_type=type(b).__name__, valid_units=len(context_units))
         reasons = []
+        if editorial_contract:
+            editorial=semantic.get('editorial')
+            if not isinstance(editorial,dict):
+                raise BoundaryReviewRequired('EDITORIAL_EVIDENCE_MISSING')
+            if (any(editorial.get(k) is not True for k in
+                    ('eligible','original_message_preserved','hook_fulfilled','payoff_preserved'))):
+                reasons.append('EDITORIAL_VALUE_NOT_PRESERVED')
+            score=editorial.get('score')
+            if (type(score) not in (int,float) or not math.isfinite(score) or not 0<=score<=100
+                    or not isinstance(editorial.get('reason'),str) or not editorial['reason'].strip()):
+                raise BoundaryReviewRequired('EDITORIAL_EVIDENCE_INVALID')
         if any(semantic.get(k) is not True for k in ("complete_start","complete_end","complete_thought")):
             reasons.append("SEMANTIC_INCOMPLETE")
         if semantic.get("context_sufficient") is not True:
@@ -347,6 +386,15 @@ def prepare_for_render(request_id, identity, candidate, source, state, aspect, a
     spec_id = "boundary-specification:" + digest(spec)
     with evidence.database() as db:
         _put(db, "boundary_specification", spec_id, spec)
+    if editorial_contract:
+        editorial=assessment['semantic']['editorial']
+        candidate={**candidate,'score':editorial['score'],'reason':editorial['reason'],
+            'editorial_revision':binding['editorial_revision']}
+        # Keep obsolete recommendation fields in immutable construction history,
+        # not on the newly validated passage or its creator-facing card.
+        for field in ('score_total','why_it_will_work','hook','summary','payoff','shareability_reason',
+                      'score_hook','score_completeness','score_impact','score_shareability','score_variety'):
+            candidate.pop(field,None)
     return {**candidate, "boundary_specification_id":spec_id,
             "boundary_request_id":request_id, "boundary_asset_id":identity,
             "boundary_specification_fingerprint":digest(spec), "requires_boundary_specification":True}
@@ -378,6 +426,11 @@ def consume(source, candidate, aspect):
             or candidate.get("transcript") != binding["transcript"] or digest(candidate.get("words")) != binding["words_digest"]
             or configuration(candidate, aspect) != binding["configuration"]):
         raise BoundaryReviewRequired("RENDER_INPUT_DIFFERS_FROM_SPECIFICATION")
+    if binding.get('editorial_revision'):
+        editorial=spec['semantic']['editorial']
+        if (candidate.get('editorial_revision')!=binding['editorial_revision']
+                or candidate.get('score')!=editorial['score'] or candidate.get('reason')!=editorial['reason']):
+            raise BoundaryReviewRequired('EDITORIAL_REVISION_CHANGED')
     if _hash_file(source) != binding["source_sha256"]:
         raise BoundaryReviewRequired("SOURCE_IDENTITY_CHANGED")
     return spec
