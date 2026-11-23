@@ -56,9 +56,13 @@ def passage(tmp_path, monkeypatch):
     monkeypatch.setattr(speech,"media_duration",lambda p:300.)
     def review(units,start,end,aspect,*,context):
         a,b=context["included_unit_indices"]
-        return dict(complete_start=True,complete_end=True,complete_thought=True,first_word=a,last_word=b,
+        response=dict(complete_start=True,complete_end=True,complete_thought=True,first_word=a,last_word=b,
                     context_sufficient=True,setup_units=[a],payoff_units=[b],reason="The answer identifies its subject and finishes.",
                     provenance={"provider":"isolated-fixture","prompt_version":"fixture"})
+        if context.get('editorial_contract'):
+            response['editorial']=dict(eligible=True,original_message_preserved=True,hook_fulfilled=True,
+                payoff_preserved=True,score=82,reason='A useful complete answer retaining its original setup and payoff.')
+        return response
     reviewer=Mock(side_effect=review);monkeypatch.setattr(speech,"review_thought",reviewer)
     edge=Mock(side_effect=lambda source,t,side,duration:dict(edge=side,cut=t,measured_clear=True,quiet_intervals=[[t-.2,t+.2]],suggested_cut=t,automatic_adjustment=False))
     monkeypatch.setattr(boundary,"acoustic_edge",edge)

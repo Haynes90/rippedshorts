@@ -117,17 +117,17 @@ def test_player_gate_requires_decoded_media_and_preserves_frozen_approvals(previ
     if not shutil.which('node'):pytest.skip('Existing Node runtime required for browser gate test')
     p=previews;clip=recovery.generate_preview('request','short',0,p['source'])
     cards=__import__('clip_review_ui').finished_cards(__import__('finished_clip_review').clips('request',p['read']()),p['token'])
-    script=cards.split('<script>',1)[1].split('async function clipDecision',1)[0]
+    script='function clipRequirements'+cards.split('function clipRequirements',1)[1].split('function sameClipDecision',1)[0]
     harness="""const assert=require('node:assert/strict');
-const listeners={};const video={readyState:1,error:null,addEventListener:(e,f)=>listeners[e]=f};
-const approve={disabled:false},status={textContent:''};
-const card={dataset:{frozen:'0'},querySelector:s=>s==='video'?video:s==='[data-approve-clip]'?approve:status};
-global.document={querySelectorAll:()=>[card]};
+const clipSaves=new Map(),video={readyState:1,error:null};
+const approve={disabled:false,dataset:{clipAction:'approve'}},status={textContent:''},requirements={textContent:''};
+const card={dataset:{asset:'fixture',frozen:'0'},querySelector:s=>s==='[data-player-status]'?status:requirements,querySelectorAll:s=>s==='input,select,textarea'?[]:[approve]};
+const p={card,video,playback:{checked:true},framing:{checked:true},reason:{value:'weak_hook'},feedback:{value:''}};
 """+script+"""
-assert.equal(approve.disabled,true);
-video.readyState=3;listeners.loadeddata();assert.equal(approve.disabled,false);
-video.error={code:4};listeners.error();assert.equal(approve.disabled,true);assert.match(status.textContent,/could not load/);
-video.error=null;card.dataset.frozen='1';listeners.loadeddata();assert.equal(approve.disabled,true);
+updateClipControls(p);assert.equal(approve.disabled,true);
+video.readyState=3;updateClipControls(p);assert.equal(approve.disabled,false);
+video.error={code:4};updateClipControls(p);assert.equal(approve.disabled,true);assert.match(status.textContent,/could not load/);
+video.error=null;card.dataset.frozen='1';updateClipControls(p);assert.equal(approve.disabled,true);
 """
     file=tmp_path/'player-gate.cjs';file.write_text(harness,encoding='utf-8')
     subprocess.run(['node',str(file)],check=True,capture_output=True,text=True)

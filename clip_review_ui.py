@@ -4,6 +4,130 @@ import json
 from urllib.parse import quote
 
 
+FINISHED_REVIEW_SCRIPT = r'''<script>
+const clipSaves=new Map();
+function clipParts(asset){
+ const key=asset.replaceAll(':','-'),card=document.getElementById('clip-'+key);
+ if(!card)return {card:null};
+ return {card,status:document.getElementById('clip-status-'+key),video:card.querySelector('video'),
+  playback:document.getElementById('clip-playback-'+key),framing:document.getElementById('clip-framing-'+key),
+  reason:document.getElementById('clip-reason-'+key),feedback:document.getElementById('clip-feedback-'+key),edit:document.getElementById('clip-edit-'+key)};
+}
+function clipDraftKey(card){return 'ripped-clip:'+TOKEN+':'+card.dataset.asset+':'+card.dataset.mediaRevision;}
+function clipStored(card){
+ let draft={};try{draft=JSON.parse(localStorage.getItem(clipDraftKey(card))||'{}');}catch(_){}
+ if(Object.prototype.hasOwnProperty.call(card,'clipPending'))draft.pending=card.clipPending;
+ return draft;
+}
+function rememberClip(p,pending=clipStored(p.card).pending){
+ p.card.clipPending=pending; // Reconciliation still works when browser storage is unavailable.
+ try{localStorage.setItem(clipDraftKey(p.card),JSON.stringify({reason:p.reason.value,feedback:p.feedback.value,
+  edit:p.edit.value,playback:p.playback.checked,framing:p.framing?.checked===true,pending}));}catch(_){}
+}
+function clipRequirements(p,choice){
+ if(p.card.dataset.mediaChanged==='1')return 'This preview changed. Refresh and review its current media before saving.';
+ if(p.card.dataset.frozen==='1')return 'This clip is already submitted; its approval is frozen.';
+ if(choice==='approve'){
+  if(!p.video||p.video.error||p.video.readyState<2)return 'Wait for this verified video to load before approving.';
+  if(!p.playback.checked)return 'Confirm that you watched this finished video and heard its audio.';
+  if(p.framing&&!p.framing.checked)return 'Confirm the framing of this exact preview.';
+ }
+ if(choice==='reject'&&!p.reason.value)return 'Choose a reason above before rejecting this clip.';
+ if(choice==='request_adjustment'&&!p.feedback.value.trim())return 'Describe the requested adjustment above.';
+ return '';
+}
+function updateClipControls(p){
+ const busy=clipSaves.has(p.card.dataset.asset);
+ p.card.querySelectorAll('input,select,textarea').forEach(e=>e.disabled=busy||p.card.dataset.frozen==='1'||p.card.dataset.mediaChanged==='1');
+ p.card.querySelectorAll('[data-clip-action]').forEach(b=>b.disabled=busy||!!clipRequirements(p,b.dataset.clipAction));
+ const ready=p.video&&!p.video.error&&p.video.readyState>=2,player=p.card.querySelector('[data-player-status]');
+ if(player)player.textContent=p.video.error?'Preview could not load. Refresh or report access; do not rerender.':ready?'Preview ready to watch.':'Loading verified preview...';
+ p.card.querySelector('[data-clip-requirements]').textContent=[clipRequirements(p,'approve'),clipRequirements(p,'reject'),clipRequirements(p,'request_adjustment')].filter(Boolean).join(' ')||'Your review inputs are ready. Choose an action to save.';
+}
+function sameClipDecision(saved,intent,unchanged=false){
+ return saved&&saved.version===intent.version+(unchanged?0:1)&&saved.media_revision===intent.media_revision&&
+  saved.choice===intent.choice&&saved.reason===(intent.choice==='reject'?intent.reason:'')&&
+  saved.feedback===intent.feedback&&JSON.stringify(saved.changed_fields||[])===JSON.stringify(intent.changed_fields);
+}
+async function readClipReview(){
+ const r=await fetch('/api/ripped-shorts/review/'+TOKEN,{cache:'no-store'});
+ if(!r.ok)throw new Error('Could not check saved review (HTTP '+r.status+').');
+ const d=await r.json();if(d.request_id!==INITIAL.request_id)throw new Error('Review request mismatch.');
+ refreshClipReview(d);return d;
+}
+function refreshClipReview(d){
+ state=d;updateProgress(d);
+ for(const item of d.clips||[]){
+  const p=clipParts(item.asset_id);if(!p.card||clipSaves.has(item.asset_id)||clipStored(p.card).pending)continue;
+  if(item.media_revision!==p.card.dataset.mediaRevision){p.card.dataset.mediaChanged='1';updateClipControls(p);continue;}
+  p.card.dataset.frozen=item.frozen?'1':'0';
+  p.card.dataset.version=item.decision.version||0;
+  if(p.card.dataset.saveError!=='1')p.status.textContent='Saved clip decision: '+(item.decision.choice||'Undecided');
+ }
+}
+function confirmClipSave(p,decision,message){
+ p.card.dataset.version=decision.version;p.card.dataset.saveError='';rememberClip(p,null);
+ p.status.setAttribute('role','status');p.status.textContent=message+' '+decision.choice+'. No rendering, scheduling or invitations started.';
+}
+async function reconcileClip(p,intent){
+ const d=await readClipReview(),item=(d.clips||[]).find(c=>c.asset_id===p.card.dataset.asset);
+ if(!item||item.media_revision!==intent.media_revision)throw new Error('Preview revision changed. Your inputs are retained; review the current media before saving.');
+ if(sameClipDecision(item.decision,intent)||sameClipDecision(item.decision,intent,true)){confirmClipSave(p,item.decision,'Saved and verified:');return true;}
+ p.card.dataset.version=item.decision.version||0;rememberClip(p,null);
+ throw new Error(item.decision.version!==undefined&&item.decision.version!==intent.version?
+  'A different review version is saved. Your inputs are retained; inspect the saved decision before choosing again.':
+  'No matching saved decision is confirmed. Your inputs are retained; choose the action again when ready.');
+}
+async function performClipDecision(asset,choice){
+ const p=clipParts(asset);let intent,knownRejection=false;
+ p.card.dataset.saveError='';rememberClip(p);
+ try{
+  const previous=clipStored(p.card).pending;
+  if(previous){await reconcileClip(p,previous);return;}
+  const missing=clipRequirements(p,choice);if(missing){knownRejection=true;throw new Error(missing);}
+  intent={choice,version:Number(p.card.dataset.version),media_revision:p.card.dataset.mediaRevision,
+   reason:choice==='reject'?p.reason.value:'',feedback:Array.from(p.feedback.value).slice(0,2000).join(''),
+   changed_fields:choice==='request_adjustment'?[p.edit.value]:[],playback_verified:p.playback.checked,framing_verified:p.framing?.checked===true};
+  rememberClip(p,intent);p.status.textContent='Saving review…';
+  const response=await fetch('/api/ripped-shorts/review/'+TOKEN+'/clip/'+encodeURIComponent(asset),
+   {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(intent)});
+  knownRejection=response.status>=400&&response.status<500&&response.status!==408;
+  let result;try{result=await response.json();}catch(error){if(knownRejection)rememberClip(p,null);throw error;}
+  if(!response.ok){if(knownRejection)rememberClip(p,null);
+   if(knownRejection)try{await readClipReview();}catch(_){}
+   throw new Error(result.detail||'Save rejected (HTTP '+response.status+').');}
+  if(result.status!=='saved'||!sameClipDecision(result.decision,intent,result.unchanged===true))throw new Error('Save acknowledgment requires verification.');
+  confirmClipSave(p,result.decision,'Saved:');
+  try{await readClipReview();}catch(_){p.status.textContent='Saved: '+result.decision.choice+'. Review count refresh is pending.';}
+  if(result.copy_review_ready){document.querySelectorAll('.clip-card').forEach(c=>rememberClip(clipParts(c.dataset.asset)));location.reload();}
+ }catch(error){
+  if(intent&&!knownRejection&&clipStored(p.card).pending){
+   try{await reconcileClip(p,intent);return;}catch(check){error=check;}
+  }
+  p.card.dataset.saveError='1';p.status.setAttribute('role','alert');p.status.textContent=(knownRejection?'Not saved: ':'Save not confirmed: ')+error.message;
+ }finally{updateClipControls(p);}
+}
+function clipDecision(asset,choice){
+ if(clipSaves.has(asset))return clipSaves.get(asset);
+ // Schedule the operation after registering its lock, including reconciliation.
+ const operation=Promise.resolve().then(()=>performClipDecision(asset,choice)).finally(()=>{clipSaves.delete(asset);updateClipControls(clipParts(asset));});
+ clipSaves.set(asset,operation);updateClipControls(clipParts(asset));return operation;
+}
+function initializeClipReviews(){
+ document.querySelectorAll('.clip-card').forEach(card=>{
+  const p=clipParts(card.dataset.asset),draft=clipStored(card);
+  if('feedback' in draft){p.feedback.value=draft.feedback;p.reason.value=draft.reason;p.edit.value=draft.edit;p.playback.checked=draft.playback;if(p.framing)p.framing.checked=draft.framing;}
+  card.addEventListener('input',()=>{rememberClip(p);updateClipControls(p);});
+  card.addEventListener('change',()=>{rememberClip(p);updateClipControls(p);});
+  if(p.video)['loadeddata','error','emptied'].forEach(event=>p.video.addEventListener(event,()=>updateClipControls(p)));
+  updateClipControls(p);
+  if(draft.pending)p.status.textContent='Previous save needs verification. Your inputs are retained; choose an action to check saved state before another submission.';
+ });
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initializeClipReviews);else initializeClipReviews();
+</script>'''
+
+
 def candidate_cards(items, token):
     """Use the existing portal for proposals; no finished-video claims here."""
     sections=[]
@@ -81,7 +205,7 @@ def finished_cards(items, token):
         if item['finished']:
             video = f'<video controls playsinline preload="metadata" style="width:100%;max-height:70vh" src="/api/ripped-shorts/review/{token}/clip/{quote(asset,safe="")}/media"></video>'
         disabled = 'disabled' if item['frozen'] else ''
-        unused = f'<button type="button" {disabled} onclick="clipDecision(\'{asset}\',\'unused\')">Leave unused</button>' if item.get('preview') else ''
+        unused = f'<button type="button" data-clip-action="unused" {disabled} onclick="clipDecision(\'{asset}\',\'unused\')">Leave unused</button>' if item.get('preview') else ''
         framing = f'<label><input type="checkbox" id="clip-framing-{key}" style="width:auto"> I approve this preview framing</label>' if item.get('preview') else ''
         approve_disabled = 'disabled'  # enable only after this exact player decodes media
         player_status = '<p data-player-status role="status">Loading verified preview...</p>' if item['finished'] else ''
@@ -93,7 +217,7 @@ def finished_cards(items, token):
             duration_text = 'Duration pending'
         saved_status = 'Previous approval needs renewed review for this render' if decision.get('choice')=='approve' and not item['approval_current'] else str(decision.get('choice') or 'Undecided')
         options = ''.join(f'<option value="{code}" {"selected" if decision.get("reason")==code else ""}>{label}</option>' for code,label in reasons)
-        cards.append(f'''<article class="clip-card" id="clip-{key}" data-asset="{html.escape(asset)}" data-version="{decision.get('version',0)}" data-frozen="{int(bool(item['frozen']))}" style="border:1px solid #315163;border-radius:16px;padding:14px;margin:16px 0">
+        cards.append(f'''<article class="clip-card" id="clip-{key}" data-asset="{html.escape(asset)}" data-version="{decision.get('version',0)}" data-media-revision="{item['media_revision']}" data-preview="{int(bool(item.get('preview')))}" data-frozen="{int(bool(item['frozen']))}" style="border:1px solid #315163;border-radius:16px;padding:14px;margin:16px 0">
 <span class="pill">{item['format']}</span><h2>{html.escape(str(item['title']))}</h2>
 <p>{duration_text} · Clip {item['number']}</p>
 <details><summary>Complete excerpt transcript{' — awaiting final render' if not item['finished'] else ''}</summary><p style="white-space:pre-wrap">{html.escape(item['transcript'])}</p></details>
@@ -101,33 +225,14 @@ def finished_cards(items, token):
 <label><input type="checkbox" id="clip-playback-{key}" style="width:auto"> I watched this finished clip and heard its audio</label>
 {framing}
 <label for="clip-reason-{key}">Reason if rejecting</label><select id="clip-reason-{key}"><option value="">Choose a reason</option>{options}</select>
-<label for="clip-feedback-{key}">Optional feedback / adjustment request</label><textarea id="clip-feedback-{key}">{html.escape(str(decision.get('feedback') or ''))}</textarea>
+<label for="clip-feedback-{key}">Optional feedback / adjustment request</label><textarea maxlength="2000" id="clip-feedback-{key}">{html.escape(str(decision.get('feedback') or ''))}</textarea>
 <label for="clip-edit-{key}">If requesting an adjustment</label><select id="clip-edit-{key}"><option value="boundaries">Boundaries</option><option value="topic_context">Topic/context</option><option value="caption">Caption</option><option value="framing">Framing</option><option value="audio">Audio</option></select>
-<div class="actions"><button type="button" data-approve-clip {approve_disabled} onclick="clipDecision('{asset}','approve')">Approve Clip</button><button type="button" {disabled} onclick="clipDecision('{asset}','reject')">Reject Clip</button><button type="button" {disabled} onclick="clipDecision('{asset}','request_adjustment')">Request Adjustment</button></div>
+<p data-clip-requirements role="status">To approve, confirm playback and framing above. To reject, choose a reason.</p>
+<div class="actions"><button type="button" data-approve-clip data-clip-action="approve" {approve_disabled} onclick="clipDecision('{asset}','approve')">Approve Clip</button><button type="button" data-clip-action="reject" {disabled} onclick="clipDecision('{asset}','reject')">Reject Clip</button><button type="button" data-clip-action="request_adjustment" {disabled} onclick="clipDecision('{asset}','request_adjustment')">Request Adjustment</button></div>
 {unused}<button type="button" class="secondary" onclick="document.getElementById('editing-workflow').open=true;document.getElementById('editing-workflow').scrollIntoView()">Edit / compare alternatives</button>
 <p id="clip-status-{key}" role="status">Saved clip decision: {html.escape(saved_status)}</p>
 <p class="meta">Clip approval does not approve copy, invite collaborators or start scheduling.</p></article>''')
-    return ''.join(cards) + '''<script>
-document.querySelectorAll('.clip-card').forEach(card=>{
- const video=card.querySelector('video'),approve=card.querySelector('[data-approve-clip]'),status=card.querySelector('[data-player-status]');
- if(!video)return;
- const update=()=>{
-  const ready=!video.error&&video.readyState>=2;
-  approve.disabled=card.dataset.frozen==='1'||!ready;
-  status.textContent=video.error?'Preview could not load. Refresh or report media access; do not rerender.':ready?'Preview ready to watch.':'Loading verified preview...';
- };
- ['loadeddata','error','emptied'].forEach(event=>video.addEventListener(event,update));update();
-});
-async function clipDecision(asset,choice){
- const key=asset.replaceAll(':','-'),card=document.getElementById('clip-'+key),status=document.getElementById('clip-status-'+key);
- try{
-  const response=await fetch('/api/ripped-shorts/review/'+TOKEN+'/clip/'+encodeURIComponent(asset),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice,version:Number(card.dataset.version),reason:document.getElementById('clip-reason-'+key).value,feedback:document.getElementById('clip-feedback-'+key).value,changed_fields:choice==='request_adjustment'?[document.getElementById('clip-edit-'+key).value]:[],playback_verified:document.getElementById('clip-playback-'+key).checked,framing_verified:document.getElementById('clip-framing-'+key)?.checked===true})});
-  const result=await response.json();if(!response.ok)throw new Error(result.detail||'Save failed');
-  card.dataset.version=result.decision.version;status.textContent='Saved: '+result.decision.choice+'. No rendering, scheduling or collaborator invitation started.';
-  if(result.copy_review_ready||INITIAL.preview_first)location.reload();
- }catch(error){status.textContent='Not saved: '+error.message;}
-}
-</script>'''
+    return ''.join(cards) + FINISHED_REVIEW_SCRIPT
 
 
 def sections(reviews, token):
