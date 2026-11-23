@@ -14,4 +14,4 @@
 ## Freshness
 - The CI smoke test builds a temporary index on push/PR; it is not shared with local or cloud Codex workspaces.
 - On each local checkout/pull, run `codebase-index update`. For continuous local updates, run `codebase-index watch --debounce 500` with the `[watch]` extra.
-- On first cloud workspace checkout, install `codebase-index` and run `codebase-index index`.
+- For local and cloud installation, parser preflight, and optional MCP setup, follow `docs/CODEBASE_INDEX.md`.
