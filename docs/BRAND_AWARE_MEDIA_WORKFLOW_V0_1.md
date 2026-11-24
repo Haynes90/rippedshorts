@@ -1,5 +1,7 @@
 # Brand-aware media workflow — implementation blueprint v0.1
 
+This dated blueprint records design history. For current production intent and evidence use requirements RS-01, RS-02 and SM-01 from the shared Railway playbooks in Tech Wizardry. In particular, the approved future automatic Agape path holds and alerts when usable retained transcript evidence is missing. Explicit authorization governs fallback transcription for that path.
+
 Status: **Design approved in conversation; implementation pending.** This document is the agreed floor plan, not proof of deployed functionality. Applies first to TCB and TDOG. Agape can use the common architecture later.
 
 ## Goals and non-goals
