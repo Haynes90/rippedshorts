@@ -1,5 +1,9 @@
 # Ripped Shorts — Codex guidance
 
+## Railway operational policy
+
+For enchanting-fascination / production, start at `railway-workflow/AGENTS.md` in the Tech Wizardry workspace. Use application requirements RS-01, RS-02 and SM-01. Preserve artifact and approval identity across intake routes. Keep the customer pilot governed by its own scope.
+
 ## Navigate before changing code
 - In an indexed checkout, run `codebase-index doctor` and `codebase-index update`; use `search`, `refs`, `impact`, and `diff-impact` to narrow code exploration.
 - Verify graph results against source code, tests, and runtime contracts; missing edges do not prove a dependency is absent.
