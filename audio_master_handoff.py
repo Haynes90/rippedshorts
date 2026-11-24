@@ -2,18 +2,22 @@
 from __future__ import annotations
 
 import io
+import hmac
 import json
+import math
 import os
 import re
 import sqlite3
 import subprocess
 import threading
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
 from google_drive import drive_service
@@ -30,14 +34,14 @@ def now() -> str:
 
 
 class Handoff(BaseModel):
-    source_job_id: str = Field(min_length=1)
-    show_id: str = "AGAPE_CHURCH"
+    source_job_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    show_id: Literal["AGAPE_CHURCH"] = "AGAPE_CHURCH"
     source_type: Literal["approved_sermon"]
     source_video_drive_id: str = Field(min_length=1)
     transcript_drive_id: str = Field(min_length=1)
     transcript_timeline: Literal["original_service", "sermon_relative"]
-    sermon_start_seconds: float = Field(ge=0)
-    sermon_end_seconds: float = Field(gt=0)
+    sermon_start_seconds: float = Field(ge=0, allow_inf_nan=False)
+    sermon_end_seconds: float = Field(gt=0, allow_inf_nan=False)
     sermon_title: str = ""
     speaker: str = ""
     primary_scripture: str = ""
@@ -45,6 +49,7 @@ class Handoff(BaseModel):
     source_youtube_video_id: str = ""
     source_youtube_url: str = ""
     destination_drive_folder_id: str = ""
+    approved_at: AwareDatetime
 
 
 def connect() -> sqlite3.Connection:
@@ -57,7 +62,7 @@ def connect() -> sqlite3.Connection:
 
 
 def get_job(source_job_id: str) -> dict | None:
-    with _DB_LOCK, connect() as db:
+    with _DB_LOCK, closing(connect()) as db, db:
         row = db.execute("SELECT * FROM source_jobs WHERE source_job_id=?", (source_job_id,)).fetchone()
     if not row:
         return None
@@ -66,7 +71,7 @@ def get_job(source_job_id: str) -> dict | None:
 
 def save_job(source_job_id: str, status: str, manifest: dict, state: dict) -> None:
     stamp = now()
-    with _DB_LOCK, connect() as db:
+    with _DB_LOCK, closing(connect()) as db, db:
         db.execute(
             "INSERT INTO source_jobs VALUES (?,?,?,?,?,?) ON CONFLICT(source_job_id) DO UPDATE SET status=excluded.status, manifest_json=excluded.manifest_json, state_json=excluded.state_json, updated_at=excluded.updated_at",
             (source_job_id, status, json.dumps(manifest), json.dumps(state), stamp, stamp),
@@ -157,7 +162,28 @@ def video_duration(path: Path) -> float:
     return float(completed.stdout.strip())
 
 
+def retained_file(file_id: str, path: Path, metadata: dict) -> Path:
+    size = int(metadata.get("size") or 0)
+    if path.is_file():
+        actual = path.stat().st_size
+        if actual > 0 and (not size or size == actual):
+            return path
+    partial = path.with_suffix(path.suffix + ".partial")
+    result = download_drive(file_id, partial, metadata)
+    if size and result.stat().st_size != size:
+        raise RuntimeError("Retained Drive file size does not match metadata")
+    result.replace(path)
+    return path
+
+
 def process_handoff(source_job_id: str) -> None:
+    with _DB_LOCK, closing(connect()) as db, db:
+        claimed = db.execute(
+            "UPDATE source_jobs SET status='processing' WHERE source_job_id=? AND status='accepted'",
+            (source_job_id,),
+        ).rowcount
+    if not claimed:
+        return
     job = get_job(source_job_id)
     if not job:
         return
@@ -166,21 +192,39 @@ def process_handoff(source_job_id: str) -> None:
     state.update({"attempts": attempts, "stage": "drive_validation", "error": None, "started_at": now()})
     save_job(source_job_id, "processing", manifest, state)
     try:
-        video_meta = drive_metadata(manifest["source_video_drive_id"])
-        transcript_meta = drive_metadata(manifest["transcript_drive_id"])
-        if video_meta.get("trashed") or transcript_meta.get("trashed"):
-            raise RuntimeError("One or more handoff files are trashed in Google Drive")
         work = SOURCE_DIR / source_job_id
-        video = download_drive(manifest["source_video_drive_id"], work / "approved-sermon.mp4", video_meta)
-        transcript = download_drive(manifest["transcript_drive_id"], work / "source-transcript", transcript_meta)
-        state["stage"] = "timeline_validation"
-        segments = normalize_sermon(parse_transcript(transcript), manifest)
+        try:
+            transcript_meta = drive_metadata(manifest["transcript_drive_id"])
+            if transcript_meta.get("trashed") or str(transcript_meta.get("size")) == "0":
+                raise ValueError("Retained transcript is unavailable")
+            transcript = retained_file(manifest["transcript_drive_id"], work / "source-transcript", transcript_meta)
+            original = parse_transcript(transcript)
+            if any(not math.isfinite(item["start"]) or not math.isfinite(item["end"]) for item in original):
+                raise ValueError("Transcript includes nonfinite timings")
+            segments = normalize_sermon(original, manifest)
+        except HttpError as exc:
+            if exc.resp.status not in {404, 410}:
+                raise
+            save_job(source_job_id, "held_transcript", manifest, {**state, "stage": "held_transcript", "retryable": False})
+            return
+        except (ValueError, RuntimeError, UnicodeError):
+            save_job(source_job_id, "held_transcript", manifest, {**state, "stage": "held_transcript", "retryable": False})
+            return
+        video_meta = drive_metadata(manifest["source_video_drive_id"])
+        if video_meta.get("trashed"):
+            raise RuntimeError("Retained video is trashed in Google Drive")
+        video = retained_file(manifest["source_video_drive_id"], work / "approved-sermon.mp4", video_meta)
         duration = video_duration(video)
         tolerance = float(os.getenv("TIMELINE_TOLERANCE_SECONDS", "5"))
-        if segments[-1]["end"] > duration + tolerance:
-            raise RuntimeError(f"Transcript ends at {segments[-1]['end']:.3f}s but video is {duration:.3f}s")
+        if not math.isfinite(duration) or abs(duration - (manifest["sermon_end_seconds"] - manifest["sermon_start_seconds"])) > tolerance:
+            raise RuntimeError("Retained video duration does not match the approved range")
+        if max(segment["end"] for segment in segments) > duration + tolerance:
+            save_job(source_job_id, "held_transcript", manifest, {**state, "stage": "held_transcript", "retryable": False})
+            return
         normalized_path = work / "sermon-relative-transcript.json"
-        normalized_path.write_text(json.dumps({"timeline": "sermon_relative", "video_duration": duration, "segments": segments}, indent=2), encoding="utf-8")
+        partial = normalized_path.with_suffix(".partial")
+        partial.write_text(json.dumps({"timeline": "sermon_relative", "video_duration": duration, "segments": segments}, indent=2), encoding="utf-8")
+        partial.replace(normalized_path)
         state.update({"stage": "ready_for_selection", "video_path": str(video), "normalized_transcript_path": str(normalized_path), "video_duration": duration, "segment_count": len(segments), "completed_at": now()})
         save_job(source_job_id, "ready_for_selection", manifest, state)
     except Exception as exc:
@@ -188,13 +232,47 @@ def process_handoff(source_job_id: str) -> None:
         save_job(source_job_id, "error", manifest, state)
 
 
+def require_secret(value: str | None) -> None:
+    expected = os.getenv("AUDIO_MASTER_HANDOFF_SECRET", "").strip()
+    if not expected or not hmac.compare_digest((value or "").encode(), expected.encode()):
+        raise HTTPException(status_code=401, detail="Invalid handoff secret")
+
+
+@router.on_event("startup")
+def resume_handoffs() -> None:
+    if not os.getenv("AUDIO_MASTER_HANDOFF_SECRET", "").strip():
+        return
+    # This volume-backed deployment runs one worker. Resume only rows admitted
+    # by the current contract, leaving legacy records for operator review.
+    with _DB_LOCK, closing(connect()) as db, db:
+        db.execute("UPDATE source_jobs SET status='accepted' WHERE status='processing' AND json_extract(state_json, '$.managed')=1")
+        rows = db.execute("SELECT source_job_id FROM source_jobs WHERE status='accepted' AND json_extract(state_json, '$.managed')=1").fetchall()
+    if rows:
+        def resume():
+            for row in rows:
+                process_handoff(row["source_job_id"])
+        threading.Thread(target=resume, daemon=True).start()
+
+
 @router.post("/api/audio-master/handoff", status_code=202)
 def handoff(payload: Handoff, background_tasks: BackgroundTasks, x_audio_master_secret: str | None = Header(None)):
-    if not os.getenv("AUDIO_MASTER_HANDOFF_SECRET") or x_audio_master_secret != os.getenv("AUDIO_MASTER_HANDOFF_SECRET"):
-        raise HTTPException(status_code=401, detail="Invalid handoff secret")
-    manifest = payload.model_dump()
-    existing = get_job(payload.source_job_id)
-    if existing:
+    require_secret(x_audio_master_secret)
+    if payload.sermon_end_seconds <= payload.sermon_start_seconds:
+        raise HTTPException(status_code=422, detail="Invalid approved range")
+    manifest = payload.model_dump(mode="json")
+    stamp = now()
+    with _DB_LOCK, closing(connect()) as db, db:
+        added = db.execute(
+            "INSERT INTO source_jobs VALUES (?,?,?,?,?,?) ON CONFLICT(source_job_id) DO NOTHING",
+            (payload.source_job_id, "accepted", json.dumps(manifest),
+             json.dumps({"stage": "accepted", "attempts": 0, "managed": True}), stamp, stamp),
+        ).rowcount
+    if not added:
+        existing = get_job(payload.source_job_id)
+        if existing["manifest"] != manifest:
+            raise HTTPException(status_code=409, detail="Approved manifest differs for existing source job")
+        if existing["status"] == "accepted":
+            background_tasks.add_task(process_handoff, payload.source_job_id)
         return {"status": "duplicate", "source_job_id": payload.source_job_id, "processing_status": existing["status"]}
     save_job(payload.source_job_id, "accepted", manifest, {"stage": "accepted", "attempts": 0})
     background_tasks.add_task(process_handoff, payload.source_job_id)
@@ -202,20 +280,26 @@ def handoff(payload: Handoff, background_tasks: BackgroundTasks, x_audio_master_
 
 
 @router.get("/api/source-jobs/{source_job_id}")
-def status(source_job_id: str):
+def status(source_job_id: str, x_audio_master_secret: str | None = Header(None)):
+    require_secret(x_audio_master_secret)
     job = get_job(source_job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Source job not found")
-    return job
+    return {"source_job_id": source_job_id, "status": job["status"]}
 
 
 @router.post("/api/source-jobs/{source_job_id}/retry", status_code=202)
 def retry(source_job_id: str, background_tasks: BackgroundTasks, x_audio_master_secret: str | None = Header(None)):
-    if x_audio_master_secret != os.getenv("AUDIO_MASTER_HANDOFF_SECRET"):
-        raise HTTPException(status_code=401, detail="Invalid handoff secret")
+    require_secret(x_audio_master_secret)
     job = get_job(source_job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Source job not found")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", source_job_id):
+        raise HTTPException(status_code=409, detail="Legacy source identity requires review")
+    with _DB_LOCK, closing(connect()) as db, db:
+        changed = db.execute("UPDATE source_jobs SET status='accepted' WHERE source_job_id=? AND status='error' AND json_extract(state_json, '$.managed')=1", (source_job_id,)).rowcount
+    if not changed:
+        raise HTTPException(status_code=409, detail="Source job is not eligible for retry")
     background_tasks.add_task(process_handoff, source_job_id)
     return {"status": "retry_accepted", "source_job_id": source_job_id}
 
