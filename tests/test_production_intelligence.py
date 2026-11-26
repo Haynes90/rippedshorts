@@ -158,7 +158,7 @@ def test_feedback_links_rendered_asset_and_acknowledged_delivery_ids(db):
 
 
 class FakeSheets:
-    def __init__(self):self.tabs={};self.writes=[];self.fail_after_write=False
+    def __init__(self):self.tabs={};self.writes=[];self.fail_after_write=False;self.batch_writes=[];self.batch_reads=[]
     def spreadsheets(self):return self
     def values(self):return self
     def result(self,value):return Mock(execute=Mock(return_value=value))
@@ -171,8 +171,19 @@ class FakeSheets:
         nums=re.findall(r'\d+',area)
         return self.result({'values':rows[int(nums[0])-1:int(nums[-1])]})
     def batchUpdate(self,**kwargs):
+        if 'data' in kwargs['body']:
+            self.batch_writes.append(kwargs)
+            for item in kwargs['body']['data']:
+                self.update(spreadsheetId=kwargs['spreadsheetId'],range=item['range'],
+                    valueInputOption=kwargs['body']['valueInputOption'],body={'values':item['values']}).execute()
+            return self.result({})
         for r in kwargs['body']['requests']:self.tabs[r['addSheet']['properties']['title']]=[]
         return self.result({})
+    def batchGet(self,**kwargs):
+        self.batch_reads.append(kwargs)
+        return self.result({'valueRanges':[{'range':area,**self.get(
+            spreadsheetId=kwargs['spreadsheetId'],range=area,
+            valueRenderOption=kwargs.get('valueRenderOption')).execute()} for area in kwargs['ranges']]})
     def update(self,**kwargs):
         import re
         tab,area=kwargs['range'].split('!');tab=tab.strip("'");number=int(re.search(r'\d+',area)[0])
@@ -234,6 +245,23 @@ def test_sheet_readback_still_rejects_changed_stored_value(db):
         pi.sync_sheets(CorruptReadback(), 'isolated')
     with pi.database() as connection:
         assert connection.execute('SELECT synced_digest FROM intelligence_records').fetchone()[0] is None
+
+
+def test_retained_backlog_uses_one_batch_write_and_readback_per_kind(db):
+    for i in range(150):
+        pi.record('feedback',f'old-feedback-{i:03}',{'decision':'reject','brand_id':'TDOG'})
+    pi.record('boundary_assessment','internal-preserved',{'complete':False})
+    service=FakeSheets()
+    assert pi.sync_sheets(service,'isolated')==150
+    assert len(service.batch_writes)==len(service.batch_reads)==1
+    assert len(service.batch_writes[0]['body']['data'])==150
+    assert service.batch_reads[0]['valueRenderOption']=='UNFORMATTED_VALUE'
+    assert pi.sync_sheets(service,'isolated')==0
+    rows=service.tabs[pi.SHEET_TABS['feedback']][1:]
+    assert len({row[0] for row in rows})==150
+    with pi.database() as connection:
+        record=connection.execute("SELECT payload,synced_digest FROM intelligence_records WHERE record_id='internal-preserved'").fetchone()
+        assert json.loads(record[0])=={'complete':False} and record[1] is None
 
 
 @pytest.mark.parametrize('supported',[False,True])
