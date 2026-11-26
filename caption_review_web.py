@@ -449,13 +449,14 @@ button {{ border:0; border-radius:12px; padding:12px 8px; font-weight:700; font-
   }}
   document.getElementById('refreshWorkflow').onclick=refreshWorkflow;
   refreshWorkflow();
-  {'setInterval(async()=>{if(document.hidden)return;try{const r=await fetch("/api/ripped-shorts/review/'+token+'",{cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status);const d=await r.json();if(d.request_id!=='+json.dumps(payload['request_id'])+')throw new Error("Review request mismatch");if(d.candidate_total!=='+str(payload.get('candidate_total',0))+'||d.preview_review_total!=='+str(payload.get('preview_review_total',0))+')location.reload();if(typeof refreshClipReview==="function")refreshClipReview(d);document.getElementById("processingStatus").textContent=d.processing_status;}catch(e){document.getElementById("workflowStatus").textContent="Status refresh failed. Saved decisions remain intact. "+e.message;}},15000);' if payload.get('website_first') and (payload.get('preview_first') or payload.get('processing_stage') in {'accepted','source_resolution','selection','parallel_format_analysis','processing','retrying','awaiting_render_completion'}) else ''}
+  {'setInterval(async()=>{if(document.hidden)return;try{const d=await refreshReviewState();if(typeof refreshClipReview==="function")refreshClipReview(d);document.getElementById("processingStatus").textContent=d.processing_status;}catch(e){document.getElementById("workflowStatus").textContent="Status refresh failed. Saved decisions remain intact. "+e.message;}},15000);' if payload.get('website_first') and (payload.get('preview_first') or payload.get('processing_stage') in {'accepted','source_resolution','selection','parallel_format_analysis','processing','retrying','awaiting_render_completion'}) else ''}
   </script>
   <div class="progress">
     <div class="progressbar"><div id="bar"></div></div>
     <div class="progress-text" id="progressText"></div>
   </div>
 
+  {__import__('mobile_review_ui').toolbar()}
   <section id="finished-clips"><h2>{'Watch previews, then choose clips' if payload.get('preview_first') else 'Review finished clips'}</h2>{__import__('clip_review_ui').finished_cards(payload.get('clips', []), token)}</section>
   <details id="editing-workflow" {'open' if payload.get('stage') in {'editorial','framing'} else ''}><summary>Edit boundaries or framing / compare alternatives</summary>
   {__import__('clip_review_ui').sections(payload.get('comparisons', []), token)}
@@ -547,13 +548,23 @@ async function reviewJson(response) {{
   return data;
 }}
 function applyReviewState(data) {{
+  for(const item of data.items||[]){{
+    const card=document.getElementById('asset-'+item.index);if(!card)continue;
+    const previous=(state.items||[]).find(i=>i.asset_id===item.asset_id);
+    const dirty=previous&&!sameCopy(bodyFor(item.index),previous);
+    if(!dirty||sameCopy(bodyFor(item.index),item))card.dataset.copyRevision=item.copy_revision;
+    else if(card.dataset.copyRevision!==item.copy_revision){{
+      rememberDraft(item.index);
+      document.getElementById('saved-'+item.index).textContent='Saved copy changed elsewhere. Your unsaved text is retained; reconcile before saving.';
+    }}
+  }}
   state=data;
-  for(const item of data.items||[]){{const card=document.getElementById('asset-'+item.index);if(card)card.dataset.copyRevision=item.copy_revision;}}
   updateProgress();
 }}
 async function refreshReviewState() {{
   const data=await reviewJson(await fetch('/api/ripped-shorts/review/'+TOKEN,{{cache:'no-store'}}));
-  applyReviewState(data);return data;
+  if(data.request_id!==INITIAL.request_id)throw new Error('Review request mismatch.');
+  applyReviewState(data);if(typeof synchronizeReviewCards==='function')await synchronizeReviewCards(data);return data;
 }}
 async function performCopySave(index, action) {{
   const saved = document.getElementById(`saved-${{index}}`);
@@ -567,6 +578,8 @@ async function performCopySave(index, action) {{
     }});
     const data = await reviewJson(response);
     if(data.review)applyReviewState(data.review);
+    const acknowledged=(data.review?.items||[]).find(i=>i.index===index);
+    if(acknowledged&&sameCopy(acknowledged,submitted))document.getElementById('asset-'+index).dataset.copyRevision=acknowledged.copy_revision;
     if(sameCopy(bodyFor(index),submitted))clearDraft(index);else rememberDraft(index);
     saved.textContent = `Saved ✓ ${{new Date().toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}})}}`;
     if(data.checkpoint_pending)saved.textContent+=' — learning sync pending; your edit is saved.';
@@ -579,6 +592,7 @@ async function performCopySave(index, action) {{
       const data=await refreshReviewState();
       const current=(data.items||[]).find(i=>i.index===index);
       if(current&&['approved','edited'].includes(current.copy_status)&&sameCopy(current,submitted)){{
+        document.getElementById('asset-'+index).dataset.copyRevision=current.copy_revision;
         if(sameCopy(bodyFor(index),submitted))clearDraft(index);else rememberDraft(index);
         saved.textContent='Saved ✓ — confirmed by server readback after an interrupted response.';
         return {{status:'saved_reconciled',review:data}};
@@ -593,7 +607,8 @@ function saveAsset(index, action='save') {{
   const operation=performCopySave(index,action).finally(()=>copySaves.delete(index));
   copySaves.set(index,operation);return operation;
 }}
-document.querySelectorAll('.asset[data-index]').forEach(card=>{{
+function initializeCopyCards() {{document.querySelectorAll('.asset[data-index]').forEach(card=>{{
+  if(card.dataset.copyInitialized)return;card.dataset.copyInitialized='1';
   const index=Number(card.dataset.index);
   card.addEventListener('input',()=>{{rememberDraft(index);updateProgress();}});
   let cached;try{{cached=JSON.parse(localStorage.getItem(draftKey(index))||'null');}}catch(_){{}}
@@ -610,7 +625,8 @@ document.querySelectorAll('.asset[data-index]').forEach(card=>{{
   if(cached.copy_revision===card.dataset.copyRevision){{restore();return;}}
   const button=document.createElement('button');button.type='button';button.textContent='Restore unsaved text';button.onclick=restore;
   const status=document.getElementById('saved-'+index);status.textContent='Newer saved copy exists. Your unsaved text is retained separately. ';status.append(button);
-}});
+}});}}
+initializeCopyCards();
 
 async function keepAsset(index) {{
   await saveAsset(index, 'keep');
@@ -680,6 +696,7 @@ async function finishReview() {{
   }} finally{{finishing=false;}}
 }}
 </script>
+{__import__('mobile_review_ui').SCRIPT}
 </body>
 </html>"""
 
@@ -707,8 +724,17 @@ def copy_review_page(token: str, stage: str = 'final'):
 
 
 @router.get("/api/ripped-shorts/review/{token}")
-def review_data(token: str):
-    return _payload_for_session(token)
+def review_data(token: str, asset_id: str | None = None):
+    payload = _payload_for_session(token)
+    if asset_id is None:
+        return payload
+    clip = next((c for c in payload['clips'] if c['asset_id']==asset_id),None)
+    if not clip:
+        raise HTTPException(status_code=404,detail='Clip not available in this review')
+    item = next((i for i in payload['items'] if i['asset_id']==asset_id),None)
+    return {'request_id':payload['request_id'],'asset_id':asset_id,
+            'clip_html':__import__('clip_review_ui').finished_cards([clip],token).split('<script>')[0],
+            'copy_html':_card_html(item,token) if item else ''}
 
 
 # Range requests for seven cards must not rehash the same unchanged source.

@@ -84,7 +84,7 @@ async function performClipDecision(asset,choice){
  p.card.dataset.saveError='';p.card.clipSaveError='';rememberClip(p);
  try{
   const previous=clipStored(p.card).pending;
-  if(previous){await reconcileClip(p,previous);return;}
+  if(previous){await reconcileClip(p,previous);return true;}
   p.card.clipAttempt=choice;
   const missing=clipRequirements(p,choice);if(missing){knownRejection=true;throw new Error(missing);}
   intent={choice,version:Number(p.card.dataset.version),media_revision:p.card.dataset.mediaRevision,
@@ -101,10 +101,11 @@ async function performClipDecision(asset,choice){
   if(result.status!=='saved'||!sameClipDecision(result.decision,intent,result.unchanged===true))throw new Error('Save acknowledgment requires verification.');
   confirmClipSave(p,result.decision,'Saved:');
   try{await readClipReview();}catch(_){p.status.textContent='Saved: '+result.decision.choice+'. Review count refresh is pending.';}
-  if(result.copy_review_ready){document.querySelectorAll('.clip-card').forEach(c=>rememberClip(clipParts(c.dataset.asset)));location.reload();}
+  if(result.copy_review_ready)try{await refreshReviewState();}catch(_){p.status.textContent='Saved: '+result.decision.choice+'. Copy editor refresh is pending; no need to repeat the decision.';}
+  return true;
  }catch(error){
   if(intent&&!knownRejection&&clipStored(p.card).pending){
-   try{await reconcileClip(p,intent);return;}catch(check){error=check;}
+   try{await reconcileClip(p,intent);return true;}catch(check){error=check;}
   }
   p.card.dataset.saveError='1';p.card.clipSaveError=(knownRejection?'Not saved: ':'Save not confirmed: ')+error.message;
   rememberClip(p);p.status.setAttribute('role','alert');p.status.textContent=p.card.clipSaveError;
@@ -118,6 +119,7 @@ function clipDecision(asset,choice){
 }
 function initializeClipReviews(){
  document.querySelectorAll('.clip-card').forEach(card=>{
+  if(card.dataset.clipInitialized)return;card.dataset.clipInitialized='1';
   const p=clipParts(card.dataset.asset),draft=clipStored(card);
   if('feedback' in draft){p.feedback.value=draft.feedback;p.reason.value=draft.reason;p.edit.value=draft.edit;p.playback.checked=draft.playback;if(p.framing)p.framing.checked=draft.framing;}
   p.card.clipAttempt=draft.attempt;p.card.clipSaveError=draft.error||'';
@@ -275,6 +277,7 @@ def finished_cards(items, token):
 <label for="clip-edit-{key}">If requesting an adjustment</label><select id="clip-edit-{key}"><option value="boundaries">Boundaries</option><option value="topic_context">Topic/context</option><option value="caption">Caption</option><option value="framing">Framing</option><option value="audio">Audio</option></select>
 <p data-clip-requirements role="status">To approve, confirm playback and framing above. To reject, choose a reason.</p>
 <div class="actions"><button type="button" data-approve-clip data-clip-action="approve" {approve_disabled} onclick="clipDecision('{asset}','approve')">Approve Clip</button><button type="button" data-clip-action="reject" {disabled} onclick="clipDecision('{asset}','reject')">Reject Clip</button><button type="button" data-clip-action="request_adjustment" {disabled} onclick="clipDecision('{asset}','request_adjustment')">Request Adjustment</button></div>
+<button type="button" data-clip-action="approve" disabled onclick="approveAndNext('{asset}')">Approve &amp; Next</button><p data-navigation-status role="status"></p>
 {unused}<button type="button" class="secondary" onclick="document.getElementById('editing-workflow').open=true;document.getElementById('editing-workflow').scrollIntoView()">Edit / compare alternatives</button>
 <p id="clip-status-{key}" role="status">Saved clip decision: {html.escape(saved_status)}</p>
 <p class="meta">Clip approval does not approve copy, invite collaborators or start scheduling.</p></article>''')

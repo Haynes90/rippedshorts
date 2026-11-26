@@ -95,7 +95,7 @@ def test_frontend_uncertain_response_reads_back_without_duplicate_post(editor,tm
     code='function bodyFor'+page.split('function bodyFor',1)[1].split('async function keepAsset',1)[0]
     harness=r'''
 const assert=require('node:assert/strict');
-const TOKEN='isolated';let state={};function updateProgress(){}
+const TOKEN='isolated',INITIAL={request_id:'isolated-request'};let state={};function updateProgress(){}
 const entries=new Map();for(const id of ['caption-0','favorite-0','hold-0','feedback-0','saved-0','status-0','playback-0'])entries.set(id,{value:'',checked:false,textContent:''});
 entries.set('asset-0',{dataset:{index:'0',asset:'stable-asset',type:'9:16_SHORT',copyRevision:'r0'}});
 const document={getElementById:id=>entries.get(id),querySelectorAll:()=>[]};
@@ -107,9 +107,9 @@ global.fetch=async(url,options={})=>{
    posts++;if(mode==='offline')throw new Error('isolated network failure');
    const body=JSON.parse(options.body);current={...current,...body,copy_revision:'r'+posts};
    if(mode==='committed500')return response(500,'Internal Server Error');
-   return response(200,{status:'saved',review:{items:[current]}});
+   return response(200,{status:'saved',review:{request_id:'isolated-request',items:[current]}});
  }
- gets++;return response(200,{items:[current]});
+ gets++;return response(200,{request_id:'isolated-request',items:[current]});
 };
 '''+code+r'''
 (async()=>{
@@ -122,6 +122,13 @@ global.fetch=async(url,options={})=>{
  assert.equal(entries.get('caption-0').value,'Unsaved emoji 🌱\n#jardín');
  mode='success';const before=posts,a=saveAsset(0),b=saveAsset(0);assert.equal(a,b);await Promise.all([a,b]);
  assert.equal(posts,before+1);assert.equal(local.size,0);assert.match(entries.get('saved-0').textContent,/Saved/);
+ // A passive refresh must not grant stale unsaved text the newer server revision.
+ entries.get('caption-0').value='My newer unsaved edit';
+ const revision=entries.get('asset-0').dataset.copyRevision;
+ applyReviewState({items:[{...current,copy_revision:'other-owner-revision',complete_post:'Different saved words'}]});
+ assert.equal(entries.get('asset-0').dataset.copyRevision,revision);
+ assert.equal(entries.get('caption-0').value,'My newer unsaved edit');
+ assert.match(entries.get('saved-0').textContent,/reconcile/);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
     file=tmp_path/'save-behavior.cjs';file.write_text(harness,encoding='utf-8')
