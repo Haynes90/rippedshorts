@@ -651,6 +651,7 @@ def sync_sheets(service, sheet_id):
                     if row[0] in keys:
                         raise ValueError('Duplicate intelligence Sheet key; manual review required')
                     keys[row[0]] = index
+            updates = []
             for row in [r for r in pending if r['kind'] == kind]:
                 payload = json.loads(row['payload'])
                 # No transcript bodies in Sheets. Full review revisions remain in SQLite.
@@ -661,18 +662,30 @@ def sync_sheets(service, sheet_id):
                 index = keys.get(row['record_id'],len(rows)+1)
                 if index>10000:
                     raise ValueError('Intelligence projection capacity reached; SQLite records retained')
-                api.values().update(spreadsheetId=sheet_id,range=f"'{tab}'!A{index}",valueInputOption='RAW',body={'values':[values]}).execute()
+                updates.append((row, values, f"'{tab}'!A{index}:Y{index}"))
+                if row['record_id'] not in keys:
+                    rows.append(values)
+                keys[row['record_id']] = index
+            # A retained backlog must not consume one write/read per record and
+            # exhaust the quota needed by foreground processing. Same key upserts,
+            # same exact readback, using the provider's existing batch interface.
+            api.values().batchUpdate(spreadsheetId=sheet_id, body={
+                'valueInputOption':'RAW', 'data':[
+                    {'range':area,'values':[values]} for _,values,area in updates]}).execute()
+            readback = api.values().batchGet(spreadsheetId=sheet_id,
+                ranges=[area for _,_,area in updates],
+                valueRenderOption='UNFORMATTED_VALUE').execute().get('valueRanges', [])
+            if len(readback) != len(updates):
+                raise ValueError('Intelligence Sheet readback mismatch')
+            for (row, values, _), observed_range in zip(updates, readback):
                 # Default FORMATTED_VALUE rounds real source timestamps for display.
                 # Verify stored RAW values, never their presentation formatting.
-                observed = api.values().get(spreadsheetId=sheet_id,range=f"'{tab}'!A{index}:Y{index}",valueRenderOption='UNFORMATTED_VALUE').execute().get('values', [])
+                observed = observed_range.get('values', [])
                 if not observed or len(observed[0]) != len(values) or any(
                         actual != expected or isinstance(actual, bool) != isinstance(expected, bool)
                         for actual, expected in zip(observed[0], values)):
                     raise ValueError('Intelligence Sheet readback mismatch')
                 with database() as db:
                     db.execute('UPDATE intelligence_records SET synced_digest=? WHERE record_id=? AND digest=?',(row['digest'],row['record_id'],row['digest']))
-                if row['record_id'] not in keys:
-                    rows.append(values)
-                keys[row['record_id']] = index
                 sent += 1
         return sent
