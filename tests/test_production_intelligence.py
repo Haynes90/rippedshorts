@@ -198,6 +198,44 @@ def test_sheet_write_readback_and_uncertain_retry_does_not_duplicate(db,timeline
     assert all(w['valueInputOption']=='RAW' for w in service.writes)
 
 
+def test_sheet_readback_uses_exact_stored_timestamps_not_display_rounding(db):
+    class FormattedSheets(FakeSheets):
+        def get(self, **kwargs):
+            result = super().get(**kwargs)
+            rows = result.execute().get('values', [])
+            if kwargs.get('range', '').endswith(':Y2'):
+                if kwargs.get('valueRenderOption') != 'UNFORMATTED_VALUE':
+                    rows = [[f'{v:.6f}' if isinstance(v, float) else v for v in row] for row in rows]
+                return self.result({'values': rows})
+            return result
+
+    # Exact November 25 production readback discrepancy, candidate row 9.
+    pi.record('candidate', 'precision-case', {'start':2553.3999938964844,
+                                          'end':2580.0599975585938})
+    service = FormattedSheets()
+    assert pi.sync_sheets(service, 'isolated') == 1
+    assert pi.sync_sheets(service, 'isolated') == 0
+    row = service.tabs[pi.SHEET_TABS['candidate']][1]
+    assert row[14:16] == [2553.3999938964844, 2580.0599975585938]
+
+
+def test_sheet_readback_still_rejects_changed_stored_value(db):
+    class CorruptReadback(FakeSheets):
+        def get(self, **kwargs):
+            result = super().get(**kwargs)
+            if kwargs.get('range', '').endswith(':Y2'):
+                rows = [list(row) for row in result.execute()['values']]
+                rows[0][14] = 2553.4
+                return self.result({'values': rows})
+            return result
+
+    pi.record('candidate', 'precision-case', {'start':2553.3999938964844})
+    with pytest.raises(ValueError, match='readback mismatch'):
+        pi.sync_sheets(CorruptReadback(), 'isolated')
+    with pi.database() as connection:
+        assert connection.execute('SELECT synced_digest FROM intelligence_records').fetchone()[0] is None
+
+
 @pytest.mark.parametrize('supported',[False,True])
 def test_sheet_sync_preserves_internal_evidence_without_blocking_supported_records(db,supported):
     internal={'boundary_assessment':{'complete':False,'diagnostic':'held'},

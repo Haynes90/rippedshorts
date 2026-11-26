@@ -662,8 +662,12 @@ def sync_sheets(service, sheet_id):
                 if index>10000:
                     raise ValueError('Intelligence projection capacity reached; SQLite records retained')
                 api.values().update(spreadsheetId=sheet_id,range=f"'{tab}'!A{index}",valueInputOption='RAW',body={'values':[values]}).execute()
-                observed = api.values().get(spreadsheetId=sheet_id,range=f"'{tab}'!A{index}:Y{index}").execute().get('values', [])
-                if not observed or [str(v) for v in observed[0]] != [str(v) for v in values][:len(observed[0])] or len(observed[0]) != len(values):
+                # Default FORMATTED_VALUE rounds real source timestamps for display.
+                # Verify stored RAW values, never their presentation formatting.
+                observed = api.values().get(spreadsheetId=sheet_id,range=f"'{tab}'!A{index}:Y{index}",valueRenderOption='UNFORMATTED_VALUE').execute().get('values', [])
+                if not observed or len(observed[0]) != len(values) or any(
+                        actual != expected or isinstance(actual, bool) != isinstance(expected, bool)
+                        for actual, expected in zip(observed[0], values)):
                     raise ValueError('Intelligence Sheet readback mismatch')
                 with database() as db:
                     db.execute('UPDATE intelligence_records SET synced_digest=? WHERE record_id=? AND digest=?',(row['digest'],row['record_id'],row['digest']))
