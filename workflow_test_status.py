@@ -97,7 +97,7 @@ def project(request_id, state, creators=None, scheduler=None):
     copied={d.get('asset_id') for d in drafts if d.get('copy_status') in {'approved','edited'} and
         (d.get('social_caption') if d.get('asset_type')=='9:16_SHORT' else d.get('video_title') and d.get('video_description'))}
     copy_ok=bool(ids) and set(ids)<=copied and bool(state.get('copy_review_completed_at'))
-    revision=copy_revision(drafts)
+    revision=copy_revision([d for d in drafts if d.get('asset_id') in set(ids)])
     stage('COPY_APPROVED','PASSED' if copy_ok else 'WAITING_FOR_HUMAN',{'approval_revision':revision,'asset_group_ids':sorted(copied)})
     response=scheduler if scheduler is not None else (state.get('schedule_master') or {}).get('shorts_response') or {}
     expected=set(ids)

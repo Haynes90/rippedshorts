@@ -113,6 +113,10 @@ def save(request_id, asset_id, body):
             decision['reason'] = ''
         decision['prior_versions'] = list(current.get('prior_versions') or []) + ([{k:v for k,v in current.items() if k != 'prior_versions'}] if current else [])
         state.setdefault('website_clip_reviews', {})[asset_id] = decision
+        if choice == 'approve':
+            state.setdefault('website_playback_checks', {})[asset_id] = dict(
+                verified=True, media_url=item['media_url'], media_revision=item['media_revision'],
+                verified_by=str(row['user_id']), verified_at=decision['decided_at'])
         copy_added=False
         if state.get('preview_first_version')==1:
             from render_recovery import LANES, asset_id as identity

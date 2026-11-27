@@ -1,5 +1,17 @@
 # Mobile review: focused refresh correction
 
+Recovery closeout uses the same finished-media decisions and ScheduleMaster GET
+readback. Playback checks are stored with the exact media revision; historical
+current-media approvals already validated by the server remain valid evidence.
+Completion copy digests include selected assets only, never unused drafts.
+Source cleanup reconciles the existing accepted receipt against authoritative
+scheduled deliveries, then retains successful evidence in the existing SQLite
+intelligence ledger keyed by the exact media, copy, creator and decision state.
+Changed or reopened work invalidates that evidence. Missing/mismatched/simulated
+readback fails closed. Shared sources and active work remain protected; preview
+caches retain their separate 48-hour completion clock. Operators can restrict the
+existing cleanup sweep to exact paths without weakening its eligibility checks.
+
 Fresh YouTube intake passes through `schedule_route_gate`, installed by both web
 entry points. That wrapper must persist `review_interface=website` too; changing
 only the underlying Telegram intake does not affect its intercepted requests.
