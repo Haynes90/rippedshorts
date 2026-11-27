@@ -4733,7 +4733,7 @@ def _path_is_under(path: Path, parents: set[Path]) -> bool:
 def _source_cache_eligibility(active_dirs=None):
     """Durable completion clock across all requests sharing a local source."""
     from production_intelligence import record, identity
-    from batch_progress import summarize, selected_assets
+    from batch_progress import reconcile_completion, selected_assets
     stamp=datetime.now(timezone.utc).timestamp()
     with _telegram_db() as db:
         rows=db.execute('SELECT request_id,status,state_json FROM telegram_requests').fetchall()
@@ -4742,7 +4742,7 @@ def _source_cache_eligibility(active_dirs=None):
         state=json.loads(row['state_json'])
         explicit=bool(state.get('source_cache_closed_at') and state.get('source_cache_closure_actor'))
         assets=selected_assets(row['request_id'],state)
-        complete=bool(assets and all(a.get('completed') for a in summarize(row['request_id'],state)['clips']))
+        complete=bool(assets and all(a.get('completed') for a in reconcile_completion(row['request_id'],state)['clips']))
         pending=any(v.get('choice')=='request_adjustment' for v in (state.get('website_clip_reviews') or {}).values())
         if state.get('preview_first_version')==1:
             for lane,(key,_) in __import__('render_recovery').LANES.items():
@@ -4779,6 +4779,7 @@ def _purge_expired_local_artifacts(
     *,
     retention_hours: int | None = None,
     emergency: bool = False,
+    paths: set[Path] | None = None,
 ) -> int:
     """Reclaim local cache while preserving the database and active job sources."""
     configured = int(os.getenv("LOCAL_ARTIFACT_RETENTION_HOURS", "12"))
@@ -4826,8 +4827,11 @@ def _purge_expired_local_artifacts(
             protect_preview_url((record.get('clip') or {}).get('clip_url') or (record.get('clip') or {}).get('segment_url'))
     preview_cutoff=datetime.now(timezone.utc).timestamp()-48*3600
     candidates: list[Path] = []
+    paths = {p.resolve() for p in paths} if paths is not None else None
     for path in data_dir.rglob("*"):
         try:
+            if paths is not None and path.resolve() not in paths:
+                continue
             if not path.is_file() or path.resolve() in protected_files:
                 continue
             if path.name in {DB_PATH.name + "-wal", DB_PATH.name + "-shm"}:
@@ -4870,6 +4874,8 @@ def _purge_expired_local_artifacts(
 
     for path in sorted((p for p in data_dir.rglob("*") if p.is_dir()), reverse=True):
         try:
+            if paths is not None and not any(_path_is_under(target, {path.resolve()}) for target in paths):
+                continue
             if _path_is_under(path, protected_dirs):
                 continue
             if path != data_dir and not any(path.iterdir()):

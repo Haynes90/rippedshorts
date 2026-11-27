@@ -1263,8 +1263,8 @@ def workflow_status(token: str):
     return _workflow_result(session['request_id'],state)
 
 
-def _workflow_result(request_id, state):
-    from workflow_test_status import project
+def _scheduler_readback(request_id, state):
+    """Existing authenticated GET, shared with completion-based source cleanup."""
     scheduler=None
     target=(os.getenv('SCHEDULE_MASTER_INTERNAL_URL') or os.getenv('SCHEDULE_MASTER_URL') or '').strip().rstrip('/')
     secret=os.getenv('SCHEDULE_MASTER_SHARED_SECRET','').strip()
@@ -1280,7 +1280,12 @@ def _workflow_result(request_id, state):
             # Do not show stale permission/preflight success while downstream is unavailable.
             scheduler={**((state.get('schedule_master') or {}).get('shorts_response') or {}),
                 'publishing_globally_paused':None,'delivery_validation':{'status':'BLOCKED','reason':'SCHEDULER_STATUS_UNAVAILABLE'}}
-    result=project(request_id,state,state.get('creator_approval'),scheduler)
+    return scheduler
+
+
+def _workflow_result(request_id, state):
+    from workflow_test_status import project
+    result=project(request_id,state,state.get('creator_approval'),_scheduler_readback(request_id,state))
     if state.get('source_intelligence'):
         from production_intelligence import analysis_status
         result['source_analyses']=analysis_status(state['source_intelligence']['map_id'])
