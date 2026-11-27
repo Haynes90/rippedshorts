@@ -2,6 +2,8 @@ name: Stored transcript render regression
 on:
   pull_request:
     paths:
+      - 'schedule_route_gate.py'
+      - 'tests/test_intake_brand_context.py'
       - 'mobile_review_ui.py'
       - 'tests/test_mobile_review_portal.py'
       - 'clip_completion.py'

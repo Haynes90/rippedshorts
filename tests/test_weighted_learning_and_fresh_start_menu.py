@@ -5,9 +5,10 @@ GATE=(ROOT/"schedule_route_gate.py").read_text(encoding="utf-8")
 INTAKE=(ROOT/"telegram_intake.py").read_text(encoding="utf-8")
 
 
-def test_reviewed_shorts_menu_offers_fresh_start():
-    assert "🧼 Fresh Start — Keep Learning" in GATE
-    assert "rs:fresh_start:{request_id}" in GATE
+def test_route_gate_cannot_reintroduce_retired_review_menus():
+    assert 'rs:fresh_start:' not in GATE and 'rs:rerip:' not in GATE
+    assert 'rs:reuse:' not in GATE
+    assert 'state["review_interface"] = "website"' in GATE
 
 
 def test_short_learning_uses_weighted_wins_and_losses():

@@ -1,5 +1,15 @@
 # Mobile review: focused refresh correction
 
+Fresh YouTube intake passes through `schedule_route_gate`, installed by both web
+entry points. That wrapper must persist `review_interface=website` too; changing
+only the underlying Telegram intake does not affect its intercepted requests.
+Explicit owner brand context is resolved against active Show Config rows, either
+from the authenticated intake's `show_id` or a named `TCB:`/`TDOG:` message. Source
+channel identity is never fabricated from the chosen destination. Unknown source
+channels retain the existing route-choice gate. Route selection is intake routing,
+not clip approval, and cannot authorize scheduling. The wrapper no longer generates
+retired re-rip/reuse controls; existing processor source/history reuse remains.
+
 The existing caption save, clip decision, player and approval APIs remain authoritative.
 Approving a clip now appends its existing copy editor instead of reloading the page.
 Polling appends newly available rendered cards without replacing active players or inputs.

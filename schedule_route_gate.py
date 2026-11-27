@@ -126,47 +126,9 @@ def _ask_for_route(chat_id: str, request_id: str, parsed: dict[str, Any], channe
 
 def _resume_after_route(request_id: str, chat_id: str, state: dict[str, Any], background_tasks) -> dict[str, Any]:
     parsed = state.get("parsed") or {}
-    try:
-        prior_shorts = ti._reviewed_short_history_from_sheet(parsed.get("video_id", ""))
-    except Exception:
-        ti.logger.exception("Could not check prior Shorts history after route resolution")
-        prior_shorts = []
-
-    if prior_shorts:
-        state["stage"] = "awaiting_rerip_choice"
-        state["prior_reviewed_short_count"] = len(prior_shorts)
-        ti._save(request_id, "awaiting_rerip_choice", state)
-        ti.telegram(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": (
-                    f"♻️ YouTube ID {parsed.get('video_id', '')} already has "
-                    f"{len(prior_shorts)} reviewed Short(s).\n\n"
-                    "Do you want to re-rip the Shorts using everything learned "
-                    "from your approvals and rejections?"
-                ),
-                "reply_markup": {
-                    "inline_keyboard": [
-                        [
-                            {"text": "♻️ Re-rip Shorts", "callback_data": f"rs:rerip:{request_id}"},
-                            {"text": "▶️ Use Existing", "callback_data": f"rs:reuse:{request_id}"},
-                        ],
-                        [{
-                            "text": "🧼 Fresh Start — Keep Learning",
-                            "callback_data": f"rs:fresh_start:{request_id}",
-                        }],
-                    ]
-                },
-            },
-        )
-        return {
-            "status": "awaiting_rerip_choice",
-            "request_id": request_id,
-            "reviewed_shorts": len(prior_shorts),
-            "show_id": state.get("show_id", ""),
-        }
-
+    # Reuse/history checks belong to the existing processor, not an obsolete
+    # Telegram re-rip selection branch. Review stays on the website.
+    state["review_interface"] = "website"
     state["stage"] = "accepted"
     ti._save(request_id, "accepted", state)
     ti.send(
@@ -266,20 +228,30 @@ def _handle_new_youtube(
     channel_id = ""
     route = None
     route_error = ""
-    try:
-        channel_id = _youtube_channel_id(str(parsed.get("source_value") or ""))
-        route = _route_by_channel(channel_id)
-    except Exception as exc:
-        route_error = str(exc)
-        ti.logger.warning("YouTube route lookup unavailable; asking Telegram for route: %s", exc)
+    explicit_show = str(update.get("show_id") or "").strip() if trusted_source else ""
+    named_show = re.match(r"^(TCB|TDOG|AGAPE_CHURCH)\s*:?\s+", text, re.I)
+    if not explicit_show and named_show:
+        explicit_show = named_show.group(1)
+    if explicit_show:
+        route = _route_by_show_id(explicit_show)
+        if not route:
+            return {"status": "invalid_route", "show_id": explicit_show}
+    else:
+        try:
+            channel_id = _youtube_channel_id(str(parsed.get("source_value") or ""))
+            route = _route_by_channel(channel_id)
+        except Exception as exc:
+            route_error = str(exc)
+            ti.logger.warning("YouTube route lookup unavailable; asking Telegram for route: %s", exc)
 
     state = {
         "stage": "accepted" if route else "awaiting_route",
         "parsed": parsed,
         "message_id": message.get("message_id"),
+        "review_interface": "website",
         "youtube_channel_id": channel_id,
         "route_status": "resolved" if route else "pending",
-        "route_source": "youtube_channel_id" if route else "telegram_required",
+        "route_source": ("authenticated_intake" if trusted_source and update.get("show_id") else "owner_message") if explicit_show else "youtube_channel_id" if route else "telegram_required",
         "route_lookup_error": route_error,
     }
     if route:
