@@ -179,7 +179,7 @@ def saved_mapping(state):
 
 def observe(request_id, state):
     """SQLite first. Sheets errors are retained and retried on subsequent progress."""
-    if str(state.get('show_id') or '').upper() not in {'TCB','TDOG'}:
+    if not str(state.get('show_id') or '').strip():
         return
     intelligence.feedback_snapshot(request_id, state)
 

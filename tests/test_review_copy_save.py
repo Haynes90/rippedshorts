@@ -44,8 +44,7 @@ def test_complete_post_roundtrip_preserves_selected_media_and_exact_copy(editor,
 
 def test_old_callback_limit_cannot_fail_committed_website_save(editor):
     r=editor;base='/api/ripped-shorts/review/'+r['token']
-    _,markup=r['tg']._copy_review_payload('x'*80,read_state(r)['copy_drafts'],0)
-    assert any(len(b.get('callback_data','').encode())>64 for line in markup['inline_keyboard'] for b in line)
+    assert not hasattr(r['tg'],'_copy_review_payload')
     response=r['client'].post(base+'/asset/0',json={'social_caption':'Saved without a Telegram menu','action':'save'})
     assert response.status_code==200 and read_state(r)['copy_drafts'][0]['social_caption']=='Saved without a Telegram menu'
     r['tg']._refresh_copy_review.assert_not_called()

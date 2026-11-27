@@ -86,7 +86,7 @@ def test_actual_render_completion_gate_isolates_clip_failure_but_holds_shared_fa
     fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_notify_render_queue_complete')
     submit=Mock()
     ns={'_LOCK':threading.RLock(),'_telegram_db':connect,'json':json,'Any':object,'now':lambda:'now',
-        '_save':Mock(),'os':os,'telegram':Mock(),'send':Mock(),
+        '_save':Mock(),'os':os,'telegram':Mock(),'send':Mock(),'_website_navigation':Mock(),
         'RENDER_EXECUTOR':SimpleNamespace(submit=submit),'_handoff_shorts_to_schedule_master':Mock()}
     exec(compile(ast.Module(body=[fn],type_ignores=[]),'real-render-gate','exec'),ns)
     ns[fn.name]('job','chat')

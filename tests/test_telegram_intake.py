@@ -157,7 +157,7 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("/resume(?:@rippedshortsbot)?", SOURCE)
         self.assertIn("def _update_status_card", SOURCE)
         self.assertIn("editMessageText", SOURCE)
-        self.assertIn("TELEGRAM_CANDIDATES_PER_PAGE", SOURCE)
+        self.assertNotIn("TELEGRAM_CANDIDATES_PER_PAGE", SOURCE)
         self.assertIn("/api/ripped-shorts/readiness", SOURCE)
         self.assertIn("/api/ripped-shorts/smoke-test", SOURCE)
         self.assertIn("RIPPED_SHORTS_READINESS", SOURCE)
@@ -219,16 +219,6 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertNotEqual(result[0]["start"], 0)
         self.assertNotEqual(result[0]["end"], 540)
 
-    def test_16_9_waits_for_explicit_shorts_confirmation(self):
-        import telegram_intake as tg
-        state={'candidate_reviews':{},'topic_reviews':{}}
-        _,markup=tg._short_control_payload('existing',{'mode':'both'},state)
-        buttons=[b for row in markup['inline_keyboard'] for b in row]
-        self.assertTrue(any(b.get('callback_data')=='rs:shorts_confirm:existing' for b in buttons))
-        self.assertNotIn('shorts_confirmed_at',state)
-        state['shorts_confirmed_at']='human-confirmed'
-        _,after=tg._short_control_payload('existing',{'mode':'both'},state)
-        self.assertFalse(any(b.get('callback_data')=='rs:shorts_confirm:existing' for row in after['inline_keyboard'] for b in row))
 
     def test_completed_short_selection_hands_off_to_schedule_master(self):
         self.assertIn("def _handoff_shorts_to_schedule_master", SOURCE)
@@ -241,44 +231,16 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn('_persist_schedule_outbox(payload, "ACCEPTED")', SOURCE)
         self.assertIn('_persist_schedule_outbox(payload, "RETRY")', SOURCE)
 
-    def test_short_review_uses_one_reusable_page_and_control_card(self):
-        self.assertIn("def _refresh_short_review_message", SOURCE)
-        self.assertIn('"short_review_message_id"', SOURCE)
-        self.assertIn('"short_control_message_id"', SOURCE)
-        self.assertIn("rs:shorts_page:", SOURCE)
-        self.assertIn("Rendering continues in the background", SOURCE)
 
-    def test_edited_caption_stays_visible_as_final_reviewed_copy(self):
-        from acceptance_fixtures import copy_review_fixture
-        with copy_review_fixture() as f:
-            f.reply();state=f.read()
-            text,_=f.tg._copy_review_payload('first',state['copy_drafts'],state['copy_review_index'])
-            self.assertIn('EDITED FINAL COPY',text)
-            self.assertIn('My exact edited wording\n\nSecond paragraph.',text)
-            self.assertEqual(state['copy_review_index'],0)
 
     def test_copy_reply_uses_durable_prompt_session_before_group_filter(self):
         self.assertIn("CREATE TABLE IF NOT EXISTS telegram_copy_inputs", SOURCE)
         self.assertIn("WHERE prompt_message_id=? AND chat_id=? AND user_id=?", SOURCE)
-        self.assertIn("INSERT OR REPLACE INTO telegram_copy_inputs", SOURCE)
-        self.assertIn("COPY_REPLY_APPLIED", SOURCE)
+        self.assertNotIn("INSERT OR REPLACE INTO telegram_copy_inputs", SOURCE)
+        self.assertIn("website_review_required", SOURCE)
 
-    def test_copy_reply_accepts_review_card_or_single_pending_edit(self):
-        self.assertIn("candidate_matches = []", SOURCE)
-        self.assertIn("reply_to_message_id in {prompt_id, review_id}", SOURCE)
-        self.assertIn("len(candidate_matches) == 1", SOURCE)
 
-    def test_copy_edit_is_checkpointed_before_success_confirmation(self):
-        self.assertIn("def _checkpoint_copy_edit(", SOURCE)
-        self.assertIn("COPY_EDIT_CHECKPOINTED", SOURCE)
-        self.assertIn("for checkpoint_attempt in range(1, 4)", SOURCE)
-        self.assertIn('"confirmation": "saved_and_checkpointed"', SOURCE)
-        self.assertIn("durable copy sheet is ready for Schedule Master", SOURCE)
 
-    def test_copy_checkpoint_failure_keeps_same_edit_route_open(self):
-        self.assertIn('latest_state["awaiting_copy_input"] = waiting', SOURCE)
-        self.assertIn('"status": "copy_checkpoint_failed"', SOURCE)
-        self.assertIn("You are still on this same caption", SOURCE)
 
     def test_schedule_handoff_prefers_durable_caption_checkpoint(self):
         import telegram_intake as tg
@@ -288,36 +250,9 @@ class TelegramParsingTests(unittest.TestCase):
             resolved=tg._caption_learning_checkpoint_map('r')
         self.assertEqual(resolved['a']['social_caption'],'Exact owner wording')
 
-    def test_copy_reply_always_confirms_saved_edit(self):
-        self.assertIn("confirmation_done = False", SOURCE)
-        self.assertIn("reply_to_message_id", SOURCE)
-        self.assertIn('"confirmation": "saved_and_checkpointed"', SOURCE)
-        self.assertIn("last_copy_edit_saved_at", SOURCE)
 
-    def test_copy_reply_is_bound_to_exact_prompt_and_preserves_route(self):
-        from acceptance_fixtures import copy_review_fixture
-        with copy_review_fixture() as f:
-            result=f.reply('100')
-            self.assertEqual(result['status'],'copy_updated')
-            self.assertEqual(f.read()['copy_drafts'][0]['social_caption'],'My exact edited wording\n\nSecond paragraph.')
-            self.assertEqual(f.read('second')['copy_drafts'][0]['social_caption'],'Original second')
-            self.assertEqual(f.read()['route_source'],'owner')
-            self.assertEqual(f.checkpoints[0][1]['copy_drafts'][0]['copy_status'],'edited')
 
-    def test_copy_reply_updates_existing_prompt_instead_of_sending_status_spam(self):
-        from acceptance_fixtures import copy_review_fixture
-        with copy_review_fixture() as f:
-            f.reply()
-            methods=[call.args[0] for call in f.telegram.call_args_list]
-            self.assertNotIn('sendMessage',methods)
-            self.assertGreaterEqual(methods.count('editMessageText'),2)
-            self.assertTrue(any(call.args[1].get('message_id')=='100' for call in f.telegram.call_args_list))
 
-    def test_copy_review_uses_one_reusable_message(self):
-        self.assertIn("def _refresh_copy_review", SOURCE)
-        self.assertIn('"copy_review_message_id"', SOURCE)
-        self.assertIn("rs:copy_page:", SOURCE)
-        self.assertIn("✅ Finish & Schedule", SOURCE)
 
     def test_16_9_runs_semantic_fallback_when_long_pass_is_empty(self):
         self.assertIn("semantic_fallback: bool = False", SOURCE)
@@ -358,13 +293,9 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn("max(180.0, float(minimum_seconds))", SOURCE)
         self.assertIn('TOPIC_SEGMENT_MIN_SECONDS", "180"', SOURCE)
 
-    def test_topic_review_uses_one_reusable_message(self):
-        self.assertIn("def _refresh_topic_review", SOURCE)
-        self.assertIn('"topic_review_message_id"', SOURCE)
-        self.assertIn("rs:topic_page:", SOURCE)
 
     def test_schedule_now_waits_for_both_render_lanes(self):
-        self.assertIn("rs:schedule_now:", SOURCE)
+        self.assertNotIn("rs:schedule_now:", SOURCE)
         self.assertIn('"schedule_requested_at"', SOURCE)
         notify_source = ast.get_source_segment(
             SOURCE,
@@ -407,28 +338,12 @@ class TelegramParsingTests(unittest.TestCase):
         self.assertIn('"video_description"', SOURCE)
         self.assertIn("BRAND RULE", SOURCE)
 
-    def test_short_caption_keeps_hashtags_separate_and_clean(self):
-        from acceptance_fixtures import copy_review_fixture
-        with copy_review_fixture() as f:
-            f.reply();draft=f.read()['copy_drafts'][0]
-            self.assertEqual(draft['hashtags'],'#Plants')
-            self.assertNotIn('#Plants',draft['social_caption'])
-            self.assertEqual(f.tg._normalize_hashtags('["#Plants", "#Seeds"]'),'#Plants #Seeds')
-            text,_=f.tg._copy_review_payload('first',[draft],0)
-            self.assertIn(draft['social_caption'],text)
-            self.assertNotIn('Hook:',text)
 
-    def test_schedule_now_requires_copy_review(self):
-        self.assertIn('"copy_review_requested_at"', SOURCE)
-        self.assertIn("rs:copy_edit_caption:", SOURCE)
-        self.assertIn("rs:copy_edit_title:", SOURCE)
-        self.assertIn("rs:copy_edit_description:", SOURCE)
-        self.assertIn("rs:copy_finish:", SOURCE)
 
     def test_copy_edits_are_saved_as_learning_examples(self):
         self.assertIn("Caption Learning", SOURCE)
         self.assertIn('"EDITED" if edited else "ACCEPTED"', SOURCE)
-        self.assertIn('"user_edited"] = True', SOURCE)
+        self.assertIn("def _log_copy_learning", SOURCE)
         self.assertIn("PAST AI-TO-FINAL EXAMPLES", SOURCE)
 
     def test_existing_clipmaster_chat_is_reused(self):

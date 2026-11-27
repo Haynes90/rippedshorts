@@ -13,7 +13,7 @@ def test_fresh_start_creates_new_request_and_preserves_learning():
     assert '"approval_learning_preserved": True' in SOURCE
     assert '"supersedes_request_id": request_id' in SOURCE
     assert 'old_state["superseded_by_request_id"] = new_request_id' in SOURCE
-    assert '"🧼 Fresh Start — Keep Learning"' in SOURCE
+    assert 'rs:fresh_start:' not in SOURCE
     assert 'r"/fresh-start' in SOURCE
 
 

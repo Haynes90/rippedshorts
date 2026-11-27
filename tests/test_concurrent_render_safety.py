@@ -30,7 +30,8 @@ def test_approvals_use_bounded_pool_and_are_idempotent():
     source = (ROOT / "telegram_intake.py").read_text()
     assert "RIPPED_SHORTS_RENDER_WORKERS" in source
     assert "RENDER_EXECUTOR.submit(renderer, request_id, index, chat_id, render_ticket=ticket)" in source
-    assert 'existing_status in {"queued", "rendering", "rendered", "render_failed"}' in source
+    assert 'ticket, reason = prepare_queue(request_id, lane, index)' in source
+    assert 'if ticket is None:' in source
     assert '"status": "rendering"' in source
 
 
@@ -47,8 +48,7 @@ def test_telegram_updates_workspace_instead_of_spamming_render_messages():
     assert "def _refresh_short_review_message" in source
     assert "def _send_short_confirmation" in source
     assert "def _refresh_topic_review" in source
-    assert "Current Ripped Shorts render queue complete" in source
-    assert "drive.google.com/drive/folders/" in source
+    assert "_website_navigation(request_id)" in source
 
 
 def test_telegram_reports_dynamic_aggregate_progress():
@@ -107,14 +107,10 @@ def test_quality_selector_does_not_pad_to_a_review_quota():
     assert select_non_overlapping([],limit=20)==[]
 
 
-def test_telegram_uses_short_not_candidate_label():
+def test_telegram_no_longer_builds_individual_clip_controls():
     import telegram_intake as tg
-    state={'result':{'segments':[{'start':10,'end':30,'duration':20,'candidate_number':9,'transcript':'Approved full thought.'}]},'candidate_reviews':{}}
-    text,markup=tg._short_review_page_payload('existing',state,1)
-    assert 'SHORT 9' in text and 'Approved full thought.' in text
-    buttons=[b for row in markup['inline_keyboard'] for b in row]
-    assert any(b.get('callback_data')=='rs:approve:existing:0' for b in buttons)
-    assert state['candidate_reviews']=={}
+    assert not hasattr(tg,'_short_review_page_payload')
+    assert not hasattr(tg,'_topic_review_payload')
 
 
 def test_opencv_speaker_tracking_and_center_fallback():
@@ -129,12 +125,10 @@ def test_opencv_speaker_tracking_and_center_fallback():
     assert "def _stepped_crop_expression" in source
 
 
-def test_repeat_video_prompts_for_rerip_choice():
-    source = (ROOT / "telegram_intake.py").read_text()
-    assert "awaiting_rerip_choice" in source
-    assert "Do you want to re-rip the Shorts" in source
-    assert "rs:rerip:{request_id}" in source
-    assert "rs:reuse:{request_id}" in source
+def test_repeat_video_keeps_reuse_backend_without_review_callbacks():
+    source = (ROOT / "telegram_intake.py").read_text(encoding="utf-8")
+    assert 'def _reusable_youtube_job' in source
+    assert 'rs:rerip:' not in source and 'rs:reuse:' not in source
 
 
 def test_short_selection_uses_sheet_approval_learning():
@@ -205,8 +199,8 @@ def test_semantic_highlights_leave_weak_gaps_and_keep_minimum():
 def test_horizontal_segments_have_separate_review_and_renderer():
     intake = (ROOT / "telegram_intake.py").read_text()
     main = (ROOT / "main.py").read_text()
-    assert "Approve 16:9" in intake
-    assert "rs:topic_approve:" in intake
+    assert 'rs:topic_approve:' not in intake
+    assert 'def _send_topic_candidates' in intake
     assert "def _render_topic_approved" in intake
     assert "def create_topic_segment_file" in main
     assert 'f"{video_id}_Segment_{segment_number}.mp4"' in main
