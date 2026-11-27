@@ -494,7 +494,7 @@ def candidate_records(mapping, lane, result, context):
 def feedback_snapshot(request_id, state):
     """Observe saved decisions; never overwrite the request or its approval revisions."""
     brand = str(state.get('show_id') or '').upper()
-    if brand not in {'TCB', 'TDOG'}:
+    if not brand:
         return
     for lane, key, review_key in [('9:16','result','candidate_reviews'), ('16:9','topic_result','topic_reviews')]:
         for index, clip in enumerate((state.get(key) or {}).get('segments') or []):
@@ -524,7 +524,7 @@ def feedback_snapshot(request_id, state):
 
 
 def record_edits(request_id,state,result,instruction,reviewer):
-    if str(state.get('show_id') or '').upper() not in {'TCB','TDOG'}:
+    if not str(state.get('show_id') or '').strip():
         return
     lane='9:16' if result.get('lane')=='short' else '16:9'
     def references(items):

@@ -291,3 +291,18 @@ def test_sheet_schema_conflict_holds_projection_not_processing(db,timeline):
     service=FakeSheets();service.tabs[pi.SHEET_TABS['source']]=[['unrelated schema']]
     with pytest.raises(ValueError,match='schema mismatch'):pi.sync_sheets(service,'isolated')
     assert pi.topic_map(SOURCE,timeline,Mock(side_effect=AssertionError()))==result
+
+
+@pytest.mark.parametrize('brand',['AGAPE_CHURCH','OTHER_SHOW'])
+def test_each_brand_feedback_influences_future_ranking_without_cross_brand_leak(db,brand):
+    import intelligence_workflow as workflow
+    workflow.observe('retained-approval',state('approved',brand))
+    source={**SOURCE,'brand_id':brand,'show_id':brand}
+    context=pi.learning_context(source,'9:16')
+    result=pi.rank_with_evidence({'segments':[{'category':'education','score':84},{'category':'humor','score':84}]},context)
+    assert result['segments'][0]['category']=='humor'
+    assert context['examples'][0]['evidence_id']
+    assert not pi.learning_context(SOURCE,'9:16')['examples']
+    edit={'lane':'short','action':'end_later','before':[{'start':10,'end':20}],'after':[{'start':10,'end':25}]}
+    pi.record_edits('retained-edit',state('approved',brand),edit,'Include the full answer.','owner')
+    assert any(e['boundary_changes'] for e in pi.learning_context(source,'9:16')['examples'])

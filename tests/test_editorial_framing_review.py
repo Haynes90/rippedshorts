@@ -98,7 +98,7 @@ def test_notification_receipts_dedupe_renew_and_uncertain_no_resend(review):
     payload=r['telegram'].call_args.args[1]
     assert payload['chat_id']=='saved-chat'
     button=payload['reply_markup']['inline_keyboard'][0][0]
-    assert button['text']=='🌐 Open Clip Review' and '?stage=editorial#editorial' in button['url']
+    assert button['text']=='Review Clips' and '?stage=editorial#editorial' in button['url']
     with r['storage'].connect() as db:
         db.execute('UPDATE copy_review_sessions SET expires_at="2020-01-01T00:00:00+00:00"')
     assert r['navigation'].notify('existing','editorial','revision')['status']=='delivered'

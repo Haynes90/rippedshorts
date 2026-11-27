@@ -284,7 +284,7 @@ def test_degraded_candidates_reach_existing_request_specific_telegram_website_on
     payload=telegram.call_args.args[1]
     assert payload['chat_id']=='saved-chat'
     button=payload['reply_markup']['inline_keyboard'][0][0]
-    assert button['text']=='🌐 Open Clip Review' and '?stage=shorts' in button['url']
+    assert button['text']=='Review Clips' and '?stage=shorts' in button['url']
     url=urlsplit(button['url']);token=url.path.rsplit('/',1)[-1]
     app=FastAPI();app.include_router(web.router)
     with TestClient(app) as client:

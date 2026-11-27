@@ -7,7 +7,7 @@ MAIN=(Path(__file__).resolve().parents[1]/"main.py").read_text(encoding="utf-8")
 
 def test_missing_render_action_uses_saved_request_selection():
     assert "def _queue_missing_approved_renders(" in INTAKE
-    assert '"♻️ Retry Missing Renders"' in INTAKE
+    assert 'rs:retry_missing:' not in INTAKE
     assert 'r"/render-missing' in INTAKE
 
 

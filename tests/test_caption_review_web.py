@@ -22,10 +22,11 @@ def test_review_session_is_temporary_but_saved_copy_is_durable():
     assert "_notify_render_queue_complete" in PORTAL
 
 
-def test_telegram_exposes_mobile_review_without_removing_existing_controls():
-    assert "🌐 Open Mobile Copy Review" in TELEGRAM
-    assert "review_url_for_request(request_id)" in TELEGRAM
-    assert "✅ Finish & Schedule" in TELEGRAM
+def test_telegram_directs_review_to_website_without_competing_controls():
+    assert 'def _website_navigation' in TELEGRAM
+    assert 'from review_navigation import notify_safely' in TELEGRAM
+    assert 'Finish & Schedule' not in TELEGRAM
+    assert 'rs:copy_finish:' not in TELEGRAM
 
 
 def test_mobile_page_groups_source_and_copy_assets():

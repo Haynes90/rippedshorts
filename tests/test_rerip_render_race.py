@@ -3,10 +3,9 @@ from pathlib import Path
 SOURCE=(Path(__file__).resolve().parents[1]/"telegram_intake.py").read_text(encoding="utf-8")
 
 
-def test_duplicate_rerip_reuse_is_blocked_while_rebuilding():
-    assert "RERIP_REUSE_IGNORED_ALREADY_PROCESSING" in SOURCE
-    assert 'state["rebuild_in_progress"] = True' in SOURCE
-    assert '"status": "already_processing"' in SOURCE
+def test_duplicate_rerip_buttons_have_no_active_execution_path():
+    assert 'RERIP_REUSE_IGNORED_ALREADY_PROCESSING' not in SOURCE
+    assert 'rs:rerip:' not in SOURCE and 'rs:reuse:' not in SOURCE
 
 
 def test_old_render_buttons_do_not_fail_when_result_is_missing():

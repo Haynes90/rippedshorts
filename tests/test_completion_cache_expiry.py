@@ -20,14 +20,15 @@ def owned(passage,monkeypatch):
 
 
 @pytest.mark.parametrize('emergency',[False,True])
-def test_old_source_expiry_starts_at_completion_and_emergency_cannot_shorten_it(owned,emergency):
+def test_verified_closed_source_released_immediately_but_preview_retained_48_hours(owned,emergency):
     p,tg,source,clock=owned
+    preview=source.parent/'previews'/'retained.mp4';preview.parent.mkdir();preview.write_bytes(b'verified local preview')
     tg._purge_expired_local_artifacts(retention_hours=12,emergency=emergency)
-    assert source.exists()
-    clock[0]+=timedelta(hours=2);tg._purge_expired_local_artifacts(retention_hours=12,emergency=emergency)
-    assert source.exists()
-    clock[0]+=timedelta(hours=11);tg._purge_expired_local_artifacts(retention_hours=12,emergency=emergency)
-    assert not source.exists()
+    assert not source.exists() and preview.exists()
+    clock[0]+=timedelta(hours=47);tg._purge_expired_local_artifacts(emergency=emergency)
+    assert preview.exists()
+    clock[0]+=timedelta(hours=2);tg._purge_expired_local_artifacts(emergency=emergency)
+    assert not preview.exists()
 
 
 def test_shared_unresolved_request_and_reopened_work_reset_the_clock(owned):

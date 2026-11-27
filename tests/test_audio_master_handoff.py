@@ -43,3 +43,33 @@ class TimelineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_rich_transcript_preserved_and_only_measured_times_rebased(tmp_path):
+    import json, copy
+    from audio_master_handoff import parse_transcript, normalize_sermon
+    words=[{'word':'Save','start':100.,'end':101.,'speaker':'pastor'}, {'word':'seeds.','start':101.,'end':102.,'speaker':'pastor'}]
+    segment={'start':100.,'end':110.,'text':'Save seeds.', 'speaker':'pastor','words':words,
+             'sentences':[{'start':100.,'end':102.,'text':'Save seeds.'}], 'timing_basis':'provider_word_timing'}
+    before=copy.deepcopy(segment);path=tmp_path/'retained.json';path.write_text(json.dumps({'segments':[segment]}),encoding='utf-8')
+    parsed=parse_transcript(path)
+    assert parsed==[segment]
+    manifest={'sermon_start_seconds':100,'sermon_end_seconds':170,'transcript_timeline':'original_service'}
+    result=normalize_sermon(parsed,manifest)[0]
+    assert result['speaker']=='pastor' and result['timing_basis']=='provider_word_timing'
+    assert [(w['start'],w['end']) for w in result['words']]==[(0.,1.),(1.,2.)]
+    assert result['sentences'][0]['start']==0 and result['sentences'][0]['end']==2
+    assert segment==before
+    relative=normalize_sermon([result],{**manifest,'transcript_timeline':'sermon_relative'})[0]
+    assert relative['words']==result['words']
+
+
+def test_boundary_overlap_retains_original_evidence_and_requires_review():
+    from audio_master_handoff import normalize_sermon
+    source={'start':99.,'end':103.,'text':'Keep the full thought.', 'speaker':'pastor',
+            'words':[{'word':'Keep','start':99.,'end':100.5},{'word':'the','start':100.6,'end':101.}, {'word':'thought.','start':101.,'end':103.}]}
+    result=normalize_sermon([source],{'sermon_start_seconds':100,'sermon_end_seconds':170,'transcript_timeline':'original_service'})[0]
+    assert result['needs_review'] and result['source_words']==source['words']
+    assert result['source_segment_bounds']==[99.,103.]
+    assert abs(result['words'][0]['start']-.6)<1e-8
+    assert result['text']==source['text'] and result['speaker']=='pastor'

@@ -113,7 +113,12 @@ def parse_transcript(path: Path) -> list[dict]:
                     continue
                 start = float(item.get("start", item.get("start_seconds", 0)))
                 end = float(item.get("end", item.get("end_seconds", start + float(item.get("duration", 0)))))
-                result.append({"start": start, "end": end, "text": str(item["text"]).strip()})
+                segment = {**item, "start": start, "end": end, "text": str(item["text"]).strip()}
+                if not segment.get('words') and isinstance(value, dict) and value.get('words'):
+                    from transcript_timing import normalize_words
+                    words, _ = normalize_words(value['words'])
+                    segment['words'] = [w for w in words if w['start'] >= start and w['end'] <= end]
+                result.append(segment)
             if result:
                 return result
     except (json.JSONDecodeError, ValueError, TypeError):
@@ -144,7 +149,20 @@ def normalize_sermon(segments: list[dict], manifest: dict) -> list[dict]:
         local_start = max(0.0, local_start)
         local_end = min(end - start, local_end)
         if local_end > local_start:
-            selected.append({"start": round(local_start, 3), "end": round(local_end, 3), "duration": round(local_end-local_start, 3), "text": segment["text"]})
+            normalized = {**segment, "start": round(local_start, 3), "end": round(local_end, 3), "duration": round(local_end-local_start, 3)}
+            offset = 0.0 if relative else -start
+            for field, text_field in [('words', 'word'), ('sentences', 'text')]:
+                if segment.get(field):
+                    from transcript_timing import _rows
+                    evidence, _ = _rows(segment[field], text_field)
+                    normalized[field] = [{**item, 'start': item['start'] + offset, 'end': item['end'] + offset}
+                                         for item in evidence if item['start'] + offset >= 0 and item['end'] + offset <= end-start]
+                    if len(normalized[field]) != len(evidence):
+                        normalized['needs_review'] = True
+                        normalized['source_' + field] = evidence
+            if local_start != seg_start + offset or local_end != seg_end + offset:
+                normalized.update(needs_review=True, source_segment_bounds=[seg_start, seg_end])
+            selected.append(normalized)
     if not selected:
         raise RuntimeError("Existing transcript has no segments inside the approved sermon timeline")
     return selected
