@@ -659,6 +659,16 @@ def sync_sheets(service, sheet_id):
                 safe['record_id'],safe['schema_version'],safe['kind'] = row['record_id'], VERSION, kind
                 safe['evidence_json'] = encoded({k:v for k,v in safe.items() if k not in SHEET_COLUMNS})
                 values = [encoded(safe[k]) if isinstance(safe.get(k),(dict,list)) else (safe.get(k) if safe.get(k) is not None else '') for k in SHEET_COLUMNS]
+                # Sheets is a projection, not the evidence store. A large
+                # diagnostic must not reject the entire supported-record batch.
+                # Retain the original payload/digest in SQLite and project an
+                # explicit verifiable reference instead of silently truncating.
+                values = [encoded({'retained_in':'SQLite intelligence_records',
+                    'record_id':row['record_id'],'field':column,
+                    'sha256':hashlib.sha256(value.encode('utf-8')).hexdigest(),
+                    'characters':len(value)})
+                    if isinstance(value,str) and len(value.encode('utf-16-le'))//2>49000 else value
+                    for column,value in zip(SHEET_COLUMNS,values)]
                 index = keys.get(row['record_id'],len(rows)+1)
                 if index>10000:
                     raise ValueError('Intelligence projection capacity reached; SQLite records retained')

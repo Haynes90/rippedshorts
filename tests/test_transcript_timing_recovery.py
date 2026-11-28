@@ -146,6 +146,16 @@ def test_word_in_provider_gap_is_preserved_with_its_actual_timing():
     assert result[1]['start']==2 and result[1]['end']==2.5
 
 
+def test_word_at_exact_provider_end_is_not_a_zero_length_timeline_unit():
+    from transcript_timing import attach_timed_words
+    from production_intelligence import normalize_transcript
+    word=dict(word='world',start=62.68000030517578,end=62.68000030517578)
+    result=attach_timed_words([dict(text='The world.',start=60,end=word['end'])],[word])
+    assert len(result)==1 and result[0]['words']==[word]
+    assert result[0]['end']==word['end']
+    assert normalize_transcript(result)[0]['text']=='The world.'
+
+
 def test_unpunctuated_words_reuse_provider_edges_and_cached_response(monkeypatch,tmp_path):
     from types import SimpleNamespace
     calls=[]
