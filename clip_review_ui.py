@@ -64,6 +64,7 @@ function refreshClipReview(d){
   p.card.dataset.frozen=item.frozen?'1':'0';
   p.card.dataset.version=item.decision.version||0;
   if(p.card.dataset.saveError!=='1')p.status.textContent='Saved clip decision: '+(item.decision.choice||'Undecided');
+  updateClipControls(p); // Reconcile restored/cached media without changing owner inputs.
  }
 }
 function confirmClipSave(p,decision,message){
@@ -126,7 +127,7 @@ function initializeClipReviews(){
   if(draft.error){p.card.dataset.saveError='1';p.status.setAttribute('role','alert');p.status.textContent=draft.error+' Your inputs are retained; no review action will be resubmitted automatically.';}
   card.addEventListener('input',()=>{rememberClip(p);updateClipControls(p);});
   card.addEventListener('change',()=>{rememberClip(p);updateClipControls(p);});
-  if(p.video)['loadeddata','error','emptied'].forEach(event=>p.video.addEventListener(event,()=>updateClipControls(p)));
+  if(p.video)['loadeddata','canplay','seeked','playing','error','emptied'].forEach(event=>p.video.addEventListener(event,()=>updateClipControls(p)));
   updateClipControls(p);
   if(draft.pending)p.status.textContent='Previous save needs verification. Your inputs are retained; choose an action to check saved state before another submission.';
  });

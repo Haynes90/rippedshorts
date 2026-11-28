@@ -86,6 +86,18 @@ async function fetch(url,options){
 (async()=>{
  const a=clipParts(cards[0].dataset.asset),b=clipParts(cards[1].dataset.asset);
  assert(a.card.controls.approve.disabled);assert(a.card.controls.reject.disabled);
+ // Position restoration/seeking may complete after loadeddata. Actual media
+ // readiness must refresh the label without fabricating owner confirmations.
+ for(const event of ['canplay','seeked','playing']){
+  a.video.readyState=1;a.video.handlers.emptied();
+  assert.equal(a.card.player.textContent,'Loading verified preview...');
+  a.video.readyState=4;a.video.handlers[event]();
+  assert.equal(a.card.player.textContent,'Preview ready to watch.');
+  assert(a.card.controls.approve.disabled);assert(!a.playback.checked&&!a.framing.checked);
+ }
+ a.video.readyState=1;a.video.handlers.emptied();a.video.readyState=4;
+ refreshClipReview(payload());assert.equal(a.card.player.textContent,'Preview ready to watch.');
+ assert.equal(posts,0);
  a.feedback.value='Entered text 🌱\nkept';a.card.handlers.input();
  await clipDecision(a.card.dataset.asset,'approve');assert.equal(posts,0);assert(a.status.textContent.includes('Confirm'));
  a.playback.checked=true;a.framing.checked=true;a.card.handlers.change();
