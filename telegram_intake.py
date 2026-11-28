@@ -1649,7 +1649,12 @@ def telegram(method: str, payload: dict[str, Any]) -> dict:
 
 
 def send(chat_id: str, text: str) -> None:
-    telegram("sendMessage", {"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
+    try:
+        telegram("sendMessage", {"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
+    except Exception as exc:
+        # Plain processing notifications are optional, never approval actions.
+        # Review-link delivery retains its existing durable notification outbox.
+        logger.warning('RIPPED_NOTIFICATION_FAILED error_type=%s',type(exc).__name__)
 
 
 def _status_card_text(request_id: str, status: str, state: dict[str, Any]) -> str:
@@ -2916,17 +2921,36 @@ def _process(request_id: str) -> None:
             parsed = state["parsed"]
             video_id = parsed["video_id"]
             retained_job_id = state.get('retained_audio_master_job_id') or (state.get('audio_master_ingest') or {}).get('job_id')
+            local_cache=None
+            local=Path(str(state.get('video_path') or ''))
+            if local.is_file() and local.resolve()==(work/f'{video_id}-source.mp4').resolve():
+                from source_ingestion import verify_youtube_source
+                retained_validation=verify_youtube_source(local,video_id,parsed['source_value'],
+                    request_id=request_id,audio_master_job_id=retained_job_id,brand_id=state.get('show_id'),
+                    test_run_id=(state.get('workflow_test') or {}).get('test_run_id'))
+                saved=state.get('topic_source_segments') or []
+                if saved and (state.get('source_validation') or {}).get('source_sha256')!=retained_validation['source_sha256']:
+                    raise ValueError('Retained transcript source revision mismatch; evidence preserved')
+                local_cache={'video_path':local,'segments':saved,'sermon_boundary':state.get('sermon_boundary')}
             if retained_job_id and ((work / f'{video_id}-source.mp4').is_file() or state.get('retained_audio_master_job_id')):
                 from source_ingestion import verify_youtube_source
-                retained_validation = verify_youtube_source(work / f'{video_id}-source.mp4',
+                retained_validation = retained_validation or verify_youtube_source(work / f'{video_id}-source.mp4',
                     video_id, parsed['source_value'], request_id=request_id,
                     audio_master_job_id=retained_job_id, brand_id=state.get('show_id'),
                     test_run_id=(state.get('workflow_test') or {}).get('test_run_id'), retained_only=True)
-            state["vid_title"] = state.get('vid_title') or _youtube_vid_title(parsed["source_value"])
+            if not state.get('vid_title'):
+                try:
+                    state['vid_title']=_youtube_vid_title(parsed['source_value'])
+                except (requests.RequestException,RuntimeError) as exc:
+                    state['vid_title']='YouTube '+video_id
+                    state['source_title_pending']=True
+                    logger.warning('Optional source title unavailable error_type=%s',type(exc).__name__)
             boundary = None
             cache = {"video_path": None, "segments": [], "sermon_boundary": None}
             try:
-                if retained_validation:
+                if local_cache:
+                    cache=local_cache
+                elif retained_validation:
                     cache = {'video_path':work / f'{video_id}-source.mp4', 'sermon_boundary':None,
                         'segments':__import__('source_ingestion')._segments_from_json(json.loads(Path(retained_validation['transcript_path']).read_text(encoding='utf-8')))}
                     state['audio_master_ingest'] = {'job_id':retained_job_id, 'status':'reused_verified',
@@ -2954,6 +2978,10 @@ def _process(request_id: str) -> None:
             if segments and not video:
                 send(chat_id, "⬇️ Reusing the existing transcript; downloading the source video.")
                 video = download_youtube_resilient(video_id, parsed["source_value"], work)
+            if local_cache and not segments:
+                # Existing audio-hash speech receipts avoid repeated provider
+                # transcription after an interrupted later stage.
+                segments=_transcribe(video,progress=lambda message:send(chat_id,message))
             if not video or not segments:
                 missing = []
                 if not video:
@@ -3038,6 +3066,14 @@ def _process(request_id: str) -> None:
                     send(chat_id, "⬇️ Downloading the YouTube video with the Ripped Shorts backup path.")
                     video = download_youtube_resilient(video_id, parsed["source_value"], work)
                     reused = False
+                state['video_path']=str(video)
+                _save(request_id,'processing',{**state,'stage':'source_verification'})
+                from source_ingestion import verify_youtube_source
+                retained_validation=retained_validation or verify_youtube_source(video,video_id,parsed['source_value'],
+                    request_id=request_id,audio_master_job_id=(state.get('audio_master_ingest') or {}).get('job_id'),
+                    brand_id=state.get('show_id'),test_run_id=(state.get('workflow_test') or {}).get('test_run_id'))
+                state['source_validation']=retained_validation
+                _save(request_id,'processing',{**state,'stage':'source_ready'})
                 if not segments:
                     send(chat_id, "📝 Creating the timed transcript with the Ripped Shorts backup path.")
                     segments = _transcribe(video, progress=lambda message: send(chat_id, message))
@@ -3061,6 +3097,12 @@ def _process(request_id: str) -> None:
                 else:
                     state.setdefault("warnings", []).append("Approved sermon boundary did not contain reusable transcript segments.")
 
+        # Preserve source and transcript before later analysis, Drive or
+        # notification work can fail. The mandatory source gate stays below.
+        state.update(video_path=str(video),topic_source_segments=segments)
+        if retained_validation:
+            state['source_validation']=retained_validation
+        _save(request_id,'processing',{**state,'stage':'source_verification'})
         if row["source_kind"] == "youtube":
             from source_ingestion import verify_youtube_source
             state["source_validation"] = retained_validation or verify_youtube_source(
@@ -3069,6 +3111,9 @@ def _process(request_id: str) -> None:
                 brand_id=state.get('show_id'),
                 test_run_id=(state.get('workflow_test') or {}).get('test_run_id'))
             state["youtube_channel_id"] = state["source_validation"].get("source_channel_id") or state.get("youtube_channel_id") or ""
+            if state.get('source_title_pending') and state['source_validation'].get('source_title'):
+                state['vid_title']=state['source_validation']['source_title']
+                state.pop('source_title_pending',None)
             state["transcript_evidence"] = {'timed_segments':len(segments),
                 'speech_evidence':bool(segments) and all(str(seg.get('text') or '').strip() and float(seg.get('duration') or (float(seg.get('end') or 0)-float(seg.get('start') or 0)))>0 for seg in segments),
                 'word_count':sum(len(seg.get('words') or []) for seg in segments),

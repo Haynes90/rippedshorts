@@ -1,5 +1,34 @@
 # Trusted retained-source verification — 2026-10-30
 
+## November 27 production hardening
+
+Retained authenticated Audio Master evidence remains authoritative when its
+request/job/source/brand, transcript and Drive integrity checks match. Otherwise,
+public metadata uses the existing `GOOGLE_API` key with YouTube Data API
+`videos.list` first. It supplies the required video ID, channel and duration
+without Google browser login or upload scopes. Google documents a cost of one
+quota unit per call: https://developers.google.com/youtube/data/reference/rest/v3/videos/list.
+The existing yt-dlp metadata extractor remains a single bounded alternative on
+provider rejection or unavailability; no downloader or dependency was added.
+Missing/mismatched required identity is a hold, never a reason to trust arbitrary
+metadata. Optional source titles cannot block required verification.
+
+The existing file-bound validation receipt avoids repeating metadata work for
+unchanged media. Duration, stream and checksum checks remain mandatory. Source
+and complete timed-transcript state are checkpointed before later analysis or
+optional delivery work. Restart recovery validates the retained local MP4 before
+reusing its matching transcript; missing transcript assembly can use the existing
+audio-hash speech response cache, without reacquiring the video. Plain Telegram
+progress messages are best-effort; review links retain the durable navigation
+outbox, and website approval remains mandatory.
+
+Fault injection: `tests/test_source_metadata_resilience.py` covers API rejection,
+timeout, malformed/missing required fields, absent optional title, changed media,
+restart checkpoint reuse, interruption after transcription, and notification
+failure. Existing mixed-render, approval, handoff, queue and cleanup protections
+remain covered by their established tests. No synthetic test is a production
+reliability success, and a resumed fresh job is not uninterrupted processing.
+
 Scope: Ripped Shorts source verification only. Publishing and Agape stay disabled.
 
 The existing TDOG request 94893455-5f48-46de-bdfb-642212ea19a5 stopped because verify_youtube_source called yt-dlp extract_info(download=False) even though Audio job b7d6bbd5-b48b-476a-b5c0-a551e53f6490 had already produced a verified full source and 1189 valid timed segments.
