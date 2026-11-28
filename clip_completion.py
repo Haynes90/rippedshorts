@@ -94,6 +94,15 @@ def transcribe_window(video, start, end):
                 except TranscriptTimingError as exc:
                     raise TimingReviewRequired(str(exc)) from None
                 if timing['words']:
+                    if not any(re.search(r'[.!?][\"\u201d\u2019\')\]]*$',w['word'].strip()) for w in timing['words']) and timing['segments']:
+                        # Some providers omit all punctuation from word tokens.
+                        # Keep their actual segment edges instead of turning the
+                        # entire recording into a single generated "sentence".
+                        from transcript_timing import attach_timed_words
+                        structured=attach_timed_words(timing['segments'],timing['words'])
+                        ends={(s['words'][-1]['start'],s['words'][-1]['end'],s['words'][-1]['word'])
+                              for s in structured if s['words']}
+                        return [{**w,'provider_segment_end':(w['start'],w['end'],w['word']) in ends} for w in timing['words']]
                     return timing['words']
                 return [{**s, 'timing_basis': 'provider_segment_timing',
                          'requires_acoustic_boundary_validation': True} for s in timing['segments']]
@@ -156,7 +165,7 @@ def transcribe_source(video, progress=None):
     result, sentence = [], []
     for word in unique:
         sentence.append(word)
-        if re.search(r'[.!?][\"\u201d\u2019\')\]]*$', word["word"].strip()):
+        if word.get('provider_segment_end') or re.search(r'[.!?][\"\u201d\u2019\')\]]*$', word["word"].strip()):
             result.append(_sentence(sentence))
             sentence = []
     if sentence:

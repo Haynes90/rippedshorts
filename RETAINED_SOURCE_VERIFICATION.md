@@ -2,6 +2,18 @@
 
 ## November 27 production hardening
 
+Retained JSON prefers usable provider segments when a coarser generated sentence
+list would discard their granularity. Each measured word is assigned once by its
+midpoint; crossing edges retain their exact word timestamps and original segment
+bounds. Words in provider gaps remain explicit measured units. No word precision
+is inferred from segment timing. Unpunctuated ASR word tokens retain provider
+segment ends during source assembly, rather than forming one recording-length
+sentence. On the retained Vcxu4BOjb6A evidence, all 1,243 provider texts and all
+11,331 timed words survive normalization with zero lost or duplicated words.
+The resulting 1,301 units include 58 measured words in provider segment gaps.
+Changed transcript granularity requires a new analysis revision; it must not
+inherit decisions or stale candidate analysis from the collapsed transcript.
+
 Retained authenticated Audio Master evidence remains authoritative when its
 request/job/source/brand, transcript and Drive integrity checks match. Otherwise,
 public metadata uses the existing `GOOGLE_API` key with YouTube Data API

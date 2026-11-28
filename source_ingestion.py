@@ -115,7 +115,7 @@ def _read_json_asset(asset: dict[str, Any], workdir: Path) -> Any:
 def _segments_from_json(payload: Any) -> list[dict[str, Any]]:
     evidence = payload if isinstance(payload, dict) else {}
     if isinstance(payload, dict):
-        if payload.get("sentences"):
+        if payload.get("sentences") and len(payload['sentences'])>=len(payload.get('segments') or []):
             payload = {**payload, "segments": payload["sentences"]}
         for key in ("segments", "timed_transcript", "transcript"):
             if isinstance(payload.get(key), list):
@@ -135,9 +135,11 @@ def _segments_from_json(payload: Any) -> list[dict[str, Any]]:
             duration = float(item["end_seconds"]) - start
         # Preserve measured word/speaker evidence instead of flattening it to punctuation.
         end = start + max(.01, float(duration or .01))
-        words = [w for w in evidence.get("words", []) if float(w["start"]) >= start and float(w["end"]) <= end]
         segments.append({**item, "start": start, "end": end, "duration": end-start,
-                         "text": str(item["text"]).strip(), "words": words or item.get("words", [])})
+                         "text": str(item["text"]).strip(), "words": item.get("words", [])})
+    if evidence.get('words') and segments:
+        from transcript_timing import attach_timed_words
+        segments=attach_timed_words(segments,evidence['words'])
     return segments
 
 
