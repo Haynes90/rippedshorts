@@ -1823,7 +1823,7 @@ def _sync_source_intelligence():
 
 def _reusable_youtube_job(video_id: str) -> dict | None:
     with _LOCK, connect() as db:
-        rows = db.execute("SELECT * FROM source_jobs ORDER BY updated_at DESC").fetchall()
+        rows = db.execute("SELECT * FROM source_jobs WHERE status='ready_for_selection' ORDER BY updated_at DESC").fetchall()
     for row in rows:
         manifest = json.loads(row["manifest_json"])
         state = json.loads(row["state_json"])
