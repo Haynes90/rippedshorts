@@ -373,8 +373,9 @@ def preview_lane(request_id,lane,source):
             _,state=_state(db,request_id)
         pool=(state.get(key) or {}).get('segments') or []
         for index in range(cursor,min(len(pool),MAX_PREVIEW_CANDIDATES)):
-            if time.monotonic()>budget_end:
-                break  # persisted pending candidates remain recoverable; no fabricated rejection
+            # The deadline bounds replacement discovery, not already-admitted
+            # siblings. A slow held candidate must not strand the remaining
+            # finite pool; each attempt and the 20-candidate ceiling stay bounded.
             proposal=pool[index]
             try:
                 generate_preview(request_id,lane,index,source);outcomes.append('verified')

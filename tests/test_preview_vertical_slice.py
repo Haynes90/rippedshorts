@@ -197,3 +197,22 @@ def test_discovery_dispatches_both_lanes_on_existing_bounded_executor_once(previ
         assert all(f.result(timeout=10)==['verified'] for f in results.values())
         assert recovery.start_preview_pipeline('request',p['source'])=={}
     assert sorted(seen)==['highlight','short'] and not p['read']()['candidate_reviews']
+
+
+def test_provider_timeout_does_not_abandon_admitted_siblings_when_discovery_budget_expires(previews,monkeypatch):
+    import time,requests,intelligence_workflow as workflow
+    p=previews;state=p['read']();state['sentence_first_version']=1;p['write'](state)
+    clock=[0];seen=[]
+    monkeypatch.setattr(time,'monotonic',lambda:clock[0])
+    def generate(rid,lane,index,source):
+        seen.append(index)
+        if index==0:
+            clock[0]=901
+            raise requests.ReadTimeout('isolated semantic timeout')
+        return {'verified':True}
+    monkeypatch.setattr(recovery,'generate_preview',generate)
+    discover=Mock(side_effect=AssertionError('Expired discovery budget must not request replacements'))
+    monkeypatch.setattr(workflow,'replacement_candidates',discover)
+    assert recovery.preview_lane('request','short',p['source'])==['held','verified']
+    assert seen==[0,1] and not discover.called
+    assert p['read']()==state and not p['read']().get('schedule_master')
