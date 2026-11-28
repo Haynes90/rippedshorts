@@ -121,3 +121,47 @@ def test_upstream_media_checkpoint_survives_transcription_failure():
     assert report['checkpoints']['TRANSCRIPT_READY']['status']=='FAILED'
     assert report['blocking_stage']=='TRANSCRIPT_READY'
 
+
+def test_coarse_generated_sentence_does_not_replace_provider_segments():
+    from source_ingestion import _segments_from_json
+    data=dict(segments=[dict(text='First thought.',start=0,end=2,speaker='a'),
+                        dict(text='Second thought.',start=1.8,end=4,speaker='b')],
+              sentences=[dict(text='Entire recording',start=0,end=4)],
+              words=[dict(word='First',start=.1,end=.5,speaker='a'),
+                     dict(word='thought',start=1.7,end=2.1,speaker='a'),
+                     dict(word='Second',start=2.2,end=3,speaker='b')])
+    result=_segments_from_json(data)
+    assert [s['text'] for s in result]==['First thought.','Second thought.']
+    measured=[w for s in result for w in s['words']]
+    assert measured==data['words']
+    assert [s['speaker'] for s in result]==['a','b']
+
+
+def test_word_in_provider_gap_is_preserved_with_its_actual_timing():
+    from transcript_timing import attach_timed_words
+    word=dict(word='gap',start=2,end=2.5,speaker='a')
+    result=attach_timed_words([dict(text='Before.',start=0,end=1),
+                               dict(text='After.',start=3,end=4)],[word])
+    assert [w for s in result for w in s['words']]==[word]
+    assert result[1]['start']==2 and result[1]['end']==2.5
+
+
+def test_unpunctuated_words_reuse_provider_edges_and_cached_response(monkeypatch,tmp_path):
+    from types import SimpleNamespace
+    calls=[]
+    data=dict(duration=4,words=[dict(word='First',start=0,end=1),
+                               dict(word='Second',start=2,end=3)],
+              segments=[dict(text='First.',start=0,end=1),dict(text='Second.',start=2,end=3)])
+    def fetch(*a,**k):
+        calls.append(True)
+        return SimpleNamespace(status_code=200,raise_for_status=lambda:None,json=lambda:data)
+    clip,video=window_fixture(monkeypatch,tmp_path,fetch)
+    units=clip.transcribe_window(video,0,4)
+    assert all(w['provider_segment_end'] for w in units)
+    assert clip.transcribe_window(video,0,4)==units
+    assert len(calls)==1
+    monkeypatch.setattr(clip,'media_duration',lambda _:4)
+    monkeypatch.setattr(clip,'transcribe_window',lambda *a:units)
+    result=clip.transcribe_source(video)
+    assert len(result)==2
+    assert [s['text'] for s in result]==['First','Second']

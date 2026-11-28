@@ -212,7 +212,12 @@ def test_ledger_later_stage_preserves_existing_source_acquisition_columns(monkey
     assert values.update.call_args.kwargs['body']['values'][0][18:]==old[18:]
 
 
-def test_acquisition_diagnostic_survives_independent_transcription_failure(tmp_path):
+def test_acquisition_diagnostic_survives_independent_transcription_failure(tmp_path,monkeypatch):
+    def verified(path,video_id,url,**kwargs):
+        assert path==tmp_path/'video.mp4' and video_id=='video'
+        assert kwargs['request_id']=='fixture'
+        return {'status':'verified','source_id':'video','source_sha256':'fixture-only'}
+    monkeypatch.setattr(source,'verify_youtube_source',verified)
     stored={'state':{'parsed':{'video_id':'video','source_value':'https://example.test/source'}}}
     class DB:
         def __enter__(self):return self
@@ -236,6 +241,8 @@ def test_acquisition_diagnostic_survives_independent_transcription_failure(tmp_p
     fn.decorator_list=[];exec(compile(ast.Module(body=[fn],type_ignores=[]),'intake','exec'),env)
     env['_process']('fixture')
     assert stored['state']['audio_master_ingest']['error']=='Audio Master authentication blocked'
+    assert stored['state']['source_validation']['status']=='verified'
+    assert stored['state']['video_path']==str(tmp_path/'video.mp4')
     assert stored['state']['error']=='Independent transcription blocked'
 
 

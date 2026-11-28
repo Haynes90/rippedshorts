@@ -74,6 +74,8 @@ def utc_now() -> str:
 
 def classify_error(error: Any) -> str:
     text = str(error or "").lower()
+    if 'source_metadata_' in text:
+        return 'SOURCE_VERIFICATION'
     if any(x in text for x in ("telegram", "too many requests", "retry_after", "webhook")):
         return "TELEGRAM_DELIVERY"
     if any(x in text for x in ("401", "403", "unauthorized", "forbidden", "token", "credential")):

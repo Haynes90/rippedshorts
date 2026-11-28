@@ -11,6 +11,11 @@ For enchanting-fascination / production, start at `railway-workflow/AGENTS.md` i
 - For changes to the Audio Master handoff, inspect `Haynes90/audiomaster` independently. This tool does not provide a unified multi-repository graph.
 
 ## Change discipline
+- For source/provider failures, distinguish acquisition from verification and
+  inspect retained file/transcript checkpoints before any retry. Preserve exact
+  timing and source revision; reuse the official public metadata and existing
+  speech caches before considering new credentials or provider calls. Optional
+  notifications must not undo successful machine work or replace human approval.
 - Change only verified responsible code; avoid refactors and unrelated edits.
 - Preserve retained jobs, existing approvals, publishing pauses, scheduling constraints, and retry/idempotency behavior unless explicitly authorized.
 - Run targeted and contract tests. Do not deploy, replay, publish, or change production settings without explicit authorization.

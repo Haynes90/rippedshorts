@@ -20,6 +20,7 @@ from typing import Any
 
 from googleapiclient.http import MediaFileUpload
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import parse_duration
 import requests
 
 from google_drive import docs_service, download_drive_file, drive_service
@@ -114,7 +115,7 @@ def _read_json_asset(asset: dict[str, Any], workdir: Path) -> Any:
 def _segments_from_json(payload: Any) -> list[dict[str, Any]]:
     evidence = payload if isinstance(payload, dict) else {}
     if isinstance(payload, dict):
-        if payload.get("sentences"):
+        if payload.get("sentences") and len(payload['sentences'])>=len(payload.get('segments') or []):
             payload = {**payload, "segments": payload["sentences"]}
         for key in ("segments", "timed_transcript", "transcript"):
             if isinstance(payload.get(key), list):
@@ -134,9 +135,11 @@ def _segments_from_json(payload: Any) -> list[dict[str, Any]]:
             duration = float(item["end_seconds"]) - start
         # Preserve measured word/speaker evidence instead of flattening it to punctuation.
         end = start + max(.01, float(duration or .01))
-        words = [w for w in evidence.get("words", []) if float(w["start"]) >= start and float(w["end"]) <= end]
         segments.append({**item, "start": start, "end": end, "duration": end-start,
-                         "text": str(item["text"]).strip(), "words": words or item.get("words", [])})
+                         "text": str(item["text"]).strip(), "words": item.get("words", [])})
+    if evidence.get('words') and segments:
+        from transcript_timing import attach_timed_words
+        segments=attach_timed_words(segments,evidence['words'])
     return segments
 
 
@@ -299,6 +302,45 @@ def _verify_retained_source(path, video_id, youtube_url, request_id, job_id, bra
         'timing_basis': document.get('speech_timing_basis'), 'checkpoints': checkpoints}
 
 
+def youtube_source_metadata(video_id, youtube_url):
+    """Official public metadata first; one existing extraction alternative, no login."""
+    key=(os.getenv('GOOGLE_API') or '').strip()
+    unavailable='not configured'
+    if key:
+        try:
+            response=requests.get('https://www.googleapis.com/youtube/v3/videos',
+                params={'key':key,'id':video_id,'part':'snippet,contentDetails',
+                        'fields':'items(id,snippet(channelId,title,liveBroadcastContent),contentDetails(duration))'},
+                timeout=(10,30))
+            unavailable='HTTP '+str(response.status_code)
+            if response.status_code==200:
+                payload=response.json()
+                items=payload.get('items') if isinstance(payload,dict) else None
+                if not isinstance(items,list) or len(items)!=1 or not isinstance(items[0],dict) or items[0].get('id')!=video_id:
+                    raise ValueError('SOURCE_METADATA_INVALID: exact public video identity unavailable')
+                item=items[0];snippet=item.get('snippet');details=item.get('contentDetails')
+                if not isinstance(snippet,dict) or not isinstance(details,dict):
+                    raise ValueError('SOURCE_METADATA_INVALID: channel or duration unavailable')
+                duration=parse_duration(details.get('duration'))
+                channel=snippet.get('channelId')
+                if not isinstance(channel,str) or not channel.strip() or not duration or not math.isfinite(duration):
+                    raise ValueError('SOURCE_METADATA_INVALID: channel or duration unavailable')
+                return {'id':item['id'],'duration':duration,'channel_id':channel,
+                        'title':str(snippet.get('title') or ''),
+                        'is_live':snippet.get('liveBroadcastContent') in {'live','upcoming'},
+                        'metadata_provider':'youtube_data_api'}
+        except requests.RequestException as exc:
+            # Exception URLs may contain the existing API key. Never retain them.
+            unavailable=type(exc).__name__
+    try:
+        with YoutubeDL({'quiet':True,'no_warnings':True,'skip_download':True,'noplaylist':True}) as yt:
+            result=yt.extract_info(youtube_url,download=False)
+        return {**result,'metadata_provider':'yt_dlp'}
+    except Exception as exc:
+        raise RuntimeError('SOURCE_METADATA_UNAVAILABLE: official '+unavailable+
+                           '; existing extraction '+type(exc).__name__+'; retained media preserved') from None
+
+
 def verify_youtube_source(path, video_id, youtube_url, *, request_id=None,
                           audio_master_job_id=None, brand_id=None, test_run_id=None, retained_only=False):
     """Bind an entire validated source to its original ID and duration, durably."""
@@ -324,8 +366,7 @@ def verify_youtube_source(path, video_id, youtube_url, *, request_id=None,
                 and all(prior.get(k)==v for k,v in fingerprint.items()) and 'source_channel_id' in prior
                 and prior.get('source_sha256') == _source_digests(path)[0]):
             return prior
-    with YoutubeDL({'quiet':True,'no_warnings':True,'skip_download':True,'noplaylist':True}) as yt:
-        metadata = yt.extract_info(youtube_url,download=False)
+    metadata = youtube_source_metadata(video_id,youtube_url)
     if metadata.get('id') != video_id or not metadata.get('duration') or metadata.get('is_live'):
         raise ValueError('Original source identity/duration is unavailable; hold for media review')
     result = subprocess.run([os.getenv('FFPROBE_BINARY','ffprobe'),'-v','error',
@@ -337,7 +378,9 @@ def verify_youtube_source(path, video_id, youtube_url, *, request_id=None,
     if not math.isfinite(actual) or abs(actual-expected)>max(1,min(3,expected*.001)) or not {'video','audio'} <= {s.get('codec_type') for s in data.get('streams',[])}:
         raise ValueError('Source is incomplete or lacks video/audio; hold for media review')
     verified = {**fingerprint,'duration':actual,'expected_duration':expected,'source_channel_id':str(metadata.get('channel_id') or ''),'status':'verified',
-                'verification_method':'youtube_metadata','source_sha256':_source_digests(path)[0]}
+                'verification_method':'youtube_metadata','source_sha256':_source_digests(path)[0],
+                'metadata_provider':metadata.get('metadata_provider'), 'source_title':metadata.get('title') or '',
+                'request_id':request_id,'audio_master_job_id':audio_master_job_id,'test_run_id':test_run_id}
     temporary = receipt.with_suffix('.tmp')
     temporary.write_text(json.dumps(verified),encoding='utf-8')
     temporary.replace(receipt)

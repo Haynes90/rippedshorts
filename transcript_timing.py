@@ -3,6 +3,38 @@ import math
 import re
 
 
+def attach_timed_words(segments, words):
+    """Assign each measured word once; never infer its time from a segment."""
+    from bisect import bisect_right
+    result=[{**s,'words':[]} for s in segments]
+    if not result:
+        return result
+    starts=[float(s['start']) for s in result]
+    if starts!=sorted(starts):
+        raise TranscriptTimingError('unordered_provider_segments')
+    duration=max([float(s['end']) for s in result]+[float(w['end']) for w in words])
+    measured,_=normalize_words(words,duration)
+    orphaned=[]
+    for word in measured:
+        middle=(word['start']+word['end'])/2
+        index=bisect_right(starts,middle)-1
+        if index>=0 and middle<float(segments[index]['end']):
+            result[index]['words'].append(word)
+        else:
+            orphaned.append({'start':word['start'],'end':word['end'],
+                'duration':word['end']-word['start'],'text':word['word'],'words':[word],
+                'timing_basis':'provider_word_timing'})
+    for segment in result:
+        if segment['words']:
+            original=[segment['start'],segment['end']]
+            segment['start']=min(segment['start'],min(w['start'] for w in segment['words']))
+            segment['end']=max(segment['end'],max(w['end'] for w in segment['words']))
+            segment['duration']=segment['end']-segment['start']
+            if original!=[segment['start'],segment['end']]:
+                segment['provider_segment_bounds']=original
+    return sorted(result+orphaned,key=lambda s:s['start'])
+
+
 def cached_response(audio_path, model, fetch, cache_dir=None):
     """Keep successful provider JSON private, including deterministic bad timing."""
     from pathlib import Path
