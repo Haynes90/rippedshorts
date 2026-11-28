@@ -10,9 +10,17 @@ is inferred from segment timing. Unpunctuated ASR word tokens retain provider
 segment ends during source assembly, rather than forming one recording-length
 sentence. On the retained Vcxu4BOjb6A evidence, all 1,243 provider texts and all
 11,331 timed words survive normalization with zero lost or duplicated words.
-The resulting 1,301 units include 58 measured words in provider segment gaps.
+Words exactly at a provider segment's ending remain attached there, including
+provider tokens whose measured start equals end. They must not become standalone
+zero-length timeline units. The final replay yields 1,250 valid units, including
+seven positive-duration gap words, and passes the actual topic-map normalizer.
 Changed transcript granularity requires a new analysis revision; it must not
 inherit decisions or stale candidate analysis from the collapsed transcript.
+
+Sheets cells exceeding the provider's limit carry an explicit record/field/hash
+reference to the full SQLite evidence instead of rejecting the entire supported
+record batch. Exact batch readback and original SQLite payload/digest remain
+mandatory; this changes only the optional projection, never editorial evidence.
 
 Retained authenticated Audio Master evidence remains authoritative when its
 request/job/source/brand, transcript and Drive integrity checks match. Otherwise,

@@ -18,7 +18,7 @@ def attach_timed_words(segments, words):
     for word in measured:
         middle=(word['start']+word['end'])/2
         index=bisect_right(starts,middle)-1
-        if index>=0 and middle<float(segments[index]['end']):
+        if index>=0 and middle<=float(segments[index]['end']):
             result[index]['words'].append(word)
         else:
             orphaned.append({'start':word['start'],'end':word['end'],

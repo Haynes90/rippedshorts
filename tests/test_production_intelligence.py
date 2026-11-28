@@ -293,6 +293,24 @@ def test_sheet_schema_conflict_holds_projection_not_processing(db,timeline):
     assert pi.topic_map(SOURCE,timeline,Mock(side_effect=AssertionError()))==result
 
 
+def test_oversized_sheet_diagnostic_projects_reference_without_losing_evidence(db):
+    payload={'title':'Retained source','diagnostics':'evidence '*7000}
+    pi.record('source','large-source',payload)
+    pi.record('source','small-source',{'title':'Other retained source'})
+    service=FakeSheets()
+    assert pi.sync_sheets(service,'isolated')==2
+    assert pi.sync_sheets(service,'isolated')==0
+    rows=service.tabs[pi.SHEET_TABS['source']][1:]
+    assert all(not isinstance(v,str) or len(v.encode('utf-16-le'))//2<=49000 for r in rows for v in r)
+    row=next(r for r in rows if r[0]=='large-source')
+    reference=json.loads(row[-1])
+    assert reference['record_id']=='large-source' and reference['field']=='evidence_json'
+    assert reference['retained_in']=='SQLite intelligence_records'
+    with pi.database() as c:
+        saved=c.execute("SELECT payload,digest,synced_digest FROM intelligence_records WHERE record_id='large-source'").fetchone()
+    assert json.loads(saved['payload'])==payload and saved['digest']==saved['synced_digest']
+
+
 @pytest.mark.parametrize('brand',['AGAPE_CHURCH','OTHER_SHOW'])
 def test_each_brand_feedback_influences_future_ranking_without_cross_brand_leak(db,brand):
     import intelligence_workflow as workflow
